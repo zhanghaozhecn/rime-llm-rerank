@@ -20,10 +20,14 @@ MAX_CANDIDATES = 4
 def worker(in_q, out_q, wid):
     """独立进程：加载模型，处理评分任务"""
     sys.stderr = open(os.devnull, 'w')
-    from llama_cpp import Llama
-    llm = Llama(model_path=MODEL_PATH, n_ctx=N_CTX, n_threads=N_THREADS_PER,
-                verbose=False, logits_all=True)
-    out_q.put(("ready", wid))
+    try:
+        from llama_cpp import Llama
+        llm = Llama(model_path=MODEL_PATH, n_ctx=N_CTX, n_threads=N_THREADS_PER,
+                    verbose=False, logits_all=True)
+        out_q.put(("ready", wid))
+    except Exception as e:
+        out_q.put(("error", wid, str(e)))
+        return
 
     while True:
         msg = in_q.get()
@@ -53,11 +57,16 @@ def worker(in_q, out_q, wid):
 # ============================================================
 if __name__ == "__main__":
     # 轻量 tokenizer：仅加载 vocab，不创建推理上下文（省~80MB）
+    if not os.path.exists(MODEL_PATH):
+        print(f"错误: 模型文件不存在: {MODEL_PATH}")
+        print("请先下载模型: 参见 README.md")
+        sys.exit(1)
     sys.stderr = open(os.devnull, 'w')
     from llama_cpp import llama_cpp as llcpp
     model_token = llcpp.llama_load_model_from_file(MODEL_PATH.encode(),
                                                     llcpp.llama_model_default_params())
     vocab = llcpp.llama_model_get_vocab(model_token)
+    sys.stderr = sys.__stderr__
     eos_id = getattr(llcpp, 'llama_token_eos', lambda m: 248046)(model_token)
     print(f"Tokenizer 就绪 (vocab only, 无推理上下文)")
 
@@ -79,6 +88,10 @@ if __name__ == "__main__":
 
     for _ in range(N_WORKERS):
         msg = out_q.get()
+        if msg[0] == "error":
+            print(f"  Worker {msg[1]} 加载失败: {msg[2]}")
+            print("请确认 Python 依赖已安装: pip install llama-cpp-python==0.3.2 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu")
+            sys.exit(1)
         print(f"  Worker {msg[1]} ready")
 
     # 预热
