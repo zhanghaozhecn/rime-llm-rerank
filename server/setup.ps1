@@ -11,38 +11,52 @@ Write-Host "NOTE: Run as Administrator for DLL install."
 Write-Host "Estimated time: 5-15 min."
 Write-Host ""
 
-# Check Python
+# Check Python: must be 3.12 (llama-cpp-python does not support 3.14+)
+$pythonCmd = $null
+$pyVer = ""
+$usePy = Get-Command py -ErrorAction SilentlyContinue
+
+# Try current 'python' first
 $py = Get-Command python -ErrorAction SilentlyContinue
-if (-not $py) {
-    Write-Host "[ERROR] Python not found."
-    Write-Host "Install Python 3.12 from python.org"
-    Write-Host "(llama-cpp-python does not support Python 3.14+ yet)"
+if ($py) {
+    $pyVer = & $pythonCmd -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+    if ($pyVer -eq "3.12") { $pythonCmd = "python" }
+}
+
+# If not 3.12, try 'py -3.12'
+if (-not $pythonCmd -and $usePy) {
+    $py312 = py -3.12 -c "import sys; print('ok')" 2>$null
+    if ($LASTEXITCODE -eq 0) { $pythonCmd = "py -3.12"; $pyVer = "3.12" }
+}
+
+# Still no? Error
+if (-not $pythonCmd) {
+    Write-Host "[ERROR] Python 3.12 is required."
+    Write-Host "llama-cpp-python does not support Python 3.14+ yet."
+    if ($pyVer) { Write-Host "Current Python is $pyVer (need 3.12)." }
+    Write-Host ""
+    Write-Host "Download Python 3.12 from https://www.python.org/downloads/"
+    Write-Host "During install, check 'Add Python to PATH'."
+    Write-Host "If you have multiple Python versions, use:"
+    Write-Host "  py -3.12 -m & $pythonCmd -m pip install ..."
     Read-Host "Press Enter to exit"
     exit 1
 }
-$pyVer = python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-$pyMajor = [int]($pyVer.Split('.')[0])
-$pyMinor = [int]($pyVer.Split('.')[1])
-Write-Host "[OK] Python: $pyVer"
-if ($pyMajor -eq 3 -and $pyMinor -ge 14) {
-    Write-Host "[WARN] Python 3.14+ may not work with llama-cpp-python yet."
-    Write-Host "If install fails, download Python 3.12 from python.org"
-    Write-Host "(leave Python 3.12 checked in PATH during install)"
-    Write-Host ""
-}
+
+Write-Host "[OK] Python: 3.12 (via: $pythonCmd)"
 
 # [1/3] Python packages
 Write-Host ""
 Write-Host "[1/3] Python packages..."
-$hasPkg = python -c "import llama_cpp" 2>$null
+$hasPkg = & $pythonCmd -c "import llama_cpp" 2>$null
 if ($LASTEXITCODE -eq 0) {
     Write-Host "  [SKIP] Already installed"
 } else {
     Write-Host "  Installing llama-cpp-python pywin32 numpy..."
-    pip install llama-cpp-python pywin32 numpy --quiet
+    & $pythonCmd -m pip install llama-cpp-python pywin32 numpy --quiet
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[ERROR] Install failed. Try:"
-        Write-Host "  pip install llama-cpp-python pywin32 numpy -i https://pypi.tuna.tsinghua.edu.cn/simple"
+        Write-Host "  & $pythonCmd -m pip install llama-cpp-python pywin32 numpy -i https://pypi.tuna.tsinghua.edu.cn/simple"
         Read-Host "Press Enter to exit"
         exit 1
     }
@@ -78,8 +92,8 @@ if (Test-Path $modelFile) {
 } else {
     if (-not (Test-Path "d:\gguf_models")) { New-Item -ItemType Directory "d:\gguf_models" -Force | Out-Null }
     Write-Host "  Downloading from ModelScope (~500MB)..."
-    pip install modelscope --quiet 2>$null
-    python -c "from modelscope import snapshot_download; snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*')"
+    & $pythonCmd -m pip install modelscope --quiet 2>$null
+    & $pythonCmd -c "from modelscope import snapshot_download; snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*')"
     if (Test-Path $modelFile) {
         Write-Host "  [OK] Download complete"
     } else {
