@@ -1,69 +1,74 @@
-﻿@echo off & chcp 65001 >nul
-title 安装 LLM 推理服务
+@echo off
+title RIME LLM Rerank - Setup
 echo ============================================
-echo   RIME LLM 推理服务 — 一键安装
+echo   RIME LLM Rerank - One-Click Setup
 echo ============================================
 echo.
-echo 将执行以下操作:
-echo   1. 安装 Python 依赖 (llama-cpp-python, pywin32, numpy)
-echo   2. 复制 rime_pipe.dll 到小狼毫安装目录
-echo   3. 从魔搭下载模型文件 (约 500MB)
+echo This will:
+echo   1. Install Python packages: llama-cpp-python, pywin32, numpy
+echo   2. Copy rime_pipe.dll to RIME program directory
+echo   3. Download model from ModelScope (~500MB)
 echo.
-echo 预计耗时 5-15 分钟，请确保网络畅通。
+echo Estimated time: 5-15 min. Requires internet.
 echo.
 
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到 Python！
-    echo 请先安装 Python 3.10+ (python.org)，安装时务必勾选 Add to PATH
-    pause & exit /b 1
+    echo [ERROR] Python not found.
+    echo Install Python 3.10+ from python.org
+    echo Check "Add Python to PATH" during install.
+    pause
+    exit /b 1
 )
-echo [通过] Python 已安装
+echo [OK] Python found
 
 echo.
-echo [1/3] 安装 Python 包...
+echo [1/3] Installing Python packages...
 pip install llama-cpp-python pywin32 numpy --quiet
 if errorlevel 1 (
-    echo [错误] 安装失败。重试或换源: pip install ... -i https://pypi.tuna.tsinghua.edu.cn/simple
-    pause & exit /b 1
+    echo [ERROR] Install failed. Try:
+    echo   pip install llama-cpp-python pywin32 numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
+    pause
+    exit /b 1
 )
-echo [通过] 依赖安装完成
+echo [OK] Packages installed
 
 echo.
-echo [2/3] 安装管道通信组件...
+echo [2/3] Installing pipe DLL...
 set "RIME_DIR=C:\Program Files\Rime"
 if exist "%RIME_DIR%\weasel-0.17.4" (
     copy /Y "%~dp0rime_pipe.dll" "%RIME_DIR%\weasel-0.17.4\rime_pipe.dll" >nul
-    echo [通过] 已安装到 %RIME_DIR%\weasel-0.17.4
+    echo [OK] Installed to %RIME_DIR%\weasel-0.17.4
 ) else if exist "%RIME_DIR%\weasel-0.16.3" (
     copy /Y "%~dp0rime_pipe.dll" "%RIME_DIR%\weasel-0.16.3\rime_pipe.dll" >nul
-    echo [通过] 已安装到 %RIME_DIR%\weasel-0.16.3
+    echo [OK] Installed to %RIME_DIR%\weasel-0.16.3
 ) else (
-    echo [警告] 未能自动安装。请手动复制 rime_pipe.dll 到:
-    echo   C:\Program Files\Rime\weasel-版本号\
+    echo [WARN] RIME not found. Manually copy rime_pipe.dll to:
+    echo   C:\Program Files\Rime\weasel-VERSION\
 )
 
 echo.
-echo [3/3] 从魔搭下载模型 (约 500MB)...
+echo [3/3] Downloading model from ModelScope (~500MB)...
 if not exist "d:\gguf_models" mkdir "d:\gguf_models"
 pip install modelscope --quiet 2>nul
-python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*')"
+python -c "from modelscope import snapshot_download; import shutil,os,glob; d=snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*'); [shutil.copy2(f,'d:/gguf_models/'+os.path.basename(f)) for f in glob.glob(os.path.join(d,'*Q4_K_M*'))]"
 
 if exist "d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf" (
-    echo [通过] 模型已下载到 d:\gguf_models\
+    echo [OK] Model saved to d:\gguf_models\
 ) else (
-    echo [错误] 模型下载失败。可能原因: 网络异常 / 磁盘空间不足。
-    echo 请检查网络后重新运行本文件。
-    pause & exit /b 1
+    echo [ERROR] Model download failed. Check internet and retry.
+    pause
+    exit /b 1
 )
 
 echo.
 echo ============================================
-echo   安装完成！
+echo   Setup complete!
 echo.
-echo   下一步: 将 lua\*.lua 复制到方案目录
-echo          在 schema.yaml 中添加配置 (参考 schema-patch.yaml)
-echo          双击 start_server.bat 启动服务
-echo          右键小狼毫托盘 → 重新部署
+echo   Next steps:
+echo   1. Copy lua\*.lua to your schema lua/ folder
+echo   2. Add config from schema-patch.yaml to schema.yaml
+echo   3. Double-click start_server.bat
+echo   4. Right-click Weasel tray -^> Redeploy
 echo ============================================
 pause
