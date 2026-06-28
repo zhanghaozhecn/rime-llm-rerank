@@ -16,28 +16,42 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 | 条件 | 说明 |
 |------|------|
 | Windows 系统 | 仅支持 Windows（命名管道通信） |
-| Python 3.10+ | 安装时务必勾选「Add Python to PATH」 |
+| Python 3.12 | 必须 3.12（llama-cpp-python 不支持 3.14+）。安装时勾选「Add to PATH」 |
 | 磁盘空间 | ~1.5 GB（模型 500MB + Python 依赖 ~500MB） |
 | 内存 | ~1.5 GB 可用内存 |
 
 ## 安装步骤
 
-### 第一步：安装 LLM 服务
+### 第一步：安装 Python 依赖
 
+```powershell
+pip install llama-cpp-python pywin32 numpy
+pip install modelscope  # 用于下载模型
 ```
-双击 server\setup.bat                                  → 一键安装（约 5-15 分钟）
-双击 server\start_server.bat                            → 启动推理服务（窗口自动关闭）
+
+如果下载慢，换清华源：`pip install ... -i https://pypi.tuna.tsinghua.edu.cn/simple`
+
+### 第二步：安装管道 DLL
+
+将 `server\rime_pipe.dll` 复制到小狼毫安装目录（需管理员权限）：
+
+```powershell
+copy /Y server\rime_pipe.dll "C:\Program Files\Rime\weasel-0.17.4\rime_pipe.dll"
 ```
 
-**setup.ps1 做了什么：**
-- 安装 3 个 Python 包（llama-cpp-python, pywin32, numpy）
-- 复制 `rime_pipe.dll` 到 `C:\Program Files\Rime\weasel-*\`
-- 从魔搭（modelscope.cn）下载 `Qwen3.5-0.8B-Q4_K_M.gguf` 到 `d:\gguf_models\`
+### 第三步：下载模型
 
-### 第二步：配置你的输入法方案
+```powershell
+mkdir d:\gguf_models
+python -c "from modelscope import snapshot_download; snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*')"
+```
+
+模型会下载到 `d:\gguf_models\`，约 500MB。
+
+### 第四步：配置你的输入法方案
 
 将 `lua\` 目录下的两个 `.lua` 文件复制到你的 RIME 方案 `lua\` 文件夹中。
-在你的方案 `schema.yaml` 中添加（参考 `schema-patch.yaml`）：
+在你的方案 `schema.yaml` 中添加：
 
 ```yaml
 engine:
@@ -47,15 +61,15 @@ engine:
     - lua_filter@*llm_rerank
 ```
 
-### 第三步：重新部署
+### 第五步：启动服务 + 重新部署
 
-右键小狼毫托盘图标 → **重新部署**。LLM 选中的候选会显示 ⚡ 标记。
+双击 `server\start_server.bat` → 右键小狼毫托盘 → **重新部署**。LLM 选中的候选显示 ⚡。
 
 ## 启停
 
 | 操作 | 方法 |
 |------|------|
-| 启动 | 双击 `server\start_server.bat` |
+| 启动 | 双击 `server\start_server.bat`（窗口自动关闭，后台运行） |
 | 停止 | 双击 `server\stop_server.bat` |
 | 临时关闭 | 创建文件 `%TEMP%\rime_llm_off`（删除即恢复） |
 
@@ -69,7 +83,6 @@ rime-llm-rerank\
 ├── server\
 │   ├── pipe_server.py        # 推理服务（4 进程并行）
 │   ├── rime_pipe.dll         # 命名管道客户端
-│   ├── setup.bat             # 一键安装（双击）
 │   ├── start_server.bat      # 启动
 │   └── stop_server.bat       # 停止
 ├── schema-patch.yaml         # 配置示例

@@ -11,7 +11,7 @@ N_WORKERS = 4
 N_THREADS_PER = 2  # 4workers×2threads=8线程，0.8B模型最优
 
 # —— 服务端控制参数 ——
-MAX_CONTEXT_TOKENS = 4  # 4tok×4cand=107ms，vs 5tok×4cand=169ms
+MAX_CONTEXT_TOKENS = 2  # 短上文减少高频词误判，对常用词不引入无关干扰
 MAX_CANDIDATES = 4
 
 # ============================================================
