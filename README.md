@@ -26,18 +26,49 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 ```powershell
 pip install pywin32 numpy modelscope
-
-# 方案一：预编译包（不支持 AVX-512 的旧 CPU 可能失败）
-pip install llama-cpp-python==0.3.30 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-
-# 方案二：方案一失败时，从源码编译（需先装 VS Build Tools）
-#   1. 下载安装 Visual Studio Build Tools：https://visualstudio.microsoft.com/visual-cpp-build-tools/
-#      （勾选「C++ 桌面开发」）
-#   2. $env:CMAKE_ARGS="-DGGML_AVX512=OFF -DGGML_AVX2=ON -DGGML_NATIVE=OFF"
-#      pip install llama-cpp-python==0.3.30 --force-reinstall --no-cache-dir
 ```
 
-> 预编译 wheel 使用 AVX-512 指令集，旧 CPU（10 代酷睿之前）可能不支持。如果 `start_server.bat` 启动后 python 进程立即退出，说明 CPU 不兼容，换方案二。
+然后安装 llama-cpp-python。**关键说明**：预编译 wheel 使用了 **AVX-512 指令集**。AVX-512 并非「新旧 CPU」的区别——它只在少数 CPU 上可用（Intel 服务器 Xeon、11 代酷睿、AMD Zen 4），**绝大多数消费级 CPU 都没有 AVX-512**，包括近年新出的酷睿 Ultra。因此大部分用户需要从源码编译。
+
+**先试预编译包**（如果你的 CPU 恰好支持 AVX-512，这一步就够了）：
+
+```powershell
+pip install llama-cpp-python==0.3.30 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+```
+
+**如果预编译包装完启动失败**（`start_server.bat` 打开后 python 进程立即退出），说明 CPU 不支持 AVX-512（这是大多数情况，不是特例），继续走源码编译：
+
+#### 从源码编译 llama-cpp-python（大多数用户需要这一步）
+
+**① 安装 Visual Studio Build Tools**（提供 C++ 编译器）
+
+1. 下载：https://visualstudio.microsoft.com/visual-cpp-build-tools/
+2. 运行安装程序，勾选 **「使用 C++ 的桌面开发」**（Desktop development with C++）
+3. 右侧额外勾选 **「C++ CMake tools for Windows」**
+4. 点击安装，等待完成（约 3-5 GB）
+
+**② 编译安装**（关闭 AVX-512，启用 AVX2）：
+
+```powershell
+# 先卸载预编译包（如果装了的话）
+pip uninstall llama-cpp-python -y
+
+# 设置编译选项：禁用 AVX-512，启用 AVX2（主流 CPU 都支持）
+$env:CMAKE_ARGS="-DGGML_AVX512=OFF -DGGML_AVX2=ON -DGGML_NATIVE=OFF"
+
+# 从源码安装（编译约 3-5 分钟）
+pip install llama-cpp-python==0.3.30 --force-reinstall --no-cache-dir
+```
+
+**③ 验证安装成功**：
+
+```powershell
+python -c "from llama_cpp import Llama; print('安装成功')"
+```
+
+如果没报错，说明编译和安装都正确。
+
+> 下载慢加清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
 
 下载慢换清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
 
