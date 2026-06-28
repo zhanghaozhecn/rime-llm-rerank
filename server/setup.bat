@@ -26,18 +26,15 @@ echo [OK] Python found
 echo.
 echo [1/3] Python packages...
 pip show llama-cpp-python >nul 2>&1
-if errorlevel 1 (
-    echo   Installing llama-cpp-python pywin32 numpy...
-    pip install llama-cpp-python pywin32 numpy --quiet
-    if errorlevel 1 (
-        echo [ERROR] Install failed. Try:
-        echo   pip install llama-cpp-python pywin32 numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
-        pause
-        exit /b 1
-    )
-) else (
-    echo   [SKIP] Already installed
-)
+if not errorlevel 1 echo   [SKIP] Already installed & goto :pkg_done
+echo   Installing llama-cpp-python pywin32 numpy...
+pip install llama-cpp-python pywin32 numpy --quiet
+if not errorlevel 1 (echo   [OK] Installed) & goto :pkg_done
+echo   [ERROR] Install failed. Try:
+echo     pip install llama-cpp-python pywin32 numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
+pause
+exit /b 1
+:pkg_done
 
 echo.
 echo [2/3] Pipe DLL...
@@ -45,18 +42,14 @@ set "RIME_DIR=C:\Program Files\Rime"
 set "DLL_DST="
 if exist "%RIME_DIR%\weasel-0.17.4" set "DLL_DST=%RIME_DIR%\weasel-0.17.4\rime_pipe.dll"
 if exist "%RIME_DIR%\weasel-0.16.3" set "DLL_DST=%RIME_DIR%\weasel-0.16.3\rime_pipe.dll"
-if "%DLL_DST%"=="" (
-    echo   [WARN] RIME not found. Manually copy rime_pipe.dll to RIME program dir.
-) else if exist "%DLL_DST%" (
-    echo   [SKIP] Already installed
-) else (
-    copy /Y "%~dp0rime_pipe.dll" "%DLL_DST%" >nul 2>&1
-    if errorlevel 1 (
-        echo   [WARN] Permission denied. Right-click -^> Run as Administrator.
-    ) else (
-        echo   [OK] Installed
-    )
-)
+if defined DLL_DST goto :dll_check
+echo   [WARN] RIME not found. Manually copy rime_pipe.dll to RIME program dir.
+goto :dll_done
+:dll_check
+if exist "%DLL_DST%" echo   [SKIP] Already installed & goto :dll_done
+copy /Y "%~dp0rime_pipe.dll" "%DLL_DST%" >nul 2>&1
+if errorlevel 1 (echo   [WARN] Permission denied. Right-click -^> Run as Administrator.) else echo   [OK] Installed
+:dll_done
 
 echo.
 echo [3/3] Model file...
