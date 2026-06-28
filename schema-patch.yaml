@@ -1,0 +1,12 @@
+# RIME LLM 候选重排 — 配置示例
+# 将以下内容合并到你的输入法方案 schema.yaml 中
+#
+# 前提: 已将 lua\*.lua 复制到你的方案目录
+#
+# 如果已有 processors 或 filters 列表，追加到末尾即可
+
+engine:
+  processors:
+    - lua_processor@*llm_context     # 收集上屏文字（LLM 需要）
+  filters:
+    - lua_filter@*llm_rerank         # LLM 候选重排
