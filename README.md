@@ -68,8 +68,6 @@ python -c "from llama_cpp import Llama; print('安装成功')"
 
 如果没报错，说明编译和安装都正确。
 
-> 下载慢加清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
-
 下载慢换清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
 
 ### 第二步：安装管道 DLL
