@@ -41,14 +41,14 @@ pip install llama-cpp-python==0.3.2 --extra-index-url https://abetlen.github.io/
 copy /Y server\rime_pipe.dll "C:\Program Files\Rime\weasel-0.17.4\rime_pipe.dll"
 ```
 
-### 第三步：下载模型
+### 第三步：下载模型（约 500MB）
 
 ```powershell
 mkdir d:\gguf_models
-python -c "from modelscope import snapshot_download; snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*')"
+python -c "from modelscope import snapshot_download; import shutil,glob,os; d=snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*'); [shutil.move(f, 'd:/gguf_models/'+os.path.basename(f)) for f in glob.glob(d+'/*.gguf')]"
 ```
 
-模型会下载到 `d:\gguf_models\`，约 500MB。
+下载完成后，模型文件位于 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`。
 
 ### 第四步：配置你的输入法方案
 
