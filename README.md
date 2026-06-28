@@ -73,6 +73,13 @@ rime-llm-rerank\
 │   ├── start_server.bat      # 启动
 │   └── stop_server.bat       # 停止
 ├── schema-patch.yaml         # 配置示例
+├── dev/                        # 开发者工具
+│   ├── rime_pipe.c             #   C 管道客户端源码
+│   ├── eval_and_analyze.py     #   GPU 评估 + 失败分析
+│   ├── bench_tok_cand.py       #   延迟基准
+│   ├── bench_configs.py        #   配置基准
+│   ├── sync.ps1                #   同步脚本（工作目录→发布目录）
+│   └── LLM服务使用说明.md      #   详细技术文档
 └── README.md
 ```
 
