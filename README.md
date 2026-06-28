@@ -26,10 +26,15 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 ```powershell
 pip install pywin32 numpy modelscope
-pip install llama-cpp-python==0.3.2 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+
+# 先安装 C++ 编译工具（只需一次，约 3GB）
+# 下载并运行：https://visualstudio.microsoft.com/visual-cpp-build-tools/
+# 安装时勾选「C++ 桌面开发工作负荷」
+
+pip install llama-cpp-python
 ```
 
-> `llama-cpp-python` 必须锁定 `==0.3.2`。最新版没有预编译 wheel，会尝试从源码编译（需要 Visual Studio，普通用户无法完成）。`--extra-index-url` 提供官方预编译版，**不需要安装任何编译工具**。
+> Qwen3.5 模型需要较新的 llama.cpp（b7973+），对应的 `llama-cpp-python` 版本（0.3.20+）没有预编译 wheel，必须从源码编译。所以需要先装一次 Visual Studio Build Tools。
 
 下载慢换清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
 
