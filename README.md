@@ -25,11 +25,11 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 ### 第一步：安装 LLM 服务
 
 ```
-双击 server\setup.bat          → 一键安装：依赖 + DLL + 下载模型（约 5-15 分钟）
-双击 server\start_server.bat   → 启动推理服务（窗口自动关闭，后台运行）
+右键 server\setup.ps1 → 使用 PowerShell 运行          → 一键安装（约 5-15 分钟）
+双击 server\start_server.bat                            → 启动推理服务（窗口自动关闭）
 ```
 
-**setup.bat 做了什么：**
+**setup.ps1 做了什么：**
 - 安装 3 个 Python 包（llama-cpp-python, pywin32, numpy）
 - 复制 `rime_pipe.dll` 到 `C:\Program Files\Rime\weasel-*\`
 - 从魔搭（modelscope.cn）下载 `Qwen3.5-0.8B-Q4_K_M.gguf` 到 `d:\gguf_models\`
@@ -69,7 +69,7 @@ rime-llm-rerank\
 ├── server\
 │   ├── pipe_server.py        # 推理服务（4 进程并行）
 │   ├── rime_pipe.dll         # 命名管道客户端
-│   ├── setup.bat             # 一键安装（依赖 + DLL + 模型）
+│   ├── setup.ps1             # 一键安装（右键 → PowerShell 运行）
 │   ├── start_server.bat      # 启动
 │   └── stop_server.bat       # 停止
 ├── schema-patch.yaml         # 配置示例
