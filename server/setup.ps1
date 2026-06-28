@@ -15,11 +15,21 @@ Write-Host ""
 $py = Get-Command python -ErrorAction SilentlyContinue
 if (-not $py) {
     Write-Host "[ERROR] Python not found."
-    Write-Host "Install Python 3.10+ from python.org"
+    Write-Host "Install Python 3.12 from python.org"
+    Write-Host "(llama-cpp-python does not support Python 3.14+ yet)"
     Read-Host "Press Enter to exit"
     exit 1
 }
-Write-Host "[OK] Python: $(python --version 2>&1)"
+$pyVer = python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+$pyMajor = [int]($pyVer.Split('.')[0])
+$pyMinor = [int]($pyVer.Split('.')[1])
+Write-Host "[OK] Python: $pyVer"
+if ($pyMajor -eq 3 -and $pyMinor -ge 14) {
+    Write-Host "[WARN] Python 3.14+ may not work with llama-cpp-python yet."
+    Write-Host "If install fails, download Python 3.12 from python.org"
+    Write-Host "(leave Python 3.12 checked in PATH during install)"
+    Write-Host ""
+}
 
 # [1/3] Python packages
 Write-Host ""
