@@ -4,7 +4,7 @@ import json, time, numpy as np, sys, os, ctypes
 from multiprocessing import Process, Queue as MPQueue
 import win32pipe, win32file, pywintypes
 
-PIPE_NAME = r"\\.\pipe\rime_ll3"
+PIPE_NAME = r"\\.\pipe\rime_llm"
 MODEL_PATH = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
 N_CTX = 64
 N_WORKERS = 4
