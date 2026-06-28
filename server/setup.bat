@@ -1,5 +1,4 @@
-@echo off
-chcp 65001 >nul
+﻿@echo off & chcp 65001 >nul
 title 安装 LLM 推理服务
 echo ============================================
 echo   RIME LLM 推理服务 — 一键安装
@@ -13,16 +12,14 @@ echo.
 echo 预计耗时 5-15 分钟，请确保网络畅通。
 echo.
 
-REM ── 检查 Python ──
 python --version >nul 2>&1
 if errorlevel 1 (
     echo [错误] 未找到 Python！
     echo 请先安装 Python 3.10+ (python.org)，安装时务必勾选 Add to PATH
     pause & exit /b 1
 )
-echo [通过] Python 已安装 (%python --version 2>&1)
+echo [通过] Python 已安装
 
-REM ── 安装依赖 ──
 echo.
 echo [1/3] 安装 Python 包...
 pip install llama-cpp-python pywin32 numpy --quiet
@@ -32,7 +29,6 @@ if errorlevel 1 (
 )
 echo [通过] 依赖安装完成
 
-REM ── 安装 DLL ──
 echo.
 echo [2/3] 安装管道通信组件...
 set "RIME_DIR=C:\Program Files\Rime"
@@ -47,7 +43,6 @@ if exist "%RIME_DIR%\weasel-0.17.4" (
     echo   C:\Program Files\Rime\weasel-版本号\
 )
 
-REM ── 下载模型 ──
 echo.
 echo [3/3] 从魔搭下载模型 (约 500MB)...
 if not exist "d:\gguf_models" mkdir "d:\gguf_models"
