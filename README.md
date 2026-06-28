@@ -75,7 +75,7 @@ python -c "from llama_cpp import Llama; print('安装成功')"
 将 `server\rime_pipe.dll` 复制到小狼毫安装目录（需管理员权限）：
 
 ```powershell
-copy /Y server\rime_pipe.dll "C:\Program Files\Rime\weasel-0.17.4\rime_pipe.dll"
+Copy-Item -Force server\rime_pipe.dll "C:\Program Files\Rime\weasel-0.17.4\"
 ```
 
 ### 第三步：下载模型（约 500MB）
