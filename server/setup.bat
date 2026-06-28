@@ -24,42 +24,56 @@ if errorlevel 1 (
 echo [OK] Python found
 
 echo.
-echo [1/3] Installing Python packages...
-pip install llama-cpp-python pywin32 numpy --quiet
+echo [1/3] Python packages...
+pip show llama-cpp-python >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Install failed. Try:
-    echo   pip install llama-cpp-python pywin32 numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
-    pause
-    exit /b 1
+    echo   Installing llama-cpp-python pywin32 numpy...
+    pip install llama-cpp-python pywin32 numpy --quiet
+    if errorlevel 1 (
+        echo [ERROR] Install failed. Try:
+        echo   pip install llama-cpp-python pywin32 numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
+        pause
+        exit /b 1
+    )
+) else (
+    echo   [SKIP] Already installed
 )
-echo [OK] Packages installed
 
 echo.
-echo [2/3] Installing pipe DLL...
+echo [2/3] Pipe DLL...
 set "RIME_DIR=C:\Program Files\Rime"
-if exist "%RIME_DIR%\weasel-0.17.4" (
-    copy /Y "%~dp0rime_pipe.dll" "%RIME_DIR%\weasel-0.17.4\rime_pipe.dll" >nul
-    echo [OK] Installed to %RIME_DIR%\weasel-0.17.4
-) else if exist "%RIME_DIR%\weasel-0.16.3" (
-    copy /Y "%~dp0rime_pipe.dll" "%RIME_DIR%\weasel-0.16.3\rime_pipe.dll" >nul
-    echo [OK] Installed to %RIME_DIR%\weasel-0.16.3
+set "DLL_DST="
+if exist "%RIME_DIR%\weasel-0.17.4" set "DLL_DST=%RIME_DIR%\weasel-0.17.4\rime_pipe.dll"
+if exist "%RIME_DIR%\weasel-0.16.3" set "DLL_DST=%RIME_DIR%\weasel-0.16.3\rime_pipe.dll"
+if "%DLL_DST%"=="" (
+    echo   [WARN] RIME not found. Manually copy rime_pipe.dll to RIME program dir.
+) else if exist "%DLL_DST%" (
+    echo   [SKIP] Already installed
 ) else (
-    echo [WARN] RIME not found. Manually copy rime_pipe.dll to:
-    echo   C:\Program Files\Rime\weasel-VERSION\
+    copy /Y "%~dp0rime_pipe.dll" "%DLL_DST%" >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARN] Permission denied. Right-click -^> Run as Administrator.
+    ) else (
+        echo   [OK] Installed
+    )
 )
 
 echo.
-echo [3/3] Downloading model from ModelScope (~500MB)...
-if not exist "d:\gguf_models" mkdir "d:\gguf_models"
-pip install modelscope --quiet 2>nul
-python -c "from modelscope import snapshot_download; snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*')"
-
+echo [3/3] Model file...
 if exist "d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf" (
-    echo [OK] Model saved to d:\gguf_models\
+    echo   [SKIP] Already downloaded
 ) else (
-    echo [ERROR] Model download failed. Check internet and retry.
-    pause
-    exit /b 1
+    if not exist "d:\gguf_models" mkdir "d:\gguf_models"
+    echo   Downloading from ModelScope (~500MB)...
+    pip install modelscope --quiet 2>nul
+    python -c "from modelscope import snapshot_download; snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*')"
+    if exist "d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf" (
+        echo   [OK] Download complete
+    ) else (
+        echo   [ERROR] Download failed. Check internet and retry.
+        pause
+        exit /b 1
+    )
 )
 
 echo.
