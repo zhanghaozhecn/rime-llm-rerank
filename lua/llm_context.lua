@@ -1,6 +1,6 @@
 -- llm_context.lua — 累积上屏历史，用 CommitHistory API 拿到真正上屏文字
 
-local MAX_CHARS = 20  -- 充足上文缓冲，服务端按5token截断保证延迟稳定
+local MAX_CHARS = 20  -- 上文缓冲，服务端按4token截断
 local IDLE_CLEAR_SEC = 20
 
 local history = {}

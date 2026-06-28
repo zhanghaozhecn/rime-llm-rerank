@@ -40,11 +40,6 @@ local function filter(translation, env)
     local context = clean_context(
         (_G.llm_context_get and _G.llm_context_get()) or ""
     )
-    if #context < 6 then
-        for _, c in ipairs(all) do yield(c) end; return
-    end
-    if #context > 60 then context = string.sub(context, -60) end
-
     -- 发送所有候选到 LLM
     local max_send = 9
     local parts = {}
@@ -61,6 +56,8 @@ local function filter(translation, env)
         local r, s = http.request("http://127.0.0.1:9877/rerank", body)
         if type(s) == "number" and s >= 200 and s < 300 and type(r) == "string" then
             raw_resp = r
+            -- 服务端判断上文不足，不重排
+            if r:find('"rerank":%s*false') then return nil end
             return parse_first(r)
         end
         return nil
@@ -96,7 +93,7 @@ local function filter(translation, env)
             if c ~= llm_cand then yield(c) end
         end
     else
-        -- LLM 失败 → 保持原序
+        -- 服务端返回不重排 / LLM 失败 → 保持原序
         for _, c in ipairs(all) do yield(c) end
     end
 end
