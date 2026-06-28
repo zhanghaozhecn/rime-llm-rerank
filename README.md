@@ -26,13 +26,12 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 ```powershell
 pip install pywin32 numpy modelscope
-pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+pip install llama-cpp-python==0.3.2 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 ```
 
-> **注意**：`llama-cpp-python` 使用预编译版（`--extra-index-url`），**不需要**安装 Visual Studio 或 C++ 编译工具。
-> 如果报版本不匹配，尝试：`pip install llama-cpp-python==0.3.2 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
+> `llama-cpp-python` 必须锁定 `==0.3.2`。最新版没有预编译 wheel，会尝试从源码编译（需要 Visual Studio，普通用户无法完成）。`--extra-index-url` 提供官方预编译版，**不需要安装任何编译工具**。
 
-如果下载慢，换清华源：`pip install ... -i https://pypi.tuna.tsinghua.edu.cn/simple`（和 `--extra-index-url` 分开用）
+下载慢换清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
 
 ### 第二步：安装管道 DLL
 
