@@ -26,10 +26,18 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 ```powershell
 pip install pywin32 numpy modelscope
+
+# 方案一：预编译包（不支持 AVX-512 的旧 CPU 可能失败）
 pip install llama-cpp-python==0.3.30 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+
+# 方案二：方案一失败时，从源码编译（需先装 VS Build Tools）
+#   1. 下载安装 Visual Studio Build Tools：https://visualstudio.microsoft.com/visual-cpp-build-tools/
+#      （勾选「C++ 桌面开发」）
+#   2. $env:CMAKE_ARGS="-DGGML_AVX512=OFF -DGGML_AVX2=ON -DGGML_NATIVE=OFF"
+#      pip install llama-cpp-python==0.3.30 --force-reinstall --no-cache-dir
 ```
 
-> `llama-cpp-python` 锁定 `==0.3.30`（支持 Qwen3.5 且有预编译 wheel）。`--extra-index-url` 使用官方预编译版，**不需要安装 Visual Studio 或任何编译工具**。
+> 预编译 wheel 使用 AVX-512 指令集，旧 CPU（10 代酷睿之前）可能不支持。如果 `start_server.bat` 启动后 python 进程立即退出，说明 CPU 不兼容，换方案二。
 
 下载慢换清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
 
