@@ -133,11 +133,18 @@ if __name__ == "__main__":
             _, data = win32file.ReadFile(pipe, 65536)
             body = data.decode('utf-8')
             req = json.loads(body)
-            # 停止信号：收到 {"stop":true} 直接返回
+            # 停止信号
             if req.get("stop"):
                 return
+            # 上文不足 2 token → 不重排
+            context = req.get("context", "")
+            ctx_ids = tokenize(context)
+            if len(ctx_ids) < 2:
+                resp = json.dumps({"rerank": False}, ensure_ascii=False)
+                win32file.WriteFile(pipe, resp.encode('utf-8'))
+                return
             t0 = time.perf_counter()
-            ranked = score(req.get("context", ""), req.get("candidates", []))
+            ranked = score(context, req.get("candidates", []))
             ms = (time.perf_counter() - t0) * 1000
             resp = json.dumps({"first": ranked[0] if ranked else "", "latency_ms": ms},
                               ensure_ascii=False)
