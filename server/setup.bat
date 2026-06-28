@@ -9,6 +9,7 @@ echo   1. Install Python packages: llama-cpp-python, pywin32, numpy
 echo   2. Copy rime_pipe.dll to RIME program directory
 echo   3. Download model from ModelScope (~500MB)
 echo.
+echo NOTE: Right-click this file -^> "Run as Administrator" for DLL install.
 echo Estimated time: 5-15 min. Requires internet.
 echo.
 
@@ -51,7 +52,7 @@ echo.
 echo [3/3] Downloading model from ModelScope (~500MB)...
 if not exist "d:\gguf_models" mkdir "d:\gguf_models"
 pip install modelscope --quiet 2>nul
-python -c "from modelscope import snapshot_download; import shutil,os,glob; d=snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*'); [shutil.copy2(f,'d:/gguf_models/'+os.path.basename(f)) for f in glob.glob(os.path.join(d,'*Q4_K_M*'))]"
+python -c "from modelscope import snapshot_download; snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*')"
 
 if exist "d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf" (
     echo [OK] Model saved to d:\gguf_models\
