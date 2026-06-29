@@ -13,6 +13,10 @@ from openpyxl.utils import get_column_letter
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", choices=["all","2only","both"], default="both")
 parser.add_argument("--samples", type=int, default=10000)
+parser.add_argument("--token-range", type=str, default="",
+                    help="Token range to sweep, e.g. 1-20.")
+parser.add_argument("--nofix", action="store_true",
+                    help="Skip pin_fix filtering (test raw baseline)")
 args = parser.parse_args()
 
 # ============================================================
@@ -24,10 +28,19 @@ PIN_FIX_PATH = os.path.join(SCRIPT_DIR, "..", "配置文件", "pin_fix.txt")
 OUTPUT = os.path.join(SCRIPT_DIR, "eval_results.xlsx")
 
 DEVICE = "cuda"; BATCH_SIZE = 48; FIXED_SEQ = 64
-N_TOKENS = 4; MAX_CANDIDATES = 4
+MAX_CANDIDATES = 4
 TARGET = args.samples
 RUN_ALL = args.mode in ("all", "both")
 RUN_2ONLY = args.mode in ("2only", "both")
+
+# Token sweep range
+if args.token_range:
+    lo, hi = args.token_range.split("-")
+    TOKEN_SWEEP = list(range(int(lo), int(hi)+1))
+    N_TOKENS = TOKEN_SWEEP[0]  # for pre-encode (use max needed)
+else:
+    TOKEN_SWEEP = [4]
+    N_TOKENS = 4
 
 random.seed(42)
 
@@ -69,7 +82,8 @@ with open(PIN_FIX_PATH, 'r', encoding='utf-8') as f:
         line = line.strip()
         if line and not line.startswith('#') and '\t' in line:
             pin_fix_codes.add(line.split('\t', 1)[0])
-print(f"  全词:{len(hom_all)} 仅二字词:{len(hom_2only)} 固顶:{len(pin_fix_codes)} 模式:{args.mode} 样本:{TARGET}")
+fix_info = "跳过" if args.nofix else str(len(pin_fix_codes))
+print(f"  全词:{len(hom_all)} 仅二字词:{len(hom_2only)} 固顶:{fix_info} 模式:{args.mode} 样本:{TARGET}")
 
 # ============================================================
 # 2. 采样
@@ -95,7 +109,7 @@ with open(CORPUS_PATH, 'r', encoding='utf-8') as f:
 
             if need_all and len(test_all) < need_all and w in search_all:
                 codes = whc_all[w]
-                ok = codes[0] in hom_all and codes[0] not in pin_fix_codes
+                ok = codes[0] in hom_all and (args.nofix or codes[0] not in pin_fix_codes)
                 if ok:
                     k = (prev[-30:], w, 'A')
                     if k not in seen_all:
@@ -144,11 +158,12 @@ ctx_2, cands_2 = pre_encode(test_2only)
 code_net = defaultdict(lambda: {"save": 0, "hurt": 0})  # save=LLM挽救, hurt=LLM误判
 
 @torch.no_grad()
-def evaluate_full(ctx_list, cands_list, pairs, label):
+def evaluate_full(ctx_list, cands_list, pairs, label, n_tokens=None):
     """评估并记录每个样本的详细信息"""
+    if n_tokens is None: n_tokens = N_TOKENS
     rows_data, offsets = [], [0]
     for ctx_ids, cand_ids in zip(ctx_list, cands_list):
-        truncated = ctx_ids[-N_TOKENS:] if len(ctx_ids) >= N_TOKENS else ctx_ids
+        truncated = ctx_ids[-n_tokens:] if len(ctx_ids) >= n_tokens else ctx_ids
         ctx_len = len(truncated)
         for w_ids in cand_ids:
             rows_data.append((truncated, ctx_len, w_ids))
@@ -223,8 +238,85 @@ def evaluate_full(ctx_list, cands_list, pairs, label):
     return acc, failures
 
 # ── 跑选择的模式 ──
-print(f"\n  {'模式':<12} {'基线':>8} {'LLM':>8} {'提升':>8} {'样本':>6} {'失败':>6}")
-print(f"  {'-'*50}")
+if len(TOKEN_SWEEP) > 1:
+    @torch.no_grad()
+    def evaluate_fast(ctx_list, cands_list, pairs, n_tokens):
+        # 1. 批量收集所有序列 (纯 Python list，避免逐行 torch.tensor)
+        seqs, ctx_lens_list, w_lens_list = [], [], []
+        offsets = [0]
+        for ctx_ids, cand_ids in zip(ctx_list, cands_list):
+            truncated = ctx_ids[-n_tokens:] if len(ctx_ids) >= n_tokens else ctx_ids
+            ctx_len = len(truncated)
+            for w_ids in cand_ids:
+                total = min(ctx_len + len(w_ids), FIXED_SEQ)
+                ctx_slot = min(ctx_len, total)
+                cand_slot = min(len(w_ids), total - ctx_slot)
+                seq = truncated[:ctx_slot] + w_ids[:cand_slot]
+                seqs.append(torch.tensor(seq, dtype=torch.long))
+                ctx_lens_list.append(ctx_slot)
+                w_lens_list.append(cand_slot)
+            offsets.append(len(seqs))
+
+        total_rows = len(seqs)
+        # 2. 一次性 padding (C++ 实现，快)
+        input_ids = torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True,
+                                                      padding_value=tokenizer.pad_token_id).to(DEVICE)
+        ctx_lens = torch.tensor(ctx_lens_list, dtype=torch.long, device=DEVICE)
+        w_lens = torch.tensor(w_lens_list, dtype=torch.long, device=DEVICE)
+
+        # 3. GPU 推理
+        all_scores = []
+        for start in range(0, total_rows, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, total_rows)
+            out = model(input_ids=input_ids[start:end], use_cache=False)
+            logits = out.logits.float()
+            for b in range(end - start):
+                cl = ctx_lens[start + b].item(); wl = w_lens[start + b].item()
+                if wl == 0: all_scores.append(-1e10); continue
+                logits_c = logits[b, cl - 1:cl - 1 + wl]
+                labels_c = input_ids[start + b, cl:cl + wl]
+                ce = torch.nn.functional.cross_entropy(logits_c, labels_c, reduction='sum').item()
+                all_scores.append(-ce)
+
+        # 4. 统计 Hit@1
+        correct = 0
+        for i in range(len(pairs)):
+            start = offsets[i]; end = offsets[i + 1]
+            if start >= len(all_scores): break
+            scores = all_scores[start:end]
+            if not scores: continue
+            best_idx = scores.index(max(scores))
+            _, correct_word, _, orig_cands = pairs[i]
+            cands = orig_cands[:MAX_CANDIDATES]
+            if best_idx < len(cands) and cands[best_idx] == correct_word:
+                correct += 1
+        return correct / max(1, len(pairs))
+
+    base_a = baseline(test_all); base_b = baseline(test_2only)
+    print(f"\n  全词基线={base_a:.1%}  仅二字词基线={base_b:.1%}  样本={TARGET}")
+    print(f"  {'tok':>4} {'全词':>8} {'Δ':>7} {'二字词':>8} {'Δ':>7} {'耗时':>8}")
+    print(f"  {'-'*48}")
+    all_results = {}
+    t0 = time.perf_counter()
+    for nt in TOKEN_SWEEP:
+        t1 = time.perf_counter()
+        row = f"  {nt:>4}"
+        if RUN_ALL:
+            acc = evaluate_fast(ctx_all, cands_all, test_all, nt)
+            row += f" {acc:>7.1%} {acc-base_a:>+6.1%}"
+            all_results.setdefault("全词", {})[nt] = acc
+        if RUN_2ONLY:
+            acc = evaluate_fast(ctx_2, cands_2, test_2only, nt)
+            row += f" {acc:>7.1%} {acc-base_b:>+6.1%}"
+            all_results.setdefault("仅二字词", {})[nt] = acc
+        dt1 = time.perf_counter() - t1
+        row += f" {dt1:>7.1f}s"
+        print(row, flush=True)
+    dt = time.perf_counter() - t0
+    import json as _json
+    _json.dump(all_results, open(os.path.join(SCRIPT_DIR, "eval_sweep.json"), "w"), indent=2)
+    print(f"\n总耗时: {dt:.0f}s  结果已保存: eval_sweep.json", flush=True)
+    sys.exit(0)
 
 t0 = time.perf_counter()
 modes = []
