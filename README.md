@@ -25,7 +25,7 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 | 条件 | 说明 |
 |------|------|
 | Windows 系统 | 仅支持 Windows（命名管道通信） |
-| Python 3.12 | 必须 3.12（llama-cpp-python 不支持 3.14+）。安装时勾选「Add to PATH」 |
+| Python | [3.12.10](https://www.python.org/downloads/release/python-31210/)（唯一验证版本）。安装时勾选「Add to PATH」 |
 | 磁盘空间 | ~1.5 GB（模型 500MB + Python 依赖 ~500MB） |
 | 内存 | ~1.5 GB 可用内存 |
 
