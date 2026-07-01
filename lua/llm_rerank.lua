@@ -1,25 +1,35 @@
--- llm_rerank.lua — LLM 候选重排 filter
--- 职责：LLM 评估所有候选 → 首选移到最前 + ⚡
--- 固顶逻辑由独立的 pin_fix_filter.lua 处理
-local http = require("rime_pipe")
-http.TIMEOUT = 0.2
+-- llm_rerank.lua — LLM candidate rerank filter
+-- Backend: auto-detect C++ plugin, fallback to pipe server
+local llm = nil
+local backend = "none"
 
--- === 延迟统计 ===
-local lat_max = 0
-local lat_count = 0
+-- Try C++ plugin first (zero-dependency)
+local ok_cpp, cpp = pcall(function() return require("rime_llm") end)
+if ok_cpp and cpp then
+    local MODEL = os.getenv("RIME_LLM_MODEL") or "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
+    cpp.model_path = MODEL
+    llm = cpp
+    backend = "cpp"
+-- Fallback to Python pipe server
+else
+    local ok_pipe, pipe = pcall(function() return require("rime_pipe") end)
+    if ok_pipe and pipe then
+        pipe.TIMEOUT = 0.2
+        llm = pipe
+        backend = "pipe"
+    end
+end
 
 local function parse_first(raw)
     if not raw or #raw == 0 then return nil end
     local fp = raw:find('"first"')
     if not fp then return nil end
     local s = raw:sub(fp)
-    local w = s:match('"first":%s*"([^"]+)"')
-    return w
+    return s:match('"first":%s*"([^"]+)"')
 end
 
-local function clean_context(s)
-    return (s:gsub('%s+', ''))
-end
+local lat_max = 0
+local lat_count = 0
 
 local function filter(translation, env)
     local all = {}
@@ -36,66 +46,48 @@ local function filter(translation, env)
         for _, c in ipairs(all) do yield(c) end; return
     end
 
-    -- 上下文收集
-    local context = clean_context(
-        (_G.llm_context_get and _G.llm_context_get()) or ""
-    )
-    -- 发送所有候选到 LLM
-    local max_send = 9
-    local parts = {}
-    for i, c in ipairs(all) do
-        if i > max_send then break end
-        table.insert(parts, '"' .. c.text:gsub('\\', '\\\\'):gsub('"', '\\"') .. '"')
+    if not llm then
+        for _, c in ipairs(all) do yield(c) end; return
     end
-    local esc = context:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
-    local body = '{"context":"' .. esc .. '","candidates":[' .. table.concat(parts, ",") .. ']}'
+
+    local context = ((_G.llm_context_get and _G.llm_context_get()) or ""):gsub('%s+', '')
+    local cands = {}
+    for i, c in ipairs(all) do if i > 9 then break end; table.insert(cands, c.text) end
 
     local t0 = os.clock()
-    local raw_resp = nil
-    local ok, result = pcall(function()
-        local r, s = http.request("http://127.0.0.1:9877/rerank", body)
-        if type(s) == "number" and s >= 200 and s < 300 and type(r) == "string" then
-            raw_resp = r
-            -- 服务端判断上文不足，不重排
-            if r:find('"rerank":%s*false') then return nil end
-            return parse_first(r)
-        end
-        return nil
-    end)
-    local elapsed_ms = (os.clock() - t0) * 1000
+    local ok, result = nil, nil
 
-    -- 更新峰值延迟
+    if backend == "cpp" then
+        ok, result = pcall(function() return llm.score(context, cands) end)
+    else -- pipe
+        local parts = {}
+        for _, w in ipairs(cands) do table.insert(parts, '"' .. w:gsub('\\', '\\\\'):gsub('"', '\\"') .. '"') end
+        local esc = context:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
+        local body = '{"context":"' .. esc .. '","candidates":[' .. table.concat(parts, ",") .. ']}'
+        ok, result = pcall(function()
+            local r, s = llm.request("http://127.0.0.1:9877/rerank", body)
+            if type(s) == "number" and s >= 200 and s < 300 and type(r) == "string" then
+                if r:find('"rerank":%s*false') then return nil end
+                return parse_first(r)
+            end
+        end)
+    end
+
+    local elapsed_ms = (os.clock() - t0) * 1000
     lat_count = lat_count + 1
     if elapsed_ms > lat_max then lat_max = elapsed_ms end
     local pf = io.open(TEMP .. "\\rime_latency.txt", "w")
-    if pf then pf:write(string.format("count=%d  max=%.0fms  last=%.0fms", lat_count, lat_max, elapsed_ms)); pf:close() end
+    if pf then pf:write(string.format("count=%d  max=%.0fms  last=%.0fms  backend=%s", lat_count, lat_max, elapsed_ms, backend)); pf:close() end
 
     if ok and result then
-        local srv_ms = ""
-        if raw_resp then
-            local lm = raw_resp:match('"latency_ms":%s*([%d.]+)')
-            if lm then srv_ms = string.format(" srv=%.0fms", tonumber(lm)) end
-        end
-        local f = io.open(TEMP .. "\\rime_ctx_log.txt", "a")
-        if f then f:write(string.format("「%s」→ %s  total=%.0fms%s\n",
-            context, tostring(result) or "?", elapsed_ms, srv_ms)); f:close() end
-
-        -- LLM 首选移到最前面 + ⚡
         local llm_cand = nil
-        for _, c in ipairs(all) do
-            if c.text == result then llm_cand = c; break end
-        end
+        for _, c in ipairs(all) do if c.text == result then llm_cand = c; break end end
         if llm_cand then
-            yield(ShadowCandidate(llm_cand, llm_cand.type, llm_cand.text,
-                llm_cand.comment .. " ⚡", true))
+            yield(ShadowCandidate(llm_cand, llm_cand.type, llm_cand.text, llm_cand.comment .. " ⚡", true))
         end
-        for _, c in ipairs(all) do
-            if c ~= llm_cand then yield(c) end
-        end
+        for _, c in ipairs(all) do if c ~= llm_cand then yield(c) end end
     else
-        -- 服务端返回不重排 / LLM 失败 → 保持原序
         for _, c in ipairs(all) do yield(c) end
     end
 end
-
 return filter
