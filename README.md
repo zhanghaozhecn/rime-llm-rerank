@@ -22,17 +22,51 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 ## 你需要
 
-| 条件 | 说明 |
-|------|------|
-| Windows | 仅支持 Windows（命名管道通信） |
-| 磁盘 | ~1 GB（模型 500MB + 后端 ~100MB） |
-| 内存 | C++: ~800MB / Python: ~1.5GB |
+- Windows 系统
+- 约 1GB 磁盘空间（模型 500MB）
+- C++ 后端 ~800MB 内存 / Python 后端 ~1.5GB
 
-## 安装
+## 安装（三步）
 
-### 共同步骤（两个后端都需要）
+### 第一步：下载模型
 
-**1. 配置 RIME 方案**：将 `common\` 下的两个 `.lua` 文件复制到 RIME 方案 `lua\` 目录，在 `schema.yaml` 中添加：
+打开 https://www.modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/files
+
+点击下载 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500MB），放到 `D:\gguf_models\` 目录下。
+
+> 放其他路径需设环境变量 `RIME_LLM_MODEL` 指向模型文件。
+
+### 第二步：选择后端
+
+#### C++ 后端（推荐）
+
+无需安装任何依赖。将 `cpp\user\rime_llm.dll` 复制到小狼毫安装目录：
+
+```
+复制: cpp\user\rime_llm.dll
+   →  C:\Program Files\Rime\weasel-0.17.4\
+```
+
+> 需要管理员权限。不想用 C++ 后端时，删除此 DLL 即可。
+
+#### Python 后端（备选）
+
+1. 安装 [Python 3.12.10](https://www.python.org/downloads/release/python-31210/)（勾选 Add to PATH）
+2. 安装 [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（勾选「使用 C++ 的桌面开发」+「C++ CMake tools」）
+3. 打开 PowerShell，运行：
+
+```powershell
+pip install pywin32 numpy modelscope
+$env:CMAKE_ARGS="-DGGML_AVX2=ON"
+pip install llama-cpp-python==0.3.30 --no-cache-dir
+```
+4. 将 `python\user\rime_pipe.dll` 复制到 `C:\Program Files\Rime\weasel-0.17.4\`
+5. 双击 `python\user\start_server.bat` 启动后台服务
+
+### 第三步：配置 RIME
+
+1. 将 `common\` 下的两个 `.lua` 文件复制到 RIME 方案 `lua\` 目录
+2. 在方案的 `schema.yaml` 中添加：
 
 ```yaml
 engine:
@@ -42,64 +76,18 @@ engine:
     - lua_filter@*llm_rerank
 ```
 
-**2. 下载模型**（~500MB）：
+3. 右键小狼毫托盘 → **重新部署**
 
-```powershell
-mkdir d:\gguf_models
-python -c "from modelscope import snapshot_download; import shutil,glob,os; d=snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*'); [shutil.move(f, 'd:/gguf_models/'+os.path.basename(f)) for f in glob.glob(d+'/*.gguf')]"
-```
-
-模型文件位于 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`。放其他路径需设环境变量 `RIME_LLM_MODEL`。
-
-### 选择后端（推荐 C++）
-
-#### C++ 后端（优先）
-
-无需 Python。将预编译 DLL 复制到小狼毫目录（需管理员）：
-
-```powershell
-Copy-Item -Force cpp\user\rime_llm.dll "C:\Program Files\Rime\weasel-0.17.4\"
-```
-
-重新部署即可。插件自动检测 CPU 线程数。
-
-#### Python 后端
-
-需要 Python [3.12.10](https://www.python.org/downloads/release/python-31210/) + Visual Studio Build Tools。
-
-```powershell
-pip install pywin32 numpy modelscope
-# 安装 VS Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
-#  勾选「使用 C++ 的桌面开发」+「C++ CMake tools for Windows」
-$env:CMAKE_ARGS="-DGGML_AVX2=ON"
-pip install llama-cpp-python==0.3.30 --no-cache-dir
-```
-
-将管道 DLL 复制到小狼毫目录：
-
-```powershell
-Copy-Item -Force python\user\rime_pipe.dll "C:\Program Files\Rime\weasel-0.17.4\"
-```
-
-双击 `python\user\start_server.bat` 启动后台服务。
-
-> 下载慢加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`
-
-### 最后一步
-
-右键小狼毫托盘 → **重新部署**。LLM 选中的候选显示 ⚡。
+LLM 选中的候选显示 ⚡。滤器自动检测：有 C++ DLL 则优先使用，否则使用 Python 服务。
 
 ## 后端对比
 
 | | C++ | Python |
 |------|------|------|
+| 安装 | 复制 DLL | 装 Python + 编译 |
+| 启动 | 无需 | 双击 bat |
 | 延迟 (4tok/4cand) | ~98ms | ~100ms |
-| 依赖 | 无 | Python + VS Build Tools |
-| 启用方式 | 复制 DLL 即可 | 安装依赖 + 启动服务 |
-| 开机自动启动 | 无需 | 需设 startup 快捷方式 |
-| 如何关闭 | 删除 DLL | 双击 `stop_server.bat` |
-
-Lua 滤器自动检测：有 `rime_llm.dll` 则用 C++，否则用 Python。`rime_latency.txt` 中 `backend=` 字段显示当前后端。
+| 开机启动 | 无需 | 设 startup 快捷方式 |
 
 ## 目录结构
 
