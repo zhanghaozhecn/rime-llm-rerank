@@ -24,59 +24,15 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 | 条件 | 说明 |
 |------|------|
-| Windows 系统 | 仅支持 Windows（命名管道通信） |
-| Python | [3.12.10](https://www.python.org/downloads/release/python-31210/)（唯一验证版本）。安装时勾选「Add to PATH」 |
-| 磁盘空间 | ~1.5 GB（模型 500MB + Python 依赖 ~500MB） |
-| 内存 | ~1.5 GB 可用内存 |
+| Windows | 仅支持 Windows（命名管道通信） |
+| 磁盘 | ~1 GB（模型 500MB + 后端 ~100MB） |
+| 内存 | C++: ~800MB / Python: ~1.5GB |
 
-## 安装步骤
+## 安装
 
-### 第一步：安装 Python 依赖
+### 共同步骤（两个后端都需要）
 
-```powershell
-pip install pywin32 numpy modelscope
-```
-
-安装 Visual Studio Build Tools（提供 C++ 编译器）：
-
-1. 下载：https://visualstudio.microsoft.com/visual-cpp-build-tools/
-2. 勾选「使用 C++ 的桌面开发」，右侧额外勾选「C++ CMake tools for Windows」
-3. 安装完成后，编译 llama-cpp-python：
-
-```powershell
-$env:CMAKE_ARGS="-DGGML_AVX2=ON"
-pip install llama-cpp-python==0.3.30 --no-cache-dir
-```
-
-验证：
-
-```powershell
-python -c "from llama_cpp import Llama; print('OK')"
-```
-
-> 下载慢换清华源：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
-
-### 第二步：安装管道 DLL
-
-将 `server\rime_pipe.dll` 复制到小狼毫安装目录（需管理员权限）：
-
-```powershell
-Copy-Item -Force server\rime_pipe.dll "C:\Program Files\Rime\weasel-0.17.4\"
-```
-
-### 第三步：下载模型（约 500MB）
-
-```powershell
-mkdir d:\gguf_models
-python -c "from modelscope import snapshot_download; import shutil,glob,os; d=snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*'); [shutil.move(f, 'd:/gguf_models/'+os.path.basename(f)) for f in glob.glob(d+'/*.gguf')]"
-```
-
-下载完成后，模型文件位于 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`。
-
-### 第四步：配置你的输入法方案
-
-将 `lua\` 目录下的两个 `.lua` 文件复制到你的 RIME 方案 `lua\` 文件夹中。
-在你的方案 `schema.yaml` 中添加：
+**1. 配置 RIME 方案**：将 `common\` 下的两个 `.lua` 文件复制到 RIME 方案 `lua\` 目录，在 `schema.yaml` 中添加：
 
 ```yaml
 engine:
@@ -86,81 +42,95 @@ engine:
     - lua_filter@*llm_rerank
 ```
 
-### 第五步：启动服务 + 重新部署
+**2. 下载模型**（~500MB）：
 
-双击 `server\start_server.bat` → 右键小狼毫托盘 → **重新部署**。LLM 选中的候选显示 ⚡。
+```powershell
+mkdir d:\gguf_models
+python -c "from modelscope import snapshot_download; import shutil,glob,os; d=snapshot_download('unsloth/Qwen3.5-0.8B-GGUF', cache_dir='d:/gguf_models', allow_file_pattern='*Q4_K_M*'); [shutil.move(f, 'd:/gguf_models/'+os.path.basename(f)) for f in glob.glob(d+'/*.gguf')]"
+```
 
-## 后端选择
+模型文件位于 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`。放其他路径需设环境变量 `RIME_LLM_MODEL`。
 
-Lua 滤器启动时自动检测可用后端，优先级：**C++ 插件 > Python 服务**。`rime_latency.txt` 中 `backend=` 字段显示当前使用的后端。
+### 选择后端（推荐 C++）
 
-| 后端 | 延迟 (4tok/4cand) | 内存 | 依赖 |
-|------|:---:|:---:|------|
-| **Python 服务** (推荐) | ~100ms | ~1.5GB | Python + VS Build Tools |
-| **C++ 插件** (实验性) | ~98ms | ~800MB | 仅预编译 DLL |
+#### C++ 后端（优先）
 
-### C++ 插件（可选，无需 Python）
+无需 Python。将预编译 DLL 复制到小狼毫目录（需管理员）：
 
-如果你不想安装 Python 和编译 llama-cpp-python，可以直接使用预编译的 C++ 插件：
+```powershell
+Copy-Item -Force cpp\user\rime_llm.dll "C:\Program Files\Rime\weasel-0.17.4\"
+```
 
-1. 将 `cpp\rime_llm.dll` 复制到小狼毫目录（需管理员）：
-   ```powershell
-   Copy-Item -Force cpp\rime_llm.dll "C:\Program Files\Rime\weasel-0.17.4\"
-   ```
+重新部署即可。插件自动检测 CPU 线程数。
 
-2. 重新部署即可。插件自动检测 CPU 线程数，无需配置。
+#### Python 后端
 
-3. 模型路径默认 `d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf`，可通过环境变量覆盖：
-   ```powershell
-   $env:RIME_LLM_MODEL = "E:\models\my-model.gguf"
-   ```
+需要 Python [3.12.10](https://www.python.org/downloads/release/python-31210/) + Visual Studio Build Tools。
 
-> C++ 插件仍为实验性。如果遇到问题，删除 DLL 即可自动回退到 Python 模式。
+```powershell
+pip install pywin32 numpy modelscope
+# 安装 VS Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+#  勾选「使用 C++ 的桌面开发」+「C++ CMake tools for Windows」
+$env:CMAKE_ARGS="-DGGML_AVX2=ON"
+pip install llama-cpp-python==0.3.30 --no-cache-dir
+```
 
-## 启停（Python 后端）
+将管道 DLL 复制到小狼毫目录：
 
-| 操作 | 方法 |
-|------|------|
-| 启动 | 双击 `server\start_server.bat`（窗口自动关闭，后台运行） |
-| 停止 | 双击 `server\stop_server.bat` |
-| 临时关闭 | 创建文件 `%TEMP%\rime_llm_off`（删除即恢复） |
+```powershell
+Copy-Item -Force python\user\rime_pipe.dll "C:\Program Files\Rime\weasel-0.17.4\"
+```
+
+双击 `python\user\start_server.bat` 启动后台服务。
+
+> 下载慢加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`
+
+### 最后一步
+
+右键小狼毫托盘 → **重新部署**。LLM 选中的候选显示 ⚡。
+
+## 后端对比
+
+| | C++ | Python |
+|------|------|------|
+| 延迟 (4tok/4cand) | ~98ms | ~100ms |
+| 依赖 | 无 | Python + VS Build Tools |
+| 启用方式 | 复制 DLL 即可 | 安装依赖 + 启动服务 |
+| 开机自动启动 | 无需 | 需设 startup 快捷方式 |
+| 如何关闭 | 删除 DLL | 双击 `stop_server.bat` |
+
+Lua 滤器自动检测：有 `rime_llm.dll` 则用 C++，否则用 Python。`rime_latency.txt` 中 `backend=` 字段显示当前后端。
 
 ## 目录结构
 
 ```
 rime-llm-rerank\
-├── lua\
-│   ├── llm_context.lua      # 收集上屏文字
-│   └── llm_rerank.lua       # LLM 候选重排 (auto backend)
-├── server\                    # Python 后端
-│   ├── pipe_server.py        #   推理服务（4 进程并行）
-│   ├── rime_pipe.dll         #   命名管道客户端
-│   ├── start_server.bat      #   启动
-│   └── stop_server.bat       #   停止
-├── cpp\                       # C++ 后端 (预编译 DLL)
-│   └── rime_llm.dll          #   进程内推理插件
-├── schema-patch.yaml         # 配置示例
-├── dev/                        # 开发者工具
-│   ├── rime_pipe.c             #   C 管道客户端源码
-│   ├── eval_and_analyze.py     #   GPU 评估 + 失败分析
-│   ├── bench_tok_cand.py       #   延迟基准
-│   └── bench_configs.py        #   配置基准
+├── common\                   # 共用（两个后端都需要）
+│   ├── llm_rerank.lua        #   候选重排滤器 (auto backend)
+│   └── llm_context.lua       #   上屏文字收集
+├── cpp\                      # C++ 后端
+│   ├── user\
+│   │   └── rime_llm.dll      #   预编译插件
+│   └── dev\                  #   源码 + 构建（需 llama.cpp）
+├── python\                   # Python 后端
+│   ├── user\
+│   │   ├── pipe_server.py    #   推理服务（4 进程）
+│   │   ├── rime_pipe.dll     #   管道客户端
+│   │   ├── start_server.bat
+│   │   └── stop_server.bat
+│   └── dev\
+│       ├── rime_pipe.c       #   管道客户端源码
+│       └── eval_and_analyze.py  # GPU 评估
+├── schema-patch.yaml
 └── README.md
 ```
 
 ## 常见问题
 
-**Q: 启动服务后打字没变化？**
-A: 右键小狼毫 → 重新部署。确认 `lua\` 文件已复制到方案目录。
-
 **Q: 如何确认正在运行？**
 ```powershell
 Get-Content "$env:TEMP\rime_latency.txt"
-# 正常输出: count=342  max=132ms  last=107ms  backend=cpp
+# count=342  max=132ms  last=107ms  backend=cpp
 ```
 
-**Q: 延迟超过 200ms？**
-A: 检查是否有其他程序占满 CPU。正常范围 80-130ms。
-
-**Q: 开机自动启动？**
-A: 右键 `start_server.bat` → 创建快捷方式 → 把快捷方式放到 `shell:startup` 文件夹（仅 Python 后端需要）。
+**Q: 延迟异常？** 正常 80-130ms。超过 200ms 检查 CPU 是否被占满。
