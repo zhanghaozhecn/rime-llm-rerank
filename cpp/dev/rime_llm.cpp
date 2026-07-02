@@ -31,20 +31,19 @@ extern "C" {
 // 自动检测 CPU 线程数（物理核心 × 2 ≈ 逻辑处理器）
 static int detect_phys_cores() {
     int n = (int)std::thread::hardware_concurrency();
-    return n > 0 ? (n * 2 / 3) : 8;  // 逻辑线程的 2/3 ≈ 物理核数
+    return n > 0 ? (n * 2 / 3) : 4;  // ~物理核, 下限 4
 }
 static int detect_logi_cores() {
     int n = (int)std::thread::hardware_concurrency();
-    return n > 0 ? n : 8;
+    return n > 0 ? n : 8;  // 全逻辑线程, 下限 8
 }
 
 static std::string  g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static int          g_max_ctx_tokens = 4;
-static int          g_max_candidates = 4;
-static int          g_n_threads = detect_phys_cores();       // 物理核 ~ 14
-static int          g_n_threads_batch = detect_logi_cores(); // 全逻辑 ~ 20
+static int          g_n_threads = detect_phys_cores();       // 物理核
+static int          g_n_threads_batch = detect_logi_cores(); // 全逻辑
 static int          g_n_ctx = 64;
-static int          g_n_seq_max = 9;
+static int          g_n_seq_max = 9;   // 最多并行候选数
 
 // ============================================================
 // 模型状态
@@ -225,7 +224,8 @@ static int lua_score(lua_State * L) {
 
     std::vector<std::string> cand_texts;
     int n = (int)luaL_len(L, 2);
-    if (n > g_max_candidates) n = g_max_candidates;
+    if (n < 2) { lua_pushnil(L); return 1; }
+    if (n > g_n_seq_max) n = g_n_seq_max;  // capped by parallel seq limit
     for (int i = 1; i <= n; i++) {
         lua_rawgeti(L, 2, i);
         const char * s = lua_tostring(L, -1);

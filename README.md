@@ -77,12 +77,12 @@ llm_rerank:
 
 | 参数 | 默认 | 说明 |
 |------|:---:|------|
-| `code_pattern` | `^[a-z]{4}$` | 只对匹配的编码触发 LLM，避免 1-3 码也被调用 |
-| `min_tokens` | 2 | 上文 token 不够时不重排（0-1 效果差） |
-| `max_tokens` | 4 | 值越大延迟越高，4 性价比最优 |
-| `max_candidates` | 9 | 传给 LLM 的候选数（C++ 最多并行评分 4 个） |
-| `cpu_cores` | 0 | 0 自动检测物理核，可手动指定避免占满 CPU |
-| `cpu_threads` | 0 | 0 自动检测逻辑线程 |
+| `code_pattern` | `^[a-z]{4}$` | 只对匹配的编码触发 LLM |
+| `min_tokens` | 1 | 上文 token 不够时不重排 |
+| `max_tokens` | 4 | 截取的上文 token 数，越大越慢 |
+| `max_candidates` | 4 | 并行评分候选数（2-9） |
+| `cpu_cores` | 0 | 物理核数（0=自动，检测失败→4） |
+| `cpu_threads` | 0 | 逻辑线程数（0=自动，检测失败→8） |
 
 ## 目录结构
 
