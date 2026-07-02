@@ -28,20 +28,9 @@ extern "C" {
 // ============================================================
 // 配置（可通过 Lua 属性修改）
 // ============================================================
-// Windows: 精确获取逻辑处理器数
-static int detect_cores() {
-    int n = (int)std::thread::hardware_concurrency();
-    if (n > 0) return n;
-    // fallback: Query Windows directly
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    return si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 4;
-}
-
 static std::string  g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static int          g_max_ctx_tokens = 4;
-static int          g_n_threads = detect_cores();
-static int          g_n_threads_batch = detect_cores();
+static int          g_n_threads = 6;
 static int          g_n_ctx = 64;
 static int          g_n_seq_max = 9;   // 最多并行候选数
 
@@ -95,7 +84,7 @@ static void load_model_async() {
         llama_context_params cparams = llama_context_default_params();
         cparams.n_ctx = g_n_ctx;
         cparams.n_threads = g_n_threads;
-        cparams.n_threads_batch = g_n_threads_batch;
+        cparams.n_threads_batch = g_n_threads;
         cparams.n_seq_max = g_n_seq_max;
 
         g_ctx = llama_new_context_with_model(g_model, cparams);
@@ -294,7 +283,6 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "max_ctx") == 0) lua_pushinteger(L, g_max_ctx_tokens);
     else if (strcmp(key, "max_cand") == 0) lua_pushinteger(L, g_max_candidates);
     else if (strcmp(key, "n_threads") == 0) lua_pushinteger(L, g_n_threads);
-    else if (strcmp(key, "n_threads_batch") == 0) lua_pushinteger(L, g_n_threads_batch);
     else if (strcmp(key, "n_seq_max") == 0) lua_pushinteger(L, g_n_seq_max);
     else lua_pushnil(L);
     return 1;
@@ -306,7 +294,6 @@ static int lua_newindex(lua_State * L) {
     else if (strcmp(key, "max_ctx") == 0) g_max_ctx_tokens = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "max_cand") == 0) g_max_candidates = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_threads") == 0) g_n_threads = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "n_threads_batch") == 0) g_n_threads_batch = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_ctx") == 0) g_n_ctx = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_seq_max") == 0) g_n_seq_max = (int)luaL_checkinteger(L, 3);
     return 0;
@@ -332,8 +319,6 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
     lua_setfield(L, -2, "max_cand");
     lua_pushinteger(L, g_n_threads);
     lua_setfield(L, -2, "n_threads");
-    lua_pushinteger(L, g_n_threads_batch);
-    lua_setfield(L, -2, "n_threads_batch");
     lua_pushinteger(L, g_n_ctx);
     lua_setfield(L, -2, "n_ctx");
     lua_pushinteger(L, g_n_seq_max);

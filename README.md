@@ -70,9 +70,8 @@ llm_rerank:
   code_pattern: "^[a-z]{4}$"    # 正则：匹配才触发 LLM（如 "^[a-z]{3,4}$"）
   min_tokens: 2                 # 最少上文 token 才重排（1 或 2）
   max_tokens: 4                 # 截取的上文 token 数（1-20）
-  max_candidates: 9             # 传给 LLM 的候选数
-  cpu_cores: 0                  # 物理核数（0 = 自动检测）
-  cpu_threads: 0                # 逻辑线程数（0 = 自动检测）
+  max_candidates: 4             # 并行评分候选数
+  cpu_cores: 6                  # CPU 物理核数
 ```
 
 | 参数 | 默认 | 说明 |
@@ -81,8 +80,7 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 4 | 截取的上文 token 数，越大越慢 |
 | `max_candidates` | 4 | 并行评分候选数（2-9） |
-| `cpu_cores` | 0 | 物理核数（0=自动，检测失败→4） |
-| `cpu_threads` | 0 | 逻辑线程数（0=自动，检测失败→8） |
+| `cpu_cores` | 6 | 线程数（设为物理核数） |
 
 ## 目录结构
 

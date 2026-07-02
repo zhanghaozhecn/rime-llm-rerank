@@ -13,5 +13,4 @@ llm_rerank:
   min_tokens: 1                     # min context tokens to start (1 or 2)
   max_tokens: 4                     # max context tokens (1-20)
   max_candidates: 4                 # candidates to score in parallel (2-9)
-  cpu_cores: 0                      # physical cores (0 = auto-detect)
-  cpu_threads: 0                    # logical threads (0 = auto-detect)
+  cpu_cores: 6                      # physical CPU cores
