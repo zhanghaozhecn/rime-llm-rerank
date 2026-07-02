@@ -11,8 +11,7 @@ local cfg = {
     min_tokens     = 1,             -- min context tokens to start rerank
     max_tokens     = 4,             -- max context tokens for scoring
     max_candidates = 4,             -- candidates to score in parallel (2-9)
-    cpu_cores      = 0,             -- physical cores (0 = auto)
-    cpu_threads    = 0,             -- logical threads (0 = auto)
+    cpu_cores      = 6,             -- physical CPU cores
 }
 
 local lat_max   = 0
@@ -28,7 +27,6 @@ function M.init(env)
         cfg.max_tokens     = tonumber(ns:get_value("max_tokens"))     or cfg.max_tokens
         cfg.max_candidates = tonumber(ns:get_value("max_candidates")) or cfg.max_candidates
         cfg.cpu_cores      = tonumber(ns:get_value("cpu_cores"))      or cfg.cpu_cores
-        cfg.cpu_threads    = tonumber(ns:get_value("cpu_threads"))    or cfg.cpu_threads
     end
 
     -- Try C++ plugin first
@@ -36,8 +34,7 @@ function M.init(env)
     if ok_cpp and cpp then
         cpp.model_path = os.getenv("RIME_LLM_MODEL") or "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
         cpp.max_ctx    = cfg.max_tokens
-        if cfg.cpu_cores   > 0 then cpp.n_threads       = cfg.cpu_cores   end
-        if cfg.cpu_threads > 0 then cpp.n_threads_batch  = cfg.cpu_threads end
+        cpp.n_threads = cfg.cpu_cores
         llm = cpp
         backend = "cpp"
     else
