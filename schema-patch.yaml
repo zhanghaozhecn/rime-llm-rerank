@@ -1,12 +1,17 @@
-# RIME LLM 候选重排 — 配置示例
-# 将以下内容合并到你的输入法方案 schema.yaml 中
-#
-# 前提: 已将 lua\*.lua 复制到你的方案目录
-#
-# 如果已有 processors 或 filters 列表，追加到末尾即可
+# RIME LLM candidate rerank — example config
+# Merge this into your schema.yaml
 
 engine:
   processors:
-    - lua_processor@*llm_context     # 收集上屏文字（LLM 需要）
+    - lua_processor@*llm_context     # collect committed text
   filters:
-    - lua_filter@*llm_rerank         # LLM 候选重排
+    - lua_filter@*llm_rerank         # LLM rerank
+
+# LLM rerank settings (all optional, defaults shown)
+llm_rerank:
+  code_pattern: "^[a-z]{4}$"        # regex: which codes trigger LLM
+  min_tokens: 2                     # min context tokens to start (1 or 2)
+  max_tokens: 4                     # max context tokens (1-20)
+  max_candidates: 9                 # max candidates passed to LLM
+  cpu_cores: 0                      # physical cores (0 = auto-detect)
+  cpu_threads: 0                    # logical threads (0 = auto-detect)

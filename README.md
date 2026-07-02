@@ -63,14 +63,26 @@ Get-Content "$env:TEMP\rime_latency.txt"    # count=342  max=132ms  last=107ms  
 
 ## 配置参数
 
-修改 `llm_rerank.lua` 顶部：
+在方案的 `schema.yaml` 中配置（全部可选，不设则用默认值）：
 
-```lua
-local MIN_INPUT      = 4    -- 最少输入码长才触发 LLM
-local MAX_CANDIDATES = 9    -- 最多发送候选数
-local CPP_MAX_CTX    = 4    -- 最大上文 token 数
-local CPP_MAX_CAND   = 4    -- 并行评分候选数（越大越慢）
+```yaml
+llm_rerank:
+  code_pattern: "^[a-z]{4}$"    # 正则：匹配才触发 LLM（如 "^[a-z]{3,4}$"）
+  min_tokens: 2                 # 最少上文 token 才重排（1 或 2）
+  max_tokens: 4                 # 截取的上文 token 数（1-20）
+  max_candidates: 9             # 传给 LLM 的候选数
+  cpu_cores: 0                  # 物理核数（0 = 自动检测）
+  cpu_threads: 0                # 逻辑线程数（0 = 自动检测）
 ```
+
+| 参数 | 默认 | 说明 |
+|------|:---:|------|
+| `code_pattern` | `^[a-z]{4}$` | 只对匹配的编码触发 LLM，避免 1-3 码也被调用 |
+| `min_tokens` | 2 | 上文 token 不够时不重排（0-1 效果差） |
+| `max_tokens` | 4 | 值越大延迟越高，4 性价比最优 |
+| `max_candidates` | 9 | 传给 LLM 的候选数（C++ 最多并行评分 4 个） |
+| `cpu_cores` | 0 | 0 自动检测物理核，可手动指定避免占满 CPU |
+| `cpu_threads` | 0 | 0 自动检测逻辑线程 |
 
 ## 目录结构
 
