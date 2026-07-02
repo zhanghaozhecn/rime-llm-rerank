@@ -28,20 +28,20 @@ extern "C" {
 // ============================================================
 // 配置（可通过 Lua 属性修改）
 // ============================================================
-// 自动检测 CPU 线程数（物理核心 × 2 ≈ 逻辑处理器）
-static int detect_phys_cores() {
+// Windows: 精确获取逻辑处理器数
+static int detect_cores() {
     int n = (int)std::thread::hardware_concurrency();
-    return n > 0 ? (n * 2 / 3) : 4;  // ~物理核, 下限 4
-}
-static int detect_logi_cores() {
-    int n = (int)std::thread::hardware_concurrency();
-    return n > 0 ? n : 8;  // 全逻辑线程, 下限 8
+    if (n > 0) return n;
+    // fallback: Query Windows directly
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors > 0 ? (int)si.dwNumberOfProcessors : 4;
 }
 
 static std::string  g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static int          g_max_ctx_tokens = 4;
-static int          g_n_threads = detect_phys_cores();       // 物理核
-static int          g_n_threads_batch = detect_logi_cores(); // 全逻辑
+static int          g_n_threads = detect_cores();
+static int          g_n_threads_batch = detect_cores();
 static int          g_n_ctx = 64;
 static int          g_n_seq_max = 9;   // 最多并行候选数
 
