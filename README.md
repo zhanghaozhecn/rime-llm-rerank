@@ -11,19 +11,12 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 | 场景 | 基线（字典序） | LLM 重排 | 提升 |
 |------|:----------:|:--------:|:---:|
 | Benchmark (10000 随机) | 86.9% | **95.7%** | +8.8pp |
-| 赛文模拟打字 | 88.0% | **95.7%** | +7.7pp |
-| **赛文真实打字** | 98.8% | **95.3%** | -3.5pp |
-
-真实打字中字典基线很高（拼读双拼重码率低），LLM 主要用于纠正罕见歧义。
 
 ## 推理延迟
-
-CPU 推理，自动检测线程数：
 
 | 配置 | 延迟 |
 |------|:---:|
 | 4tok/4cand | ~120ms |
-| 8tok/4cand | ~135ms |
 
 ## 安装（三步）
 
@@ -102,8 +95,7 @@ rime-llm-rerank\
 │   │   └── rime_llm.dll      #   预编译插件（复制到 RIME 目录）
 │   └── dev\                  #   源码 + 构建
 │       ├── rime_llm.cpp       #   插件主源码
-│       ├── CMakeLists.txt     #   CMake 配置
-│       └── rebuild.bat        #   一键编译+部署
+│       └── CMakeLists.txt     #   CMake 配置
 └── README.md
 ```
 
@@ -117,9 +109,9 @@ rime-llm-rerank\
 
 ## 编译
 
-需要 Visual Studio Build Tools 2022 + CMake + llama.cpp 编译产物。
+需要 Visual Studio Build Tools 2022 + CMake + llama.cpp。
 
-llama.cpp 镜像：`D:\llama.cpp-mirror\`（`git clone https://gitcode.com/ggerganov/llama.cpp.git`）
+编译前需修改 `CMakeLists.txt` 中的 llama.cpp 路径，指向你本机的 llama.cpp 仓库（需先编译 `libllama`）。
 
 ```powershell
 cd cpp\dev
@@ -127,4 +119,4 @@ cmake -G "Visual Studio 17 2022" -A x64 -S . -B build
 cmake --build build --config Release
 ```
 
-或直接运行 `rebuild.bat` 一键编译并部署到 RIME。
+编译得到的 `build\Release\rime_llm.dll` 需要复制到小狼毫程序目录。由于小狼毫运行时会锁定该文件，部署前需先**退出小狼毫**（右键托盘图标 → 退出），复制 DLL，再重新启动。

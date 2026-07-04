@@ -9,8 +9,7 @@ llm_rerank/
 ├── cpp/
 │   ├── dev/                  # 源码 + 构建
 │   │   ├── rime_llm.cpp      #   C++ 插件（CPU 推理，并行 batch 评分）
-│   │   ├── CMakeLists.txt    #   CMake 配置（依赖 D:\llama.cpp-mirror\）
-│   │   └── rebuild.bat       #   一键编译+部署
+│   │   └── CMakeLists.txt    #   CMake 配置（依赖 D:\llama.cpp-mirror\）
 │   └── user/
 │       └── rime_llm.dll      #   预编译 DLL
 ├── common/                   # Lua filter（发布用副本）
