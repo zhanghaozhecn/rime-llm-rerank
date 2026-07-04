@@ -37,6 +37,7 @@ local function do_init(env)
     if ok and cpp then
         cpp.model_path = os.getenv("RIME_LLM_MODEL") or "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
         cpp.max_ctx    = cfg.max_tokens
+        cpp.min_tokens = cfg.min_tokens
         if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end
         llm = cpp
     end

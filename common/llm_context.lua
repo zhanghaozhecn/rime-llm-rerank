@@ -2,6 +2,7 @@
 
 local MAX_CHARS = 30
 local IDLE_CLEAR_SEC = 10
+local inited = false
 
 local apps = {}
 local current_app = ""
@@ -22,6 +23,16 @@ local function get_app_state(app)
 end
 
 local function processor(key, env)
+    if not inited then
+        inited = true
+        local sc = env.engine.schema.config
+        local ns = sc:get_map("llm_rerank")
+        if ns then
+            local v = tonumber(ns:get_value("idle_clear_sec"))
+            if v then IDLE_CLEAR_SEC = v end
+        end
+    end
+
     local ctx = env.engine.context
     local now = os.time()
     local app = get_current_app()

@@ -77,6 +77,7 @@ llm_rerank:
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 4        # 截取的上文 token 数（1-20）
   max_candidates: 4    # 并行评分候选数（2-9）
+  idle_clear_sec: 10   # 同应用闲置多少秒清空上文（5-300）
   cpu_cores: 14        # CPU 线程数（省略则自动检测）
 ```
 
@@ -86,6 +87,7 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 4 | 截取的上文 token 数 |
 | `max_candidates` | 4 | 并行评分候选数（2-9） |
+| `idle_clear_sec` | 10 | 同应用闲置 N 秒清空上文 |
 | `cpu_cores` | auto | 线程数（省略则自动检测） |
 
 ## 目录结构
@@ -102,7 +104,6 @@ rime-llm-rerank\
 │       ├── rime_llm.cpp       #   插件主源码
 │       ├── CMakeLists.txt     #   CMake 配置
 │       └── rebuild.bat        #   一键编译+部署
-├── schema-patch.yaml
 └── README.md
 ```
 

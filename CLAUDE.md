@@ -19,7 +19,6 @@ llm_rerank/
 ├── test_typing_eval.py       # 模拟打字评估（GPU）
 ├── analyze_typing.py         # 真实打字分析（对比赛文）
 ├── verify_typing.py          # 直接 LLM 验证 + 上下文比对
-├── schema-patch.yaml         # 配置示例
 ├── sync_llm.ps1              # 同步到 GitHub（本地工具）
 └── README.md
 ```

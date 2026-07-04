@@ -30,6 +30,7 @@ extern "C" {
 // 配置默认值
 // ============================================================
 static std::string  g_model_path      = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
+static int          g_min_tokens      = 1;
 static int          g_max_ctx_tokens  = 4;
 static int          g_n_threads       = std::thread::hardware_concurrency();
 static int          g_n_ctx           = 64;
@@ -229,7 +230,7 @@ static int lua_score(lua_State * L) {
     if (cand_texts.size() < 2) { lua_pushnil(L); return 1; }
 
     std::vector<llama_token> ctx_ids = tokenize(context);
-    if (ctx_ids.empty()) { lua_pushnil(L); return 1; }
+    if ((int)ctx_ids.size() < g_min_tokens) { lua_pushnil(L); return 1; }
 
     if ((int)ctx_ids.size() > g_max_ctx_tokens)
         ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
@@ -277,6 +278,7 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "score") == 0)     lua_pushcfunction(L, lua_score);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
     else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);
+    else if (strcmp(key, "min_tokens") == 0) lua_pushinteger(L, g_min_tokens);
     else if (strcmp(key, "n_threads") == 0) lua_pushinteger(L, g_n_threads);
     else if (strcmp(key, "n_ctx") == 0)     lua_pushinteger(L, g_n_ctx);
     else if (strcmp(key, "n_seq_max") == 0) lua_pushinteger(L, g_n_seq_max);
@@ -288,6 +290,7 @@ static int lua_newindex(lua_State * L) {
     const char * key = luaL_checkstring(L, 2);
     if (strcmp(key, "model_path") == 0)      g_model_path = luaL_checkstring(L, 3);
     else if (strcmp(key, "max_ctx") == 0)    g_max_ctx_tokens = (int)luaL_checkinteger(L, 3);
+    else if (strcmp(key, "min_tokens") == 0) g_min_tokens = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_threads") == 0)  g_n_threads = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_ctx") == 0)      g_n_ctx = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_seq_max") == 0)  g_n_seq_max = (int)luaL_checkinteger(L, 3);
