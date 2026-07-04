@@ -1,54 +1,51 @@
--- llm_rerank.lua — LLM candidate rerank filter
--- Config in schema.yaml under "llm_rerank" namespace
+-- llm_rerank.lua — LLM candidate rerank filter (CPU)
 
-local M = {}
 local llm = nil
-local backend = "none"
+local inited = false
 
--- Defaults (overridden by schema config)
 local cfg = {
-    code_pattern   = "^[a-z]{4}$",  -- regex: which codes trigger LLM
-    min_tokens     = 1,             -- min context tokens to start rerank
-    max_tokens     = 4,             -- max context tokens for scoring
-    max_candidates = 4,             -- candidates to score in parallel (2-9)
-    cpu_cores      = 6,             -- physical CPU cores
+    min_code_len   = 4,
+    min_tokens     = 1,
+    max_tokens     = 4,
+    max_candidates = 4,
+    cpu_cores      = nil,  -- nil = auto-detect in C++
 }
 
 local lat_max   = 0
 local lat_count = 0
 
--- === Init: read schema config, load backend ===
-function M.init(env)
+local function do_init(env)
+    if inited then return end
+    inited = true
+
     local sc = env.engine.schema.config
     local ns = sc:get_map("llm_rerank")
     if ns then
-        cfg.code_pattern   = ns:get_value("code_pattern")   or cfg.code_pattern
-        cfg.min_tokens     = tonumber(ns:get_value("min_tokens"))     or cfg.min_tokens
-        cfg.max_tokens     = tonumber(ns:get_value("max_tokens"))     or cfg.max_tokens
-        cfg.max_candidates = tonumber(ns:get_value("max_candidates")) or cfg.max_candidates
-        cfg.cpu_cores      = tonumber(ns:get_value("cpu_cores"))      or cfg.cpu_cores
+        local v = tonumber(ns:get_value("min_code_len"))
+        if v then cfg.min_code_len = v end
+        v = tonumber(ns:get_value("max_tokens"))
+        if v then cfg.max_tokens = v end
+        v = tonumber(ns:get_value("max_candidates"))
+        if v then cfg.max_candidates = v end
+        v = tonumber(ns:get_value("cpu_cores"))
+        if v then cfg.cpu_cores = v end
+        v = tonumber(ns:get_value("min_tokens"))
+        if v then cfg.min_tokens = v end
     end
 
-    -- Try C++ plugin first
-    local ok_cpp, cpp = pcall(function() return require("rime_llm") end)
-    if ok_cpp and cpp then
+    local ok, cpp = pcall(require, "rime_llm")
+    if ok and cpp then
         cpp.model_path = os.getenv("RIME_LLM_MODEL") or "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
         cpp.max_ctx    = cfg.max_tokens
-        cpp.n_threads = cfg.cpu_cores
+        if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end
         llm = cpp
-        backend = "cpp"
-    else
-        local ok_pipe, pipe = pcall(function() return require("rime_pipe") end)
-        if ok_pipe and pipe then
-            pipe.TIMEOUT = 0.2
-            llm = pipe
-            backend = "pipe"
-        end
     end
 end
 
 -- === Filter ===
-function M.func(translation, env)
+return function(translation, env)
+    do_init(env)
+
     local all = {}
     for cand in translation:iter() do table.insert(all, cand) end
     if #all < 2 then for _, c in ipairs(all) do yield(c) end; return end
@@ -62,13 +59,11 @@ function M.func(translation, env)
         for _, c in ipairs(all) do yield(c) end; return
     end
 
-    -- Check code pattern
     local input = env.engine.context.input or ""
-    if not input:match(cfg.code_pattern) then
+    if #input < cfg.min_code_len then
         for _, c in ipairs(all) do yield(c) end; return
     end
 
-    -- Collect context and candidates
     local context = ((_G.llm_context_get and _G.llm_context_get()) or ""):gsub('%s+', '')
     local cands = {}
     for i, c in ipairs(all) do
@@ -77,34 +72,27 @@ function M.func(translation, env)
     end
 
     local t0 = os.clock()
-    local ok, result = nil, nil
+    local ok, result = pcall(function() return llm.score(context, cands) end)
+    local elapsed_ms = (os.clock() - t0) * 1000
 
-    if backend == "cpp" then
-        ok, result = pcall(function() return llm.score(context, cands) end)
-    else -- pipe
-        local parts = {}
-        for _, w in ipairs(cands) do
-            table.insert(parts, '"' .. w:gsub('\\', '\\\\'):gsub('"', '\\"') .. '"')
-        end
-        local esc = context:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
-        local body = '{"context":"' .. esc .. '","candidates":[' .. table.concat(parts, ",") .. ']}'
-        ok, result = pcall(function()
-            local r, s = llm.request("http://127.0.0.1:9877/rerank", body)
-            if type(s) == "number" and s >= 200 and s < 300 and type(r) == "string" then
-                if r:find('"rerank":%s*false') then return nil end
-                local fp = r:find('"first"')
-                if fp then return r:sub(fp):match('"first":%s*"([^"]+)"') end
-            end
-        end)
+    -- Event log: time|code|ctx_chars|n_cands|LLM_pick|ok|ms|cand1,cand2,...
+    local ef = io.open(TEMP .. "\\rime_llm_events.txt", "a")
+    if ef then
+        local cand_str = table.concat(cands, ","):gsub("|", "/")
+        local ctx_safe = context:gsub("|", "/"):gsub("\n", " ")
+        ef:write(string.format("%s|%s|%d|%s|%s|%d|%s|%s|%s\n",
+            os.date("%H:%M:%S"), input, #context, tostring(#cands),
+            ok and result or "nil", ok and (result ~= nil) and 1 or 0,
+            tostring(math.floor(elapsed_ms)), ctx_safe, cand_str))
+        ef:close()
     end
 
-    local elapsed_ms = (os.clock() - t0) * 1000
     lat_count = lat_count + 1
     if elapsed_ms > lat_max then lat_max = elapsed_ms end
     local pf = io.open(TEMP .. "\\rime_latency.txt", "w")
     if pf then
-        pf:write(string.format("count=%d  max=%.0fms  last=%.0fms  backend=%s",
-            lat_count, lat_max, elapsed_ms, backend))
+        pf:write(string.format("count=%d  max=%.0fms  last=%.0fms",
+            lat_count, lat_max, elapsed_ms))
         pf:close()
     end
 
@@ -113,12 +101,10 @@ function M.func(translation, env)
         for _, c in ipairs(all) do if c.text == result then llm_cand = c; break end end
         if llm_cand then
             yield(ShadowCandidate(llm_cand, llm_cand.type, llm_cand.text,
-                llm_cand.comment .. " ⚡", true))
+                llm_cand.comment .. " AI", true))
         end
         for _, c in ipairs(all) do if c ~= llm_cand then yield(c) end end
     else
         for _, c in ipairs(all) do yield(c) end
     end
 end
-
-return M

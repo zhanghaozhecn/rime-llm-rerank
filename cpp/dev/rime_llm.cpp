@@ -1,7 +1,8 @@
 /*
- * rime_llm.cpp — RIME LLM 候选重排 C++ 插件
- * 编译: 参见 CMakeLists.txt + build.ps1
- * 用法: Lua 中 require("rime_llm") → llm.score(ctx, cands)
+ * rime_llm.cpp — RIME LLM 候选重排 C++ 插件 (CPU)
+ * 编译: cmake -G "Visual Studio 17 2022" -A x64 -S . -B build
+ *        cmake --build build --config Release
+ * Lua:  require("rime_llm") → llm.score(ctx, cands)
  */
 
 #define NOMINMAX
@@ -26,13 +27,13 @@ extern "C" {
 #include <algorithm>
 
 // ============================================================
-// 配置（可通过 Lua 属性修改）
+// 配置默认值
 // ============================================================
-static std::string  g_model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
-static int          g_max_ctx_tokens = 4;
-static int          g_n_threads = 6;
-static int          g_n_ctx = 64;
-static int          g_n_seq_max = 9;   // 最多并行候选数
+static std::string  g_model_path      = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
+static int          g_max_ctx_tokens  = 4;
+static int          g_n_threads       = std::thread::hardware_concurrency();
+static int          g_n_ctx           = 64;
+static int          g_n_seq_max       = 9;
 
 // ============================================================
 // 模型状态
@@ -70,6 +71,8 @@ static void load_model_async() {
     std::thread([]() {
         log_msg("loading model: %s", g_model_path.c_str());
 
+        llama_backend_init();
+
         llama_model_params mparams = llama_model_default_params();
         mparams.use_mmap = 1;
 
@@ -82,10 +85,10 @@ static void load_model_async() {
         g_vocab = llama_model_get_vocab(g_model);
 
         llama_context_params cparams = llama_context_default_params();
-        cparams.n_ctx = g_n_ctx;
-        cparams.n_threads = g_n_threads;
+        cparams.n_ctx           = g_n_ctx;
+        cparams.n_threads       = g_n_threads;
         cparams.n_threads_batch = g_n_threads;
-        cparams.n_seq_max = g_n_seq_max;
+        cparams.n_seq_max       = g_n_seq_max;
 
         g_ctx = llama_new_context_with_model(g_model, cparams);
         if (!g_ctx) {
@@ -96,7 +99,7 @@ static void load_model_async() {
             return;
         }
 
-        // 预热
+        // warmup
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             llama_memory_clear(llama_get_memory(g_ctx), true);
@@ -112,7 +115,7 @@ static void load_model_async() {
 
         g_loaded.store(true);
         g_loading.store(false);
-        log_msg("model ready (n_ctx=%d, threads=%d)", g_n_ctx, g_n_threads);
+        log_msg("model ready (n_ctx=%d threads=%d)", g_n_ctx, g_n_threads);
     }).detach();
 }
 
@@ -153,19 +156,21 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     int idx = 0;
     for (int i = 0; i < n_cands; i++) {
         for (int j = 0; j < ctx_len; j++) {
-            batch.token[idx] = ctx_ids[j];
-            batch.pos[idx] = j;
+            batch.token[idx]    = ctx_ids[j];
+            batch.pos[idx]      = j;
             batch.n_seq_id[idx] = 1;
             batch.seq_id[idx][0] = i;
             idx++;
         }
+        // last ctx token predicts first cand token — need logits here
+        batch.logits[idx - 1] = 1;
         int wlen = (int)cands[i].size();
         for (int j = 0; j < wlen; j++) {
-            batch.token[idx] = cands[i][j];
-            batch.pos[idx] = ctx_len + j;
+            batch.token[idx]    = cands[i][j];
+            batch.pos[idx]      = ctx_len + j;
             batch.n_seq_id[idx] = 1;
             batch.seq_id[idx][0] = i;
-            batch.logits[idx] = 1;
+            batch.logits[idx]   = 1;
             idx++;
         }
     }
@@ -181,12 +186,12 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         int wlen = (int)cands[i].size();
         double ce = 0;
         for (int j = 0; j < wlen; j++) {
-            int pos = row_start + ctx_len + j;
+            int pos = row_start + ctx_len + j - 1;  // logits[pos] predicts token[pos+1]
             float * logits = llama_get_logits_ith(g_ctx, pos);
             if (!logits) { ce = -1e10; break; }
-            int vs = llama_n_vocab(g_vocab);
-            int tid = cands[i][j];
-            float m = -1e30f;
+            int vs   = llama_n_vocab(g_vocab);
+            int tid  = cands[i][j];
+            float m  = -1e30f;
             for (int k = 0; k < vs; k++) if (logits[k] > m) m = logits[k];
             double se = 0;
             for (int k = 0; k < vs; k++) se += exp((double)(logits[k] - m));
@@ -199,7 +204,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
 }
 
 // ============================================================
-// Lua API: score(context, candidates_table) → string | nil
+// Lua API
 // ============================================================
 static int lua_score(lua_State * L) {
     if (!g_loaded.load()) {
@@ -214,7 +219,7 @@ static int lua_score(lua_State * L) {
     std::vector<std::string> cand_texts;
     int n = (int)luaL_len(L, 2);
     if (n < 2) { lua_pushnil(L); return 1; }
-    if (n > g_n_seq_max) n = g_n_seq_max;  // capped by parallel seq limit
+    if (n > g_n_seq_max) n = g_n_seq_max;
     for (int i = 1; i <= n; i++) {
         lua_rawgeti(L, 2, i);
         const char * s = lua_tostring(L, -1);
@@ -224,23 +229,18 @@ static int lua_score(lua_State * L) {
     if (cand_texts.size() < 2) { lua_pushnil(L); return 1; }
 
     std::vector<llama_token> ctx_ids = tokenize(context);
-    if (ctx_ids.empty() || (int)ctx_ids.size() < 2) {
-        lua_pushnil(L);
-        return 1;
-    }
+    if (ctx_ids.empty()) { lua_pushnil(L); return 1; }
 
     if ((int)ctx_ids.size() > g_max_ctx_tokens)
         ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
 
-    // 分词所有候选
     std::vector<std::vector<llama_token>> cand_ids;
     for (auto & s : cand_texts) {
         auto ids = tokenize(s.c_str());
-        if (ids.empty()) ids.push_back(0);  // fallback
+        if (ids.empty()) ids.push_back(0);
         cand_ids.push_back(ids);
     }
 
-    // 并行评分
     std::vector<double> scores;
     try {
         score_batch(ctx_ids, cand_ids, scores);
@@ -250,7 +250,6 @@ static int lua_score(lua_State * L) {
         return 1;
     }
 
-    // 找最佳
     int best_idx = -1;
     double best_score = -1e100;
     for (int i = 0; i < (int)scores.size(); i++) {
@@ -264,9 +263,6 @@ static int lua_score(lua_State * L) {
     return 1;
 }
 
-// ============================================================
-// Lua API: is_ready() → bool
-// ============================================================
 static int lua_is_ready(lua_State * L) {
     lua_pushboolean(L, g_loaded.load() ? 1 : 0);
     return 1;
@@ -277,12 +273,12 @@ static int lua_is_ready(lua_State * L) {
 // ============================================================
 static int lua_index(lua_State * L) {
     const char * key = luaL_checkstring(L, 2);
-    if (strcmp(key, "is_ready") == 0) lua_pushcfunction(L, lua_is_ready);
-    else if (strcmp(key, "score") == 0) lua_pushcfunction(L, lua_score);
+    if (strcmp(key, "is_ready") == 0)       lua_pushcfunction(L, lua_is_ready);
+    else if (strcmp(key, "score") == 0)     lua_pushcfunction(L, lua_score);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
-    else if (strcmp(key, "max_ctx") == 0) lua_pushinteger(L, g_max_ctx_tokens);
-    else if (strcmp(key, "max_cand") == 0) lua_pushinteger(L, g_max_candidates);
+    else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);
     else if (strcmp(key, "n_threads") == 0) lua_pushinteger(L, g_n_threads);
+    else if (strcmp(key, "n_ctx") == 0)     lua_pushinteger(L, g_n_ctx);
     else if (strcmp(key, "n_seq_max") == 0) lua_pushinteger(L, g_n_seq_max);
     else lua_pushnil(L);
     return 1;
@@ -290,12 +286,11 @@ static int lua_index(lua_State * L) {
 
 static int lua_newindex(lua_State * L) {
     const char * key = luaL_checkstring(L, 2);
-    if (strcmp(key, "model_path") == 0) g_model_path = luaL_checkstring(L, 3);
-    else if (strcmp(key, "max_ctx") == 0) g_max_ctx_tokens = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "max_cand") == 0) g_max_candidates = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "n_threads") == 0) g_n_threads = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "n_ctx") == 0) g_n_ctx = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "n_seq_max") == 0) g_n_seq_max = (int)luaL_checkinteger(L, 3);
+    if (strcmp(key, "model_path") == 0)      g_model_path = luaL_checkstring(L, 3);
+    else if (strcmp(key, "max_ctx") == 0)    g_max_ctx_tokens = (int)luaL_checkinteger(L, 3);
+    else if (strcmp(key, "n_threads") == 0)  g_n_threads = (int)luaL_checkinteger(L, 3);
+    else if (strcmp(key, "n_ctx") == 0)      g_n_ctx = (int)luaL_checkinteger(L, 3);
+    else if (strcmp(key, "n_seq_max") == 0)  g_n_seq_max = (int)luaL_checkinteger(L, 3);
     return 0;
 }
 
@@ -313,14 +308,16 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
 
     lua_pushstring(L, g_model_path.c_str());
     lua_setfield(L, -2, "model_path");
+
     lua_pushinteger(L, g_max_ctx_tokens);
     lua_setfield(L, -2, "max_ctx");
-    lua_pushinteger(L, g_max_candidates);
-    lua_setfield(L, -2, "max_cand");
+
     lua_pushinteger(L, g_n_threads);
     lua_setfield(L, -2, "n_threads");
+
     lua_pushinteger(L, g_n_ctx);
     lua_setfield(L, -2, "n_ctx");
+
     lua_pushinteger(L, g_n_seq_max);
     lua_setfield(L, -2, "n_seq_max");
 

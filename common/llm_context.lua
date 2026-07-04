@@ -1,12 +1,10 @@
--- llm_context.lua — 累积上屏历史，用 CommitHistory API 拿到真正上屏文字
+-- llm_context.lua — per-app context with to_table for 标点顶屏
 
-local MAX_CHARS = 20  -- 上文缓冲，服务端按4token截断
-local IDLE_CLEAR_SEC = 20
+local MAX_CHARS = 30
+local IDLE_CLEAR_SEC = 10
 
-local history = {}
-local last_commit_time = 0
-local last_app = ""
-local last_back_text = ""  -- 直接用 ch:back() 的 text 去重，不依赖 count
+local apps = {}
+local current_app = ""
 
 local function get_current_app()
     local ok, result = pcall(function()
@@ -16,49 +14,52 @@ local function get_current_app()
     return "unknown"
 end
 
+local function get_app_state(app)
+    if not apps[app] then
+        apps[app] = { history = {}, _size = 0, last_time = 0 }
+    end
+    return apps[app]
+end
+
 local function processor(key, env)
     local ctx = env.engine.context
     local now = os.time()
+    local app = get_current_app()
+    current_app = app
+    local st = get_app_state(app)
 
-    -- 切换应用 → 清空
-    local current_app = get_current_app()
-    if current_app ~= last_app and last_app ~= "" then
-        history = {}
-        last_back_text = ""
-    end
-    last_app = current_app
-
-    -- 时间衰减
-    if last_commit_time > 0 and (now - last_commit_time) > IDLE_CLEAR_SEC then
-        history = {}
-        last_back_text = ""
+    if st.last_time > 0 and (now - st.last_time) > IDLE_CLEAR_SEC then
+        st.history = {}
+        st._size = 0
     end
 
-    -- 用 CommitHistory:back() 直接检测新上屏（不依赖 size/count）
     local ch = ctx.commit_history
     if ch then
-        local last = ch:back()
-        if last and last.text and #last.text >= 3 then
-            if last.text ~= last_back_text then
-                -- 新上屏文字
-                last_back_text = last.text
-                if #history == 0 or history[#history] ~= last.text then
-                    table.insert(history, last.text)
-                    -- 按实际字节数截断（无分隔符）
-                    local total = 0
-                    for _, t in ipairs(history) do total = total + #t end
-                    while total > MAX_CHARS * 3 and #history > 1 do
-                        total = total - #history[1]
-                        table.remove(history, 1)
+        local all = ch:to_table()
+        if all and #all > st._size then
+            local new_entries = {}
+            for i = st._size + 1, #all do
+                local entry = all[i]
+                if entry and entry.text and #entry.text >= 1 then
+                    if #st.history == 0 or st.history[#st.history] ~= entry.text then
+                        table.insert(st.history, entry.text)
+                        table.insert(new_entries, entry.text)
+                        local total_bytes = 0
+                        for _, t in ipairs(st.history) do total_bytes = total_bytes + #t end
+                        while total_bytes > MAX_CHARS * 3 and #st.history > 1 do
+                            total_bytes = total_bytes - #st.history[1]
+                            table.remove(st.history, 1)
+                        end
                     end
                 end
-                last_commit_time = now
-                -- 调试日志
-                local TEMP = os.getenv("TEMP") or "C:\\Windows\\Temp"
-                local f = io.open(TEMP .. "\\rime_ctx_debug.txt", "a")
+            end
+            st._size = #all
+            st.last_time = now
+            -- debug: log only what was added this key event
+            if #new_entries > 0 then
+                local f = io.open((os.getenv("TEMP") or "C:\\Windows\\Temp") .. "\\rime_ctx_debug.txt", "a")
                 if f then
-                    f:write(string.format("[ctx] +\"%s\"  hist_len=%d  total_bytes=%d\n",
-                        last.text, #history, #table.concat(history, "")))
+                    f:write(string.format("[ctx] +%s\n", table.concat(new_entries, " ")))
                     f:close()
                 end
             end
@@ -69,11 +70,12 @@ local function processor(key, env)
 end
 
 local function get_context()
-    if last_commit_time > 0 and (os.time() - last_commit_time) > IDLE_CLEAR_SEC then
-        history = {}
-        last_back_text = ""
+    local st = get_app_state(current_app)
+    if st.last_time > 0 and (os.time() - st.last_time) > IDLE_CLEAR_SEC then
+        st.history = {}
+        st._size = 0
     end
-    return table.concat(history, "")  -- 无分隔符，纯汉字连写
+    return table.concat(st.history, "")
 end
 
 _G.llm_context_get = get_context
