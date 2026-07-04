@@ -98,13 +98,26 @@ return function(translation, env)
     end
 
     if ok and result then
-        local llm_cand = nil
-        for _, c in ipairs(all) do if c.text == result then llm_cand = c; break end end
-        if llm_cand then
-            yield(ShadowCandidate(llm_cand, llm_cand.type, llm_cand.text,
-                llm_cand.comment .. " AI", true))
+        -- result = LLM 按分数降序排列的候选表 {best, second, ...}
+        -- 按 LLM 排序重排全部候选，首位标记 AI
+        local seen = {}
+        local ordered = {}
+        for i = 1, #result do
+            for _, c in ipairs(all) do
+                if c.text == result[i] and not seen[c.text] then
+                    seen[c.text] = true
+                    table.insert(ordered, c)
+                    break
+                end
+            end
         end
-        for _, c in ipairs(all) do if c ~= llm_cand then yield(c) end end
+        for i, c in ipairs(ordered) do
+            if i == 1 then
+                yield(ShadowCandidate(c, c.type, c.text, c.comment .. " AI", true))
+            else
+                yield(c)
+            end
+        end
     else
         for _, c in ipairs(all) do yield(c) end
     end

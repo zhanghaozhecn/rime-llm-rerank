@@ -251,16 +251,19 @@ static int lua_score(lua_State * L) {
         return 1;
     }
 
-    int best_idx = -1;
-    double best_score = -1e100;
-    for (int i = 0; i < (int)scores.size(); i++) {
-        if (scores[i] > best_score) { best_score = scores[i]; best_idx = i; }
-    }
+    // 按分数降序排列候选的索引
+    std::vector<int> order(scores.size());
+    for (int i = 0; i < (int)order.size(); i++) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [&](int a, int b) { return scores[a] > scores[b]; });
 
-    if (best_idx >= 0 && best_idx < (int)cand_texts.size())
-        lua_pushstring(L, cand_texts[best_idx].c_str());
-    else
-        lua_pushnil(L);
+    // 返回排序后的候选表，Lua 侧按需选择（如二字词优先）
+    lua_newtable(L);
+    for (int i = 0; i < (int)order.size(); i++) {
+        int idx = order[i];
+        lua_pushstring(L, cand_texts[idx].c_str());
+        lua_rawseti(L, -2, i + 1);
+    }
     return 1;
 }
 

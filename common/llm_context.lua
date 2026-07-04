@@ -41,7 +41,12 @@ local function processor(key, env)
 
     if st.last_time > 0 and (now - st.last_time) > IDLE_CLEAR_SEC then
         st.history = {}
-        st._size = 0
+        -- 同步 _size 到当前 commit_history 长度，防止下面把旧记录重新读入
+        local ch0 = ctx.commit_history
+        if ch0 then
+            local all0 = ch0:to_table()
+            if all0 then st._size = #all0 end
+        end
     end
 
     local ch = ctx.commit_history
@@ -84,7 +89,6 @@ local function get_context()
     local st = get_app_state(current_app)
     if st.last_time > 0 and (os.time() - st.last_time) > IDLE_CLEAR_SEC then
         st.history = {}
-        st._size = 0
     end
     return table.concat(st.history, "")
 end
