@@ -90,7 +90,7 @@ llm_rerank:
 rime-llm-rerank\
 ├── common\                   # 滤器文件（复制到 RIME lua\）
 │   ├── llm_rerank.lua        #   候选重排（标记 "AI"）
-│   └── llm_context.lua       #   上屏文字收集（按应用隔离）
+│   └── llm_context.lua       #   上屏文字收集
 ├── cpp\
 │   ├── user\
 │   │   └── rime_llm.dll      #   预编译插件（复制到 RIME 目录）
