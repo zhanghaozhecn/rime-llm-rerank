@@ -31,7 +31,7 @@ local function processor(key, env)
         local ns = sc:get_map("llm_rerank")
         if ns then
             local v = ns:get_value("clear_key")
-            if v then clear_key = tostring(v) end
+            if v and v:get_string() then clear_key = v:get_string() end
         end
     end
 
