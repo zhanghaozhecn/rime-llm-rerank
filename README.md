@@ -61,7 +61,7 @@ LLM 选中的候选显示 `AI`。事件日志：
 Get-Content "$env:TEMP\rime_llm_events.txt" -Tail 5
 ```
 
-每行格式：`时间|编码|上文字数|候选数|LLM结果|成功|延迟ms|计数|最大延迟|上文|候选列表`
+每行格式：`时间|计数|编码|候选列表|上文|LLM结果|延迟ms`
 
 ## 配置参数
 
@@ -90,7 +90,7 @@ llm_rerank:
 rime-llm-rerank\
 ├── common\                   # 滤器文件（复制到 RIME lua\）
 │   ├── llm_rerank.lua        #   候选重排（标记 "AI"）
-│   └── llm_context.lua       #   上屏文字收集
+│   └── llm_context.lua       #   上屏文字收集（RIME commit_history 上限 20 条）
 ├── cpp\
 │   ├── user\
 │   │   └── rime_llm.dll      #   预编译插件（复制到 RIME 目录）
