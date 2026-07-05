@@ -41,8 +41,26 @@ target_link_libraries(rime_llm PRIVATE
     llama_cpu ggml_cpu ggml_base ggml_cpu_impl
 )
 
+# Latency benchmark (standalone exe, same scoring algorithm as DLL)
+add_executable(bench_latency bench_latency.cpp)
+target_include_directories(bench_latency PRIVATE
+    "${LLAMA_ROOT}/include"
+    "${LLAMA_ROOT}/ggml/include"
+    "${LLAMA_ROOT}/common"
+)
+target_link_libraries(bench_latency PRIVATE
+    llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+)
+
 if(MSVC)
     target_compile_options(rime_llm PRIVATE /O2 /arch:AVX2 /utf-8)
     target_link_options(rime_llm PRIVATE /OPT:REF /OPT:ICF)
     set_target_properties(rime_llm PROPERTIES SUFFIX ".dll" PREFIX "")
+    # Post-build: copy DLL to cpp/user/
+    add_custom_command(TARGET rime_llm POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:rime_llm>"
+            "${CMAKE_SOURCE_DIR}/../user/rime_llm.dll"
+    )
+    target_compile_options(bench_latency PRIVATE /O2 /arch:AVX2 /utf-8)
 endif()
