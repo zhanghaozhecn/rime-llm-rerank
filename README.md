@@ -55,12 +55,13 @@ engine:
 
 3. 右键小狼毫 → **重新部署**
 
-LLM 选中的候选显示 `AI`。延迟日志：
+LLM 选中的候选显示 `AI`。事件日志：
 
 ```powershell
-Get-Content "$env:TEMP\rime_latency.txt"
-# count=342  max=132ms  last=107ms
+Get-Content "$env:TEMP\rime_llm_events.txt" -Tail 5
 ```
+
+每行格式：`时间|编码|上文字数|候选数|LLM结果|成功|延迟ms|计数|最大延迟|上文|候选列表`
 
 ## 配置参数
 
