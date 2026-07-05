@@ -118,6 +118,10 @@ return function(translation, env)
                 yield(c)
             end
         end
+        -- 未被 LLM 评分的剩余候选原样追加
+        for _, c in ipairs(all) do
+            if not seen[c.text] then yield(c) end
+        end
     else
         for _, c in ipairs(all) do yield(c) end
     end
