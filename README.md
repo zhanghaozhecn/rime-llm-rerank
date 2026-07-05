@@ -73,6 +73,7 @@ llm_rerank:
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 8        # 截取的上文 token 数（1-20）
   max_candidates: 3    # 并行评分候选数（2-9）
+  clear_key: ""         # 清除上文的快捷键（如 "grave"，默认 ""=不启用）
   cpu_cores: 14        # CPU 线程数（省略则自动检测）
 ```
 
@@ -82,6 +83,7 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 8 | 截取的上文 token 数 |
 | `max_candidates` | 3 | 并行评分候选数（2-9） |
+| `clear_key` | "" | 清除上文快捷键名，""=不启用 |
 | `cpu_cores` | auto | 线程数（省略则自动检测） |
 
 ## 目录结构
