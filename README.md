@@ -16,7 +16,9 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 | 配置 | 延迟 |
 |------|:---:|
-| 4tok/4cand | ~120ms |
+| 8tok/3cand | ~98ms |
+| 8tok/4cand | ~120ms |
+| 8tok/5cand | ~160ms |
 
 ## 安装（三步）
 
@@ -68,8 +70,8 @@ Get-Content "$env:TEMP\rime_latency.txt"
 llm_rerank:
   min_code_len: 4      # 最小编码长度触发 LLM
   min_tokens: 1        # 最少上文 token 才重排
-  max_tokens: 4        # 截取的上文 token 数（1-20）
-  max_candidates: 4    # 并行评分候选数（2-9）
+  max_tokens: 8        # 截取的上文 token 数（1-20）
+  max_candidates: 3    # 并行评分候选数（2-9）
   idle_clear_sec: 10   # 同应用闲置多少秒清空上文（5-300）
   cpu_cores: 14        # CPU 线程数（省略则自动检测）
 ```
@@ -78,8 +80,8 @@ llm_rerank:
 |------|:---:|------|
 | `min_code_len` | 4 | 编码达到此长度才触发 LLM |
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
-| `max_tokens` | 4 | 截取的上文 token 数 |
-| `max_candidates` | 4 | 并行评分候选数（2-9） |
+| `max_tokens` | 8 | 截取的上文 token 数 |
+| `max_candidates` | 3 | 并行评分候选数（2-9） |
 | `idle_clear_sec` | 10 | 同应用闲置 N 秒清空上文 |
 | `cpu_cores` | auto | 线程数（省略则自动检测） |
 

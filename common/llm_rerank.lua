@@ -6,8 +6,8 @@ local inited = false
 local cfg = {
     min_code_len   = 4,
     min_tokens     = 1,
-    max_tokens     = 4,
-    max_candidates = 4,
+    max_tokens     = 8,
+    max_candidates = 3,
     cpu_cores      = nil,  -- nil = auto-detect in C++
 }
 
