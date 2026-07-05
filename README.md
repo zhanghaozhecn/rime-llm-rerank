@@ -73,7 +73,6 @@ llm_rerank:
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 8        # 截取的上文 token 数（1-20）
   max_candidates: 3    # 并行评分候选数（2-9）
-  idle_clear_sec: 10   # 同应用闲置多少秒清空上文（5-300）
   cpu_cores: 14        # CPU 线程数（省略则自动检测）
 ```
 
@@ -83,7 +82,6 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 8 | 截取的上文 token 数 |
 | `max_candidates` | 3 | 并行评分候选数（2-9） |
-| `idle_clear_sec` | 10 | 同应用闲置 N 秒清空上文 |
 | `cpu_cores` | auto | 线程数（省略则自动检测） |
 
 ## 目录结构
@@ -92,7 +90,7 @@ llm_rerank:
 rime-llm-rerank\
 ├── common\                   # 滤器文件（复制到 RIME lua\）
 │   ├── llm_rerank.lua        #   候选重排（标记 "AI"）
-│   └── llm_context.lua       #   上屏文字收集（按应用隔离，10s 闲置清除）
+│   └── llm_context.lua       #   上屏文字收集（按应用隔离，` 键手动清除）
 ├── cpp\
 │   ├── user\
 │   │   └── rime_llm.dll      #   预编译插件（复制到 RIME 目录）
