@@ -76,25 +76,23 @@ return function(translation, env)
     local ok, result = pcall(function() return llm.score(context, cands) end)
     local elapsed_ms = (os.clock() - t0) * 1000
 
-    -- Event log: time|code|ctx_chars|n_cands|LLM_pick|ok|ms|cand1,cand2,...
+    -- Event log: 时间|计数|编码|候选列表|上文|LLM结果|延迟ms
     local ef = io.open(TEMP .. "\\rime_llm_events.txt", "a")
     if ef then
         local cand_str = table.concat(cands, ","):gsub("|", "/")
         local ctx_safe = context:gsub("|", "/"):gsub("\n", " ")
-        ef:write(string.format("%s|%s|%d|%s|%s|%d|%s|%s|%s\n",
-            os.date("%H:%M:%S"), input, #context, tostring(#cands),
-            ok and result or "nil", ok and (result ~= nil) and 1 or 0,
-            tostring(math.floor(elapsed_ms)), ctx_safe, cand_str))
+        local res_info = "nil"
+        if ok and type(result) == "table" then
+            res_info = table.concat(result, ","):gsub("|", "/")
+        elseif ok and result then
+            res_info = tostring(result)
+        end
+        lat_count = lat_count + 1
+        if elapsed_ms > lat_max then lat_max = elapsed_ms end
+        ef:write(string.format("%s|%d|%s|%s|%s|%s|%.0fms\n",
+            os.date("%H:%M:%S"), lat_count, input,
+            cand_str, ctx_safe, res_info, elapsed_ms))
         ef:close()
-    end
-
-    lat_count = lat_count + 1
-    if elapsed_ms > lat_max then lat_max = elapsed_ms end
-    local pf = io.open(TEMP .. "\\rime_latency.txt", "w")
-    if pf then
-        pf:write(string.format("count=%d  max=%.0fms  last=%.0fms",
-            lat_count, lat_max, elapsed_ms))
-        pf:close()
     end
 
     if ok and result then
