@@ -31,7 +31,7 @@ extern "C" {
 // ============================================================
 static std::string  g_model_path      = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static int          g_min_tokens      = 1;
-static int          g_max_ctx_tokens  = 8;
+static int          g_max_ctx_tokens  = 6;
 static int          g_n_threads       = std::thread::hardware_concurrency();
 static int          g_n_ctx           = 64;
 static int          g_n_seq_max       = 9;
