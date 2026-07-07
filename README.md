@@ -75,22 +75,20 @@ Get-Content "$env:TEMP\rime_llm_events.txt" -Tail 5
 
 ```yaml
 llm_rerank:
-  min_code_len: 3      # 最小编码长度触发 LLM
+  min_code_len: 4      # 最小编码长度触发 LLM
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 6        # 截取的上文 token 数（1-20）
   max_candidates: 3    # 并行评分候选数（2-9）
   cpu_cores: 14        # CPU 线程数（省略则自动检测）
-  prior_alpha: 0.5     # 编码先验强度：0=关闭, 1=满（需 code_prior.lua）
 ```
 
 | 参数 | 默认 | 说明 |
 |------|:---:|------|
-| `min_code_len` | 3 | 编码达到此长度才触发 LLM |
+| `min_code_len` | 4 | 编码达到此长度才触发 LLM |
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 6 | 截取的上文 token 数 |
 | `max_candidates` | 3 | 并行评分候选数（2-9） |
 | `cpu_cores` | auto | 线程数（省略则自动检测） |
-| `prior_alpha` | 0.5 | 编码先验调节强度（需 `code_prior.lua`） |
 
 ## 目录结构
 
@@ -107,27 +105,14 @@ rime-llm-rerank\
 └── README.md
 ```
 
-## 编码先验（解决多音字误排）
+## 调试接口
 
-多音词在不同编码下对应同一汉字，LLM 仅根据上文语义无法区分。编码先验 `code_prior.lua` 用读音概率修正分数：
+C++ 插件提供 `get_scores()` 方法，在 `score()` 调用后返回 `{[候选词] = 分数}` 的 Lua 表。仅用于调试和分析，Lua filter 层不消费。
 
+```lua
+local ranked = llm.score(ctx, cands)     -- 排序表（正常使用）
+local scores = llm.get_scores()          -- 数值分数（调试用）
 ```
-adjusted = llm_score + prior_alpha × ln(P(读音|词))
-```
-
-- 高频读音（如 了/le5=99.3%）：ln ≈ 0，几乎不调
-- 低频读音（如 了/liao3=0.7%）：ln ≈ -4.96，强惩罚
-
-`code_prior.lua` 由 `build_code_prior.py` 从字典和语料库自动化生成，不在本仓库中（与具体编码方案绑定）。未提供时 `prior_alpha` 自动失效。
-
-## 评估方法
-
-LLM 重排的评估应以**编码为单位**，统计每个编码下的失败情况：
-
-- **失败率**：该编码下 LLM 选错的次数 ÷ 该编码触发总次数
-- **失败绝对数**：该编码下 LLM 选错的累计次数
-
-两者结合判断是否需要固顶（pin_fix）： 高失败率 + 高次数 = 优先固顶； 高失败率 + 低次数 = 观察； 低失败率 = 无需处理。
 
 ## 常见问题
 
