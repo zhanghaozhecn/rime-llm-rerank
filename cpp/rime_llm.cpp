@@ -257,14 +257,27 @@ static int lua_score(lua_State * L) {
     std::sort(order.begin(), order.end(),
               [&](int a, int b) { return scores[a] > scores[b]; });
 
-    // 返回排序后的候选表，Lua 侧按需选择（如二字词优先）
+    // 返回: ranked_table, score_map
+    // ranked = {best, second, ...}  — 降序候选文本（向后兼容）
+    // scores = {[word] = score, ...} — 数值分数（供编码先验调节）
+    int n_cands = (int)cand_texts.size();
+
+    // 先压 score_map（第二个返回值）
+    lua_newtable(L);
+    for (int i = 0; i < n_cands; i++) {
+        lua_pushnumber(L, scores[i]);
+        lua_setfield(L, -2, cand_texts[i].c_str());
+    }
+
+    // 再压 ranked_table（第一个返回值，栈顶）
     lua_newtable(L);
     for (int i = 0; i < (int)order.size(); i++) {
         int idx = order[i];
         lua_pushstring(L, cand_texts[idx].c_str());
         lua_rawseti(L, -2, i + 1);
     }
-    return 1;
+
+    return 2;  // ranked_table, score_map
 }
 
 static int lua_is_ready(lua_State * L) {

@@ -38,17 +38,17 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 ### 第二步：复制插件
 
-将 `cpp\user\rime_llm.dll` 复制到小狼毫安装目录（需管理员）：
+将 `user\rime_llm.dll` 复制到小狼毫安装目录（需管理员）：
 
 ```
-cpp\user\rime_llm.dll  →  C:\Program Files\Rime\weasel-0.17.4\
+user\rime_llm.dll  →  C:\Program Files\Rime\weasel-0.17.4\
 ```
 
 插件自动检测 CPU 线程数，无需配置。
 
 ### 第三步：配置 RIME
 
-1. 将 `common\` 下的两个 `.lua` 文件复制到方案 `lua\` 目录
+1. 将 `user\` 下的两个 `.lua` 文件复制到方案 `lua\` 目录
 2. 在 `schema.yaml` 中添加：
 
 ```yaml
@@ -75,36 +75,59 @@ Get-Content "$env:TEMP\rime_llm_events.txt" -Tail 5
 
 ```yaml
 llm_rerank:
-  min_code_len: 4      # 最小编码长度触发 LLM
+  min_code_len: 3      # 最小编码长度触发 LLM
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 6        # 截取的上文 token 数（1-20）
   max_candidates: 3    # 并行评分候选数（2-9）
   cpu_cores: 14        # CPU 线程数（省略则自动检测）
+  prior_alpha: 0.5     # 编码先验强度：0=关闭, 1=满（需 code_prior.lua）
 ```
 
 | 参数 | 默认 | 说明 |
 |------|:---:|------|
-| `min_code_len` | 4 | 编码达到此长度才触发 LLM |
+| `min_code_len` | 3 | 编码达到此长度才触发 LLM |
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 6 | 截取的上文 token 数 |
 | `max_candidates` | 3 | 并行评分候选数（2-9） |
 | `cpu_cores` | auto | 线程数（省略则自动检测） |
+| `prior_alpha` | 0.5 | 编码先验调节强度（需 `code_prior.lua`） |
 
 ## 目录结构
 
 ```
 rime-llm-rerank\
-├── common\                   # 滤器文件（复制到 RIME lua\）
-│   ├── llm_rerank.lua        #   候选重排（标记 "AI"）
-│   └── llm_context.lua       #   上屏文字收集（RIME commit_history 上限 20 条）
-├── cpp\
-│   ├── user\
-│   │   └── rime_llm.dll      #   预编译插件（复制到 RIME 目录）
-│   └── dev\                  #   源码 + 构建
-│       ├── rime_llm.cpp       #   插件主源码
-│       └── CMakeLists.txt     #   CMake 配置
+├── user\                      # 用户安装文件（复制到 RIME）
+│   ├── llm_rerank.lua         #   候选重排 filter
+│   ├── llm_context.lua        #   上屏文字收集 processor
+│   └── rime_llm.dll           #   预编译插件
+├── cpp\                       # 源码 + Lua 嵌入
+│   ├── rime_llm.cpp           #   插件主源码
+│   ├── CMakeLists.txt         #   CMake 配置
+│   └── l*.c / l*.h            #   Lua 5.4 源码
 └── README.md
 ```
+
+## 编码先验（解决多音字误排）
+
+多音词在不同编码下对应同一汉字，LLM 仅根据上文语义无法区分。编码先验 `code_prior.lua` 用读音概率修正分数：
+
+```
+adjusted = llm_score + prior_alpha × ln(P(读音|词))
+```
+
+- 高频读音（如 了/le5=99.3%）：ln ≈ 0，几乎不调
+- 低频读音（如 了/liao3=0.7%）：ln ≈ -4.96，强惩罚
+
+`code_prior.lua` 由 `build_code_prior.py` 从字典和语料库自动化生成，不在本仓库中（与具体编码方案绑定）。未提供时 `prior_alpha` 自动失效。
+
+## 评估方法
+
+LLM 重排的评估应以**编码为单位**，统计每个编码下的失败情况：
+
+- **失败率**：该编码下 LLM 选错的次数 ÷ 该编码触发总次数
+- **失败绝对数**：该编码下 LLM 选错的累计次数
+
+两者结合判断是否需要固顶（pin_fix）： 高失败率 + 高次数 = 优先固顶； 高失败率 + 低次数 = 观察； 低失败率 = 无需处理。
 
 ## 常见问题
 
@@ -119,7 +142,7 @@ rime-llm-rerank\
 编译前需修改 `CMakeLists.txt` 中的 llama.cpp 路径，指向你本机的 llama.cpp 仓库（需先编译 `libllama`）。
 
 ```powershell
-cd cpp\dev
+cd cpp
 cmake -G "Visual Studio 17 2022" -A x64 -S . -B build
 cmake --build build --config Release
 ```
