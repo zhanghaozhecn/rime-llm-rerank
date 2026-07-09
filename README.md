@@ -118,7 +118,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 **Q: 延迟异常？** 正常中位数 ~120ms，P95 ~150ms。超过 200ms 检查 CPU 是否被占满。
 
-**Q: 如何关闭？** 双击 `user\llm_off.bat` 后重新部署即可临时禁用（仅跳过重排，不卸载 DLL）。恢复：双击 `user\llm_on.bat`。彻底删除：移除 `rime_llm.dll`。
+**Q: 如何关闭？** 将 `rime_llm.dll` 重命名为 `rime_llm.dll.bak`（或其他后缀），重新部署即恢复字典序。
 
 ## 编译
 
