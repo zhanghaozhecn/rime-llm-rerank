@@ -13,6 +13,7 @@ local cfg = {
 
 local lat_max   = 0
 local lat_count = 0
+local mem_logged = false
 
 local function do_init(env)
     if inited then return end
@@ -93,6 +94,16 @@ return function(translation, env)
             os.date("%H:%M:%S"), lat_count, input,
             cand_str, ctx_safe, res_info, elapsed_ms))
         ef:close()
+    end
+
+    -- 首次成功重排时记录内存占用
+    if ok and result and not mem_logged and llm.get_memory then
+        mem_logged = true
+        local mb = llm.get_memory()
+        if mb and mb > 0 then
+            local memf = io.open(TEMP .. "\\rime_llm_events.txt", "a")
+            if memf then memf:write(string.format("# model memory: %d MB\n", mb)); memf:close() end
+        end
     end
 
     if ok and result then
