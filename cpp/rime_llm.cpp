@@ -45,6 +45,8 @@ static const llama_vocab  * g_vocab   = nullptr;
 static std::mutex           g_mutex;
 static std::atomic<bool>    g_loaded{false};
 static std::atomic<bool>    g_loading{false};
+static std::vector<double>      g_last_scores;
+static std::vector<std::string> g_last_cands;
 
 // ============================================================
 // 轻量日志
@@ -137,7 +139,11 @@ static std::vector<llama_token> tokenize(const char * text) {
 }
 
 // ============================================================
-// 核心：并行 batch 评分（所有候选一次 decode）
+// 核心：KV cache 复制并行评分
+// 上下文在 seq 0 单次 decode，然后 llama_memory_seq_cp 复制到其他序列，
+// 候选 token 多序列并行 decode。延迟约减半（194→93ms）。
+// 注意: seq_cp 跨 stream 时必须传 p1=-1（全部位置），Qwen3.5 混合架构
+//       各 seq 在不同 stream，传部分范围会触发 ASSERT(is_full) 失败。
 // ============================================================
 static void score_batch(const std::vector<llama_token> & ctx_ids,
                          const std::vector<std::vector<llama_token>> & cands,
@@ -150,47 +156,63 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     llama_memory_clear(llama_get_memory(g_ctx), true);
 
     int ctx_len = (int)ctx_ids.size();
-    int total = n_cands * ctx_len;
-    for (auto & c : cands) total += (int)c.size();
 
-    llama_batch batch = llama_batch_init(total, 0, g_n_seq_max);
+    // ── Step 1: 上下文在 seq 0 中单次 decode ──
+    llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
+    for (int j = 0; j < ctx_len; j++) {
+        ctx_batch.token[j]      = ctx_ids[j];
+        ctx_batch.pos[j]        = j;
+        ctx_batch.n_seq_id[j]   = 1;
+        ctx_batch.seq_id[j][0]  = 0;
+    }
+    ctx_batch.logits[ctx_len - 1] = 1;
+    ctx_batch.n_tokens = ctx_len;
+
+    if (llama_decode(g_ctx, ctx_batch) != 0) {
+        llama_batch_free(ctx_batch);
+        return;
+    }
+    llama_batch_free(ctx_batch);
+
+    // ── Step 2: 复制 KV cache 到其他候选序列 ──
+    // p1=-1 表示 [p0, inf)，绕过跨 stream 的 is_full 检查
+    for (int i = 1; i < n_cands; i++) {
+        llama_memory_seq_cp(llama_get_memory(g_ctx), 0, i, 0, -1);
+    }
+
+    // ── Step 3: 候选 token 多序列并行 decode ──
+    int cand_total = 0;
+    for (auto & c : cands) cand_total += (int)c.size();
+
+    llama_batch cand_batch = llama_batch_init(cand_total, 0, n_cands);
     int idx = 0;
     for (int i = 0; i < n_cands; i++) {
-        for (int j = 0; j < ctx_len; j++) {
-            batch.token[idx]    = ctx_ids[j];
-            batch.pos[idx]      = j;
-            batch.n_seq_id[idx] = 1;
-            batch.seq_id[idx][0] = i;
-            idx++;
-        }
-        // last ctx token predicts first cand token — need logits here
-        batch.logits[idx - 1] = 1;
         int wlen = (int)cands[i].size();
         for (int j = 0; j < wlen; j++) {
-            batch.token[idx]    = cands[i][j];
-            batch.pos[idx]      = ctx_len + j;
-            batch.n_seq_id[idx] = 1;
-            batch.seq_id[idx][0] = i;
-            batch.logits[idx]   = 1;
+            cand_batch.token[idx]     = cands[i][j];
+            cand_batch.pos[idx]       = ctx_len + j;
+            cand_batch.n_seq_id[idx]  = 1;
+            cand_batch.seq_id[idx][0] = i;
+            cand_batch.logits[idx]    = 1;
             idx++;
         }
     }
-    batch.n_tokens = idx;
+    cand_batch.n_tokens = idx;
 
-    if (llama_decode(g_ctx, batch) != 0) {
-        llama_batch_free(batch);
+    if (llama_decode(g_ctx, cand_batch) != 0) {
+        llama_batch_free(cand_batch);
         return;
     }
 
+    // ── Step 4: 计算 CE loss（logits 按 batch 顺序排列）──
+    int vs = llama_n_vocab(g_vocab);
     int row_start = 0;
     for (int i = 0; i < n_cands; i++) {
         int wlen = (int)cands[i].size();
         double ce = 0;
         for (int j = 0; j < wlen; j++) {
-            int pos = row_start + ctx_len + j - 1;  // logits[pos] predicts token[pos+1]
-            float * logits = llama_get_logits_ith(g_ctx, pos);
+            float * logits = llama_get_logits_ith(g_ctx, row_start + j);
             if (!logits) { ce = -1e10; break; }
-            int vs   = llama_n_vocab(g_vocab);
             int tid  = cands[i][j];
             float m  = -1e30f;
             for (int k = 0; k < vs; k++) if (logits[k] > m) m = logits[k];
@@ -199,9 +221,9 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
             ce -= (double)(logits[tid] - m) - log(se);
         }
         scores_out[i] = -ce;
-        row_start += ctx_len + wlen;
+        row_start += wlen;
     }
-    llama_batch_free(batch);
+    llama_batch_free(cand_batch);
 }
 
 // ============================================================
@@ -257,27 +279,28 @@ static int lua_score(lua_State * L) {
     std::sort(order.begin(), order.end(),
               [&](int a, int b) { return scores[a] > scores[b]; });
 
-    // 返回: ranked_table, score_map
-    // ranked = {best, second, ...}  — 降序候选文本（向后兼容）
-    // scores = {[word] = score, ...} — 数值分数（供编码先验调节）
-    int n_cands = (int)cand_texts.size();
+    // 保存分数到模块变量（供 get_scores() 获取）
+    g_last_scores = scores;
+    g_last_cands  = cand_texts;
 
-    // 先压 score_map（第二个返回值）
-    lua_newtable(L);
-    for (int i = 0; i < n_cands; i++) {
-        lua_pushnumber(L, scores[i]);
-        lua_setfield(L, -2, cand_texts[i].c_str());
-    }
-
-    // 再压 ranked_table（第一个返回值，栈顶）
+    // 返回排序后的候选表
     lua_newtable(L);
     for (int i = 0; i < (int)order.size(); i++) {
         int idx = order[i];
         lua_pushstring(L, cand_texts[idx].c_str());
         lua_rawseti(L, -2, i + 1);
     }
+    return 1;
+}
 
-    return 2;  // ranked_table, score_map
+static int lua_get_scores(lua_State * L) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    lua_newtable(L);
+    for (size_t i = 0; i < g_last_cands.size(); i++) {
+        lua_pushnumber(L, g_last_scores[i]);
+        lua_setfield(L, -2, g_last_cands[i].c_str());
+    }
+    return 1;
 }
 
 static int lua_is_ready(lua_State * L) {
@@ -291,6 +314,7 @@ static int lua_is_ready(lua_State * L) {
 static int lua_index(lua_State * L) {
     const char * key = luaL_checkstring(L, 2);
     if (strcmp(key, "is_ready") == 0)       lua_pushcfunction(L, lua_is_ready);
+    else if (strcmp(key, "get_scores") == 0) lua_pushcfunction(L, lua_get_scores);
     else if (strcmp(key, "score") == 0)     lua_pushcfunction(L, lua_score);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
     else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);

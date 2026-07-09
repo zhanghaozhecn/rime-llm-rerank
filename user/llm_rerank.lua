@@ -7,7 +7,7 @@ local cfg = {
     min_code_len   = 4,
     min_tokens     = 1,
     max_tokens     = 6,
-    max_candidates = 3,
+    max_candidates = 5,
     cpu_cores      = nil,  -- nil = auto-detect in C++
 }
 
@@ -19,19 +19,16 @@ local function do_init(env)
     inited = true
 
     local sc = env.engine.schema.config
-    local ns = sc:get_map("llm_rerank")
-    if ns then
-        local v = tonumber(ns:get_value("min_code_len"))
-        if v then cfg.min_code_len = v end
-        v = tonumber(ns:get_value("max_tokens"))
-        if v then cfg.max_tokens = v end
-        v = tonumber(ns:get_value("max_candidates"))
-        if v then cfg.max_candidates = v end
-        v = tonumber(ns:get_value("cpu_cores"))
-        if v then cfg.cpu_cores = v end
-        v = tonumber(ns:get_value("min_tokens"))
-        if v then cfg.min_tokens = v end
-    end
+    local v = sc:get_int("llm_rerank/min_code_len")
+    if v then cfg.min_code_len = v end
+    v = sc:get_int("llm_rerank/max_tokens")
+    if v then cfg.max_tokens = v end
+    v = sc:get_int("llm_rerank/max_candidates")
+    if v then cfg.max_candidates = v end
+    v = sc:get_int("llm_rerank/cpu_cores")
+    if v then cfg.cpu_cores = v end
+    v = sc:get_int("llm_rerank/min_tokens")
+    if v then cfg.min_tokens = v end
 
     local ok, cpp = pcall(require, "rime_llm")
     if ok and cpp then

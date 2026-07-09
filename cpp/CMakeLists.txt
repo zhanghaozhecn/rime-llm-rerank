@@ -63,4 +63,28 @@ if(MSVC)
             "${CMAKE_SOURCE_DIR}/../user/rime_llm.dll"
     )
     target_compile_options(bench_latency PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # KV cache copy test
+    add_executable(bench_kv bench_kv.cpp)
+    target_include_directories(bench_kv PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_kv PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_kv PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # Cand sweep benchmark (old ctx×N vs new KV copy)
+    add_executable(bench_sweep bench_sweep.cpp)
+    target_include_directories(bench_sweep PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_sweep PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_sweep PRIVATE /O2 /arch:AVX2 /utf-8)
 endif()
