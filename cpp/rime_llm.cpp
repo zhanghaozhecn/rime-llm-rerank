@@ -31,10 +31,10 @@ extern "C" {
 // ============================================================
 static std::string  g_model_path      = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static int          g_min_tokens      = 1;
-static int          g_max_ctx_tokens  = 6;
-static int          g_n_threads       = std::thread::hardware_concurrency();
+static int          g_max_ctx_tokens  = 10; // 4+ tok 准确率稳定，10 tok 更多上文信息
+static int          g_n_threads       = 6;  // 1→6 持续收益，6→8 平坦
 static int          g_n_ctx           = 64;
-static int          g_n_seq_max       = 9;
+static int          g_n_seq_max       = 12; // 模板 seq 0 + 最多 11 worker seq
 
 // ============================================================
 // 模型状态
@@ -139,11 +139,26 @@ static std::vector<llama_token> tokenize(const char * text) {
 }
 
 // ============================================================
-// 核心：KV cache 复制并行评分
-// 上下文在 seq 0 单次 decode，然后 llama_memory_seq_cp 复制到其他序列，
-// 候选 token 多序列并行 decode。延迟约减半（194→93ms）。
-// 注意: seq_cp 跨 stream 时必须传 p1=-1（全部位置），Qwen3.5 混合架构
-//       各 seq 在不同 stream，传部分范围会触发 ASSERT(is_full) 失败。
+// Softmax CE 辅助：-log(softmax(x)[target])
+// ============================================================
+static double cross_entropy(float * logits, int vs, int target_id) {
+    float m = -1e30f;
+    for (int k = 0; k < vs; k++) if (logits[k] > m) m = logits[k];
+    double se = 0;
+    for (int k = 0; k < vs; k++) se += exp((double)(logits[k] - m));
+    return -((double)(logits[target_id] - m) - log(se));
+}
+
+// ============================================================
+// 核心评分：ctx 仅 1 次 decode + KV copy + 多序列分层并行候选 decode
+//
+// Step 1: decode ctx → 保存 logits → 所有候选的第 1 个 token CE 从此计算
+// Step 2: KV copy ctx → M 个 seq，并行 decode 候选首 token → 第 2 token CE
+// Step 3: 同一批 seq 继续 decode → 第 3 token CE
+//
+// 原理：P(tok_i0|ctx) 对所有 i 共享同一个 ctx_last hidden state
+//       多 token 候选每个 seq 仅 1 个新 token，SSM 跨序列干扰可忽略
+//       ith = batch 数组索引（不是 logits 标记序号）
 // ============================================================
 static void score_batch(const std::vector<llama_token> & ctx_ids,
                          const std::vector<std::vector<llama_token>> & cands,
@@ -153,77 +168,104 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     if (n_cands == 0) return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
-    llama_memory_clear(llama_get_memory(g_ctx), true);
-
     int ctx_len = (int)ctx_ids.size();
+    int vs = llama_n_vocab(g_vocab);
 
-    // ── Step 1: 上下文在 seq 0 中单次 decode ──
+    // 按 token 数分组
+    std::vector<int> idx2, idx3;
+    for (int i = 0; i < n_cands; i++) {
+        if (cands[i].size() >= 2) idx2.push_back(i);
+        if (cands[i].size() >= 3) idx3.push_back(i);
+    }
+    int M = (int)idx2.size();
+    int K = (int)idx3.size();
+    std::vector<int> cand_to_seq(n_cands, -1);  // candidate index → seq id
+
+    // ---- Step 1: ctx 仅 decode 一次，保存 ctx_last logits ----
+    llama_memory_clear(llama_get_memory(g_ctx), true);
     llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
     for (int j = 0; j < ctx_len; j++) {
-        ctx_batch.token[j]      = ctx_ids[j];
-        ctx_batch.pos[j]        = j;
-        ctx_batch.n_seq_id[j]   = 1;
-        ctx_batch.seq_id[j][0]  = 0;
+        ctx_batch.token[j] = ctx_ids[j]; ctx_batch.pos[j] = j;
+        ctx_batch.n_seq_id[j] = 1; ctx_batch.seq_id[j][0] = 0;
     }
     ctx_batch.logits[ctx_len - 1] = 1;
     ctx_batch.n_tokens = ctx_len;
-
-    if (llama_decode(g_ctx, ctx_batch) != 0) {
-        llama_batch_free(ctx_batch);
-        return;
+    std::vector<float> ctx_logits;
+    if (llama_decode(g_ctx, ctx_batch) == 0) {
+        float* cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
+        if (cl) ctx_logits.assign(cl, cl + vs);
     }
     llama_batch_free(ctx_batch);
 
-    // ── Step 2: 复制 KV cache 到其他候选序列 ──
-    // p1=-1 表示 [p0, inf)，绕过跨 stream 的 is_full 检查
-    for (int i = 1; i < n_cands; i++) {
-        llama_memory_seq_cp(llama_get_memory(g_ctx), 0, i, 0, -1);
-    }
+    if (ctx_logits.empty()) return;  // decode failed
 
-    // ── Step 3: 候选 token 多序列并行 decode ──
-    int cand_total = 0;
-    for (auto & c : cands) cand_total += (int)c.size();
-
-    llama_batch cand_batch = llama_batch_init(cand_total, 0, n_cands);
-    int idx = 0;
+    // 所有候选的第 1 个 token CE
+    std::vector<double> ce_sum(n_cands, 0);
     for (int i = 0; i < n_cands; i++) {
-        int wlen = (int)cands[i].size();
-        for (int j = 0; j < wlen; j++) {
-            cand_batch.token[idx]     = cands[i][j];
-            cand_batch.pos[idx]       = ctx_len + j;
-            cand_batch.n_seq_id[idx]  = 1;
-            cand_batch.seq_id[idx][0] = i;
-            cand_batch.logits[idx]    = 1;
-            idx++;
+        ce_sum[i] = cross_entropy(ctx_logits.data(), vs, cands[i][0]);
+    }
+
+    // ---- Step 2: 多 token 候选的首 token 并行 decode（每 seq 1 token）----
+    if (M > 0) {
+        // KV copy ctx (seq 0) → worker seqs 1..M
+        for (int s = 0; s < M; s++) {
+            llama_memory_seq_cp(llama_get_memory(g_ctx), 0, s + 1, 0, -1);
+            cand_to_seq[idx2[s]] = s + 1;
         }
-    }
-    cand_batch.n_tokens = idx;
 
-    if (llama_decode(g_ctx, cand_batch) != 0) {
-        llama_batch_free(cand_batch);
-        return;
+        llama_batch b2 = llama_batch_init(M, 0, M);
+        for (int s = 0; s < M; s++) {
+            int ci = idx2[s];
+            b2.token[s] = cands[ci][0];
+            b2.pos[s] = ctx_len;
+            b2.n_seq_id[s] = 1;
+            b2.seq_id[s][0] = s + 1;
+            b2.logits[s] = 1;
+        }
+        b2.n_tokens = M;
+        if (llama_decode(g_ctx, b2) == 0) {
+            for (int s = 0; s < M; s++) {
+                int ci = idx2[s];
+                float* l = llama_get_logits_ith(g_ctx, s);
+                if (l) ce_sum[ci] += cross_entropy(l, vs, cands[ci][1]);
+                else   ce_sum[ci] = -1e10;
+            }
+        } else {
+            for (int ci : idx2) ce_sum[ci] = -1e10;
+        }
+        llama_batch_free(b2);
     }
 
-    // ── Step 4: 计算 CE loss（logits 按 batch 顺序排列）──
-    int vs = llama_n_vocab(g_vocab);
-    int row_start = 0;
+    // ---- Step 3: 3-token 候选的次 token 并行 decode ----
+    if (K > 0) {
+        llama_batch b3 = llama_batch_init(K, 0, K);
+        for (int s = 0; s < K; s++) {
+            int ci = idx3[s];
+            int seq_id = cand_to_seq[ci];  // same seq as step 2
+            b3.token[s] = cands[ci][1];
+            b3.pos[s] = ctx_len + 1;
+            b3.n_seq_id[s] = 1;
+            b3.seq_id[s][0] = seq_id;
+            b3.logits[s] = 1;
+        }
+        b3.n_tokens = K;
+        if (llama_decode(g_ctx, b3) == 0) {
+            for (int s = 0; s < K; s++) {
+                int ci = idx3[s];
+                float* l = llama_get_logits_ith(g_ctx, s);
+                if (l) ce_sum[ci] += cross_entropy(l, vs, cands[ci][2]);
+                else   ce_sum[ci] = -1e10;
+            }
+        } else {
+            for (int ci : idx3) ce_sum[ci] = -1e10;
+        }
+        llama_batch_free(b3);
+    }
+
+    // ---- 输出分数 ----
     for (int i = 0; i < n_cands; i++) {
-        int wlen = (int)cands[i].size();
-        double ce = 0;
-        for (int j = 0; j < wlen; j++) {
-            float * logits = llama_get_logits_ith(g_ctx, row_start + j);
-            if (!logits) { ce = -1e10; break; }
-            int tid  = cands[i][j];
-            float m  = -1e30f;
-            for (int k = 0; k < vs; k++) if (logits[k] > m) m = logits[k];
-            double se = 0;
-            for (int k = 0; k < vs; k++) se += exp((double)(logits[k] - m));
-            ce -= (double)(logits[tid] - m) - log(se);
-        }
-        scores_out[i] = -ce;
-        row_start += wlen;
+        scores_out[i] = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
     }
-    llama_batch_free(cand_batch);
 }
 
 // ============================================================
@@ -253,7 +295,6 @@ static int lua_score(lua_State * L) {
 
     std::vector<llama_token> ctx_ids = tokenize(context);
     if ((int)ctx_ids.size() < g_min_tokens) { lua_pushnil(L); return 1; }
-
     if ((int)ctx_ids.size() > g_max_ctx_tokens)
         ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
 
@@ -273,21 +314,18 @@ static int lua_score(lua_State * L) {
         return 1;
     }
 
-    // 按分数降序排列候选的索引
+    // 按分数降序排列
     std::vector<int> order(scores.size());
     for (int i = 0; i < (int)order.size(); i++) order[i] = i;
     std::sort(order.begin(), order.end(),
               [&](int a, int b) { return scores[a] > scores[b]; });
 
-    // 保存分数到模块变量（供 get_scores() 获取）
     g_last_scores = scores;
     g_last_cands  = cand_texts;
 
-    // 返回排序后的候选表
     lua_newtable(L);
     for (int i = 0; i < (int)order.size(); i++) {
-        int idx = order[i];
-        lua_pushstring(L, cand_texts[idx].c_str());
+        lua_pushstring(L, cand_texts[order[i]].c_str());
         lua_rawseti(L, -2, i + 1);
     }
     return 1;

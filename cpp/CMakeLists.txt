@@ -87,4 +87,112 @@ if(MSVC)
         llama_cpu ggml_cpu ggml_base ggml_cpu_impl
     )
     target_compile_options(bench_sweep PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # KV copy correctness verification
+    add_executable(bench_verify bench_verify.cpp)
+    target_include_directories(bench_verify PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_verify PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_verify PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # Wiki corpus evaluation
+    add_executable(bench_wiki bench_wiki.cpp)
+    target_include_directories(bench_wiki PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_wiki PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_wiki PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # CE comparison: gold single-seq vs KV copy
+    add_executable(bench_cecmp bench_cecmp.cpp)
+    target_include_directories(bench_cecmp PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_cecmp PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_cecmp PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # Accuracy comparison: two-step vs KV copy
+    add_executable(bench_acc bench_acc.cpp)
+    target_include_directories(bench_acc PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_acc PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_acc PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # Real encoding evaluation (dict code-mates + corpus context)
+    add_executable(bench_enc bench_enc.cpp)
+    target_include_directories(bench_enc PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_enc PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_enc PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
+    # Latency benchmark
+    add_executable(bench_lat bench_lat.cpp)
+    target_include_directories(bench_lat PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_lat PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_lat PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # Layered multi-seq benchmark (ctx once + per-layer parallel decode)
+    add_executable(bench_hyb bench_hyb.cpp)
+    target_include_directories(bench_hyb PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_hyb PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_hyb PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
+    # Thread count + method benchmark
+    add_executable(bench_thr bench_thr.cpp)
+    target_include_directories(bench_thr PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_thr PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_thr PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
+    # Logits frame debug
+    add_executable(bench_dbg bench_dbg.cpp)
+    target_include_directories(bench_dbg PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_dbg PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(bench_dbg PRIVATE /O2 /arch:AVX2 /utf-8)
 endif()
