@@ -30,7 +30,9 @@ local function do_init(env)
     v = sc:get_int("llm_rerank/min_tokens")
     if v then cfg.min_tokens = v end
 
-    local ok, cpp = pcall(require, "rime_llm")
+    local backend = (sc:get_string("llm_rerank/backend") or "cpu")
+    local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
+    local ok, cpp = pcall(require, modname)
     if ok and cpp then
         cpp.model_path = os.getenv("RIME_LLM_MODEL") or "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
         cpp.max_ctx    = cfg.max_tokens

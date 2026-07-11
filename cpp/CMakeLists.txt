@@ -195,4 +195,107 @@ if(MSVC)
         llama_cpu ggml_cpu ggml_base ggml_cpu_impl
     )
     target_compile_options(bench_dbg PRIVATE /O2 /arch:AVX2 /utf-8)
+
+    # GPU accuracy sweep (links against CUDA build of llama.cpp)
+    set(LLAMA_CUDA_ROOT "D:/llama.cpp-mirror/build-cuda" CACHE PATH "llama.cpp CUDA build root")
+    add_executable(bench_gpu bench_gpu.cpp)
+    target_include_directories(bench_gpu PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_gpu PRIVATE
+        "${LLAMA_CUDA_ROOT}/src/llama.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-base.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cpu.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cuda/ggml-cuda.lib"
+    )
+    target_compile_options(bench_gpu PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+    # Post-build: copy CUDA DLLs to output dir
+    add_custom_command(TARGET bench_gpu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LLAMA_CUDA_ROOT}/bin/ggml.dll"
+            "$<TARGET_FILE_DIR:bench_gpu>/ggml.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LLAMA_CUDA_ROOT}/bin/ggml-base.dll"
+            "$<TARGET_FILE_DIR:bench_gpu>/ggml-base.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LLAMA_CUDA_ROOT}/bin/ggml-cpu.dll"
+            "$<TARGET_FILE_DIR:bench_gpu>/ggml-cpu.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LLAMA_CUDA_ROOT}/bin/ggml-cuda.dll"
+            "$<TARGET_FILE_DIR:bench_gpu>/ggml-cuda.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LLAMA_CUDA_ROOT}/bin/llama.dll"
+            "$<TARGET_FILE_DIR:bench_gpu>/llama.dll"
+    )
+
+    # Mega-batch GPU sweep (cross-sample batching for max throughput)
+    add_executable(bench_mega bench_mega.cpp)
+    target_include_directories(bench_mega PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(bench_mega PRIVATE
+        "${LLAMA_CUDA_ROOT}/src/llama.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-base.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cpu.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cuda/ggml-cuda.lib"
+    )
+    target_compile_options(bench_mega PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 endif()
+
+    # GPU layered + cross-sample batch sweep  
+    add_executable(bench_gpu2 bench_gpu2.cpp)
+    target_include_directories(bench_gpu2 PRIVATE
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
+    target_link_libraries(bench_gpu2 PRIVATE
+        "${LLAMA_CUDA_ROOT}/src/llama.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-base.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cpu.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cuda/ggml-cuda.lib")
+    target_compile_options(bench_gpu2 PRIVATE /O2 /arch:AVX2 /utf-8)
+target_compile_features(bench_gpu2 PRIVATE cxx_std_17)
+
+    # GPU latency stability benchmark (same input, repeat N times)
+    add_executable(bench_stable bench_stable.cpp)
+    target_include_directories(bench_stable PRIVATE
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
+    target_link_libraries(bench_stable PRIVATE
+        "${LLAMA_CUDA_ROOT}/src/llama.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-base.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cpu.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cuda/ggml-cuda.lib")
+    target_compile_options(bench_stable PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
+    # GPU production DLL (CUDA backend, same layered algorithm as CPU)
+    add_library(rime_llm_cuda SHARED rime_llm_cuda.cpp ${LUA_SRCS})
+    target_include_directories(rime_llm_cuda PRIVATE
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common" "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_definitions(rime_llm_cuda PRIVATE LUA_USE_WINDOWS)
+    target_link_libraries(rime_llm_cuda PRIVATE
+        "${LLAMA_CUDA_ROOT}/src/llama.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-base.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cpu.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cuda/ggml-cuda.lib")
+    target_compile_options(rime_llm_cuda PRIVATE /O2 /arch:AVX2 /utf-8)
+    set_target_properties(rime_llm_cuda PROPERTIES SUFFIX ".dll" PREFIX "")
+    add_custom_command(TARGET rime_llm_cuda POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:rime_llm_cuda>"
+            "${CMAKE_SOURCE_DIR}/../user/rime_llm_cuda.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LLAMA_CUDA_ROOT}/bin/ggml.dll"
+            "$<TARGET_FILE_DIR:rime_llm_cuda>/ggml.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LLAMA_CUDA_ROOT}/bin/ggml-base.dll"
+            "$<TARGET_FILE_DIR:rime_llm_cuda>/ggml-base.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LLAMA_CUDA_ROOT}/bin/ggml-cpu.dll"
+            "$<TARGET_FILE_DIR:rime_llm_cuda>/ggml-cpu.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LLAMA_CUDA_ROOT}/bin/ggml-cuda.dll"
+            "$<TARGET_FILE_DIR:rime_llm_cuda>/ggml-cuda.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LLAMA_CUDA_ROOT}/bin/llama.dll"
+            "$<TARGET_FILE_DIR:rime_llm_cuda>/llama.dll")
