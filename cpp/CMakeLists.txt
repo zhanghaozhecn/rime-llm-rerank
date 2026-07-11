@@ -148,6 +148,18 @@ if(MSVC)
     )
     target_compile_options(bench_enc PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
+    # Automated core tests (CE correctness + accuracy regression)
+    add_executable(test_core test_core.cpp)
+    target_include_directories(test_core PRIVATE
+        "${LLAMA_ROOT}/include"
+        "${LLAMA_ROOT}/ggml/include"
+        "${LLAMA_ROOT}/common"
+    )
+    target_link_libraries(test_core PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
+    )
+    target_compile_options(test_core PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
     # Latency benchmark
     add_executable(bench_lat bench_lat.cpp)
     target_include_directories(bench_lat PRIVATE
@@ -248,7 +260,19 @@ if(MSVC)
     target_compile_options(bench_mega PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 endif()
 
-    # GPU layered + cross-sample batch sweep  
+    # GPU 双因素扫参 (tok × cand, 20000 samples)
+    add_executable(bench_sweep2 bench_sweep2.cpp)
+    target_include_directories(bench_sweep2 PRIVATE
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
+    target_link_libraries(bench_sweep2 PRIVATE
+        "${LLAMA_CUDA_ROOT}/src/llama.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-base.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cpu.lib"
+        "${LLAMA_CUDA_ROOT}/ggml/src/ggml-cuda/ggml-cuda.lib")
+    target_compile_options(bench_sweep2 PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
+    # GPU layered + cross-sample batch sweep
     add_executable(bench_gpu2 bench_gpu2.cpp)
     target_include_directories(bench_gpu2 PRIVATE
         "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")

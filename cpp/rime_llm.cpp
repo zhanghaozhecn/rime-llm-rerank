@@ -105,7 +105,7 @@ static void load_model_async() {
         // warmup
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            llama_memory_clear(llama_get_memory(g_ctx), true);
+            llama_memory_clear(llama_get_memory(g_ctx), false);
             const char * warmup = "\n";
             llama_token tokens[4];
             int n_tokens = llama_tokenize(g_vocab, warmup, (int)strlen(warmup),
@@ -182,7 +182,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     std::vector<int> cand_to_seq(n_cands, -1);  // candidate index → seq id
 
     // ---- Step 1: ctx 仅 decode 一次，保存 ctx_last logits ----
-    llama_memory_clear(llama_get_memory(g_ctx), true);
+    llama_memory_clear(llama_get_memory(g_ctx), false);
     llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
     for (int j = 0; j < ctx_len; j++) {
         ctx_batch.token[j] = ctx_ids[j]; ctx_batch.pos[j] = j;

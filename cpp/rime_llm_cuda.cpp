@@ -99,7 +99,7 @@ static void load_model_async() {
         // warmup
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            llama_memory_clear(llama_get_memory(g_ctx), true);
+            llama_memory_clear(llama_get_memory(g_ctx), false);
             llama_token tokens[4];
             int n = llama_tokenize(g_vocab, "\n", 1, tokens, 4, true, true);
             if (n > 0) {
@@ -166,7 +166,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
 
     // Step 1: decode ctx once
     auto t1_0 = std::chrono::high_resolution_clock::now();
-    llama_memory_clear(llama_get_memory(g_ctx), true);
+    llama_memory_clear(llama_get_memory(g_ctx), false);
     llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
     for (int j = 0; j < ctx_len; j++) {
         ctx_batch.token[j] = ctx_ids[j]; ctx_batch.pos[j] = j;

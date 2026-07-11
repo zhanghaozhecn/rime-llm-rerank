@@ -106,13 +106,22 @@ local function processor(key, env)
 
             local parts = {}
             for _, w in ipairs(new_words) do
-                -- 优先手动捕获的码，其次满码（顶屏回退），用完即清
-                local code = pending_code
-                if code == "" then
-                    code = last_full
+                -- 含中文才分配码，跳过纯英文/数字/标点
+                local has_chinese = w:match("[^\1-\127]")
+                local code = ""
+                if has_chinese then
+                    -- 优先手动捕获的码，其次满码（顶屏回退），用完即清
+                    code = pending_code
+                    if code == "" then
+                        code = last_full
+                    end
                 end
                 pending_code = ""
                 last_full = ""
+                -- 单字 3 码只需前 2 码（第 3 码是形码，由字本身决定）
+                if #w == 1 and #code >= 3 then
+                    code = code:sub(1, 2)
+                end
                 table.insert(parts, w .. TAB .. code)
             end
             local sep = (overlap > 0 and SPLIT or "")

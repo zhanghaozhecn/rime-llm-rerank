@@ -51,17 +51,25 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 user\rime_llm.dll  →  C:\Program Files\Rime\weasel-0.17.4\
 ```
 
-**GPU（需 NVIDIA 显卡 + CUDA 12，更快更稳定）：** 复制 `user\` 下所有 DLL 到同一目录：
+**GPU（需 NVIDIA 显卡 + CUDA Toolkit 12.8，更快更稳定）：**
+
+1. 安装 [CUDA Toolkit 12.8](https://developer.nvidia.com/cuda-12-8-0-download-archive)
+2. 复制 `user\` 下所有 DLL 到小狼毫目录
+3. 从 CUDA Toolkit 安装目录（如 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\`）复制以下文件到小狼毫目录：
+   - `cudart64_12.dll`
+   - `cublas64_12.dll`
+   - `cublasLt64_12.dll`
 
 ```
 user\rime_llm_cuda.dll  →  C:\Program Files\Rime\weasel-0.17.4\
 user\ggml*.dll          →  ...（llama.cpp 依赖）
 user\llama.dll          →  ...
-user\cudart64_12.dll    →  ...（CUDA runtime）
-user\cublas*.dll        →  ...（cuBLAS）
+<CUDA>\bin\cudart64_12.dll   →  ...（CUDA runtime）
+<CUDA>\bin\cublas64_12.dll   →  ...（cuBLAS）
+<CUDA>\bin\cublasLt64_12.dll →  ...
 ```
 
-> ⚠️ GPU 版部署后需在 NVIDIA 控制面板中将 `WeaselServer.exe` 的电源管理模式设为「最高性能优先」，否则延迟波动严重。
+> ⚠️ 需在 NVIDIA 控制面板中将 `WeaselServer.exe` 设为「最高性能优先」，否则延迟波动严重。CUDA 版本必须为 12.8，其他版本未经测试。
 
 插件默认 6 线程 + 10 token 上文，通常无需调整。如需自定义见下方配置参数。
 
