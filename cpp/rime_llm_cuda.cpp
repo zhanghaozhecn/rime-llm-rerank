@@ -34,7 +34,15 @@ extern "C" {
 static std::string  g_model_path      = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static int          g_min_tokens      = 1;
 static int          g_max_ctx_tokens  = 10;
-static int          g_n_threads       = 4;   // GPU 场景线程数不需太多
+static int          g_n_threads       = 0;  // 0=auto: max(4, ceil(hw_threads/3))，用户设置后覆盖
+
+// 自动检测默认线程数：总线程数的 1/3 向上取整，最少 4
+static int auto_threads() {
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) return 6;  // 无法检测时回退 6
+    int t = (int)std::ceil(hw / 3.0);
+    return (t < 4) ? 4 : t;
+}
 static int          g_n_ctx           = 512; // 12 seq × ~23 tok 需要
 static int          g_n_seq_max       = 12;  // 模板 seq 0 + 11 worker seq
 static int          g_n_gpu_layers    = 99;  // 全部 offload 到 GPU
@@ -50,6 +58,12 @@ static std::atomic<bool>    g_loaded{false};
 static std::atomic<bool>    g_loading{false};
 static std::vector<double>      g_last_scores;
 static std::vector<std::string> g_last_cands;
+
+// 预解码状态：prepare() 在 commit 后异步执行 Step 1 + KV copy
+static std::vector<llama_token> g_prep_ctx;
+static std::vector<float>       g_prep_logits;
+static bool                      g_prep_ready = false;
+static std::atomic<int>         g_prep_seq{0};
 
 // ============================================================
 // 轻量日志
@@ -84,10 +98,16 @@ static void load_model_async() {
         }
         g_vocab = llama_model_get_vocab(g_model);
 
+        // 解析线程数：0 = 自动检测
+        int n_thr = g_n_threads;
+        if (n_thr <= 0) n_thr = auto_threads();
+        log_msg("threads: hw=%u auto=%d user=%d final=%d",
+                std::thread::hardware_concurrency(), auto_threads(), g_n_threads, n_thr);
+
         llama_context_params cparams = llama_context_default_params();
         cparams.n_ctx           = g_n_ctx;
-        cparams.n_threads       = g_n_threads;
-        cparams.n_threads_batch = g_n_threads;
+        cparams.n_threads       = n_thr;
+        cparams.n_threads_batch = n_thr;
         cparams.n_seq_max       = g_n_seq_max;
 
         g_ctx = llama_new_context_with_model(g_model, cparams);
@@ -109,7 +129,7 @@ static void load_model_async() {
         }
 
         g_loaded.store(true); g_loading.store(false);
-        log_msg("model ready (GPU, n_ctx=%d threads=%d gpu_layers=%d)", g_n_ctx, g_n_threads, g_n_gpu_layers);
+        log_msg("model ready (GPU, n_ctx=%d threads=%d gpu_layers=%d)", g_n_ctx, n_thr, g_n_gpu_layers);
     }).detach();
 }
 
@@ -164,25 +184,34 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     int M = (int)idx2.size(), K = (int)idx3.size();
     std::vector<int> cand_to_seq(n_cands, -1);
 
-    // Step 1: decode ctx once
-    auto t1_0 = std::chrono::high_resolution_clock::now();
-    llama_memory_clear(llama_get_memory(g_ctx), false);
-    llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
-    for (int j = 0; j < ctx_len; j++) {
-        ctx_batch.token[j] = ctx_ids[j]; ctx_batch.pos[j] = j;
-        ctx_batch.n_seq_id[j] = 1; ctx_batch.seq_id[j][0] = 0;
-    }
-    ctx_batch.logits[ctx_len - 1] = 1; ctx_batch.n_tokens = ctx_len;
+    // 检测预解码
+    bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx;
     std::vector<float> ctx_logits;
-    int rc1 = llama_decode(g_ctx, ctx_batch);
-    if (rc1 == 0) {
-        float* cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
-        if (cl) ctx_logits.assign(cl, cl + vs);
+    double ms1 = 0;
+
+    if (!use_prep) {
+        // Step 1: decode ctx once
+        auto t1_0 = std::chrono::high_resolution_clock::now();
+        llama_memory_clear(llama_get_memory(g_ctx), false);
+        llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
+        for (int j = 0; j < ctx_len; j++) {
+            ctx_batch.token[j] = ctx_ids[j]; ctx_batch.pos[j] = j;
+            ctx_batch.n_seq_id[j] = 1; ctx_batch.seq_id[j][0] = 0;
+        }
+        ctx_batch.logits[ctx_len - 1] = 1; ctx_batch.n_tokens = ctx_len;
+        int rc1 = llama_decode(g_ctx, ctx_batch);
+        if (rc1 == 0) {
+            float* cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
+            if (cl) ctx_logits.assign(cl, cl + vs);
+        }
+        llama_batch_free(ctx_batch);
+        auto t1_1 = std::chrono::high_resolution_clock::now();
+        ms1 = std::chrono::duration<double, std::milli>(t1_1 - t1_0).count();
+        if (ctx_logits.empty()) { log_msg("score: S1 FAILED rc=%d", rc1); return; }
+    } else {
+        // 预解码命中
+        ctx_logits = g_prep_logits;
     }
-    llama_batch_free(ctx_batch);
-    auto t1_1 = std::chrono::high_resolution_clock::now();
-    double ms1 = std::chrono::duration<double, std::milli>(t1_1 - t1_0).count();
-    if (ctx_logits.empty()) { log_msg("score: S1 FAILED rc=%d", rc1); return; }
 
     // First-token CE for all candidates
     std::vector<double> ce_sum(n_cands, 0);
@@ -190,7 +219,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         ce_sum[i] = cross_entropy(ctx_logits.data(), vs, cands[i][0]);
 
     // Step 2: multi-token first tokens in parallel
-    double ms2 = 0;
+    double ms2a = 0, ms2b = 0;
     if (M > 0) {
         auto t2_0 = std::chrono::high_resolution_clock::now();
         auto mem = llama_get_memory(g_ctx);
@@ -198,6 +227,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
             llama_memory_seq_cp(mem, 0, s + 1, 0, -1);
             cand_to_seq[idx2[s]] = s + 1;
         }
+        auto t2_kv = std::chrono::high_resolution_clock::now();
         llama_batch b2 = llama_batch_init(M, 0, M);
         for (int s = 0; s < M; s++) {
             int ci = idx2[s];
@@ -215,7 +245,8 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         } else { for (int ci : idx2) ce_sum[ci] = -1e10; }
         llama_batch_free(b2);
         auto t2_1 = std::chrono::high_resolution_clock::now();
-        ms2 = std::chrono::duration<double, std::milli>(t2_1 - t2_0).count();
+        ms2a = std::chrono::duration<double, std::milli>(t2_kv - t2_0).count();
+        ms2b = std::chrono::duration<double, std::milli>(t2_1 - t2_kv).count();
     }
 
     // Step 3: 3-token second tokens in parallel
@@ -245,6 +276,8 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     for (int i = 0; i < n_cands; i++)
         scores_out[i] = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
 
+    if (use_prep) g_prep_ready = false;
+
     auto t_total_1 = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count();
 
@@ -252,13 +285,71 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     char tok_buf[64]; int pos = 0;
     for (int i = 0; i < n_cands && pos < 60; i++)
         pos += snprintf(tok_buf + pos, sizeof(tok_buf) - pos, "%d%s", (int)cands[i].size(), i < n_cands-1 ? "," : "");
-    log_msg("score: wait=%.0fms S1=%.0fms S2=%.0fms S3=%.0fms total=%.0fms ctx_tok=%d cand_tok=[%s]",
-        wait_ms, ms1, ms2, ms3, total_ms, ctx_len, tok_buf);
+    log_msg("score: wait=%.0fms S1=%.0fms KV=%.0fms S2=%.0fms S3=%.0fms total=%.0fms ctx_tok=%d cand_tok=[%s]",
+        wait_ms, ms1, ms2a, ms2b, ms3, total_ms, ctx_len, tok_buf);
+}
+
+// ============================================================
+// 预解码：在第一个编码按下时提前执行 Step 1 + KV copy
+// ============================================================
+static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    int ctx_len = (int)ctx_ids.size();
+
+    // 过期请求：新的 prepare 已到来，放弃本次计算
+    if (seq != g_prep_seq.load()) {
+        log_msg("prepare: SKIP stale seq=%d current=%d ctx_tok=%d", seq, g_prep_seq.load(), ctx_len);
+        return;
+    }
+    log_msg("prepare: start ctx_tok=%d seq=%d", ctx_len, seq);
+    int vs = llama_n_vocab(g_vocab);
+    auto* mem = llama_get_memory(g_ctx);
+
+    g_prep_ready = false;
+    g_prep_ctx.clear();
+    g_prep_logits.clear();
+
+    llama_memory_clear(mem, false);
+    llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
+    for (int j = 0; j < ctx_len; j++) {
+        ctx_batch.token[j] = ctx_ids[j]; ctx_batch.pos[j] = j;
+        ctx_batch.n_seq_id[j] = 1; ctx_batch.seq_id[j][0] = 0;
+    }
+    ctx_batch.logits[ctx_len - 1] = 1; ctx_batch.n_tokens = ctx_len;
+
+    if (llama_decode(g_ctx, ctx_batch) != 0) { llama_batch_free(ctx_batch); return; }
+    float* cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
+    if (!cl) { llama_batch_free(ctx_batch); return; }
+    g_prep_logits.assign(cl, cl + vs);
+    llama_batch_free(ctx_batch);
+
+    g_prep_ctx = ctx_ids;
+    g_prep_ready = true;
+    log_msg("prepare: done ctx_tok=%d seq=%d", ctx_len, seq);
 }
 
 // ============================================================
 // Lua API (与 CPU 版相同接口)
 // ============================================================
+static int lua_prepare(lua_State * L) {
+    if (!g_loaded.load()) { lua_pushboolean(L, 0); return 1; }
+    const char * context = luaL_checkstring(L, 1);
+    auto ctx_ids = tokenize(context);
+    if ((int)ctx_ids.size() < g_min_tokens) { lua_pushboolean(L, 0); return 1; }
+    if ((int)ctx_ids.size() > g_max_ctx_tokens)
+        ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
+
+    int seq = ++g_prep_seq;
+
+    std::thread([ctx_ids, seq]() {
+        prepare(ctx_ids, seq);
+    }).detach();
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 static int lua_score(lua_State * L) {
     if (!g_loaded.load()) {
         if (!g_loading.load()) load_model_async();
@@ -328,10 +419,11 @@ static int lua_index(lua_State * L) {
     if (strcmp(key, "is_ready") == 0)       lua_pushcfunction(L, lua_is_ready);
     else if (strcmp(key, "get_scores") == 0) lua_pushcfunction(L, lua_get_scores);
     else if (strcmp(key, "score") == 0)     lua_pushcfunction(L, lua_score);
+    else if (strcmp(key, "prepare") == 0)   lua_pushcfunction(L, lua_prepare);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
     else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);
     else if (strcmp(key, "min_tokens") == 0) lua_pushinteger(L, g_min_tokens);
-    else if (strcmp(key, "n_threads") == 0) lua_pushinteger(L, g_n_threads);
+    else if (strcmp(key, "n_threads") == 0) lua_pushinteger(L, g_n_threads > 0 ? g_n_threads : auto_threads());
     else if (strcmp(key, "n_ctx") == 0)     lua_pushinteger(L, g_n_ctx);
     else if (strcmp(key, "n_seq_max") == 0)  lua_pushinteger(L, g_n_seq_max);
     else if (strcmp(key, "n_gpu_layers") == 0) lua_pushinteger(L, g_n_gpu_layers);
@@ -358,6 +450,7 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm_cuda(lua_State * L) {
     lua_newtable(L);
 
     lua_pushcfunction(L, lua_score);      lua_setfield(L, -2, "score");
+    lua_pushcfunction(L, lua_prepare);    lua_setfield(L, -2, "prepare");
     lua_pushcfunction(L, lua_is_ready);    lua_setfield(L, -2, "is_ready");
     lua_pushstring(L, g_model_path.c_str()); lua_setfield(L, -2, "model_path");
     lua_pushinteger(L, g_max_ctx_tokens); lua_setfield(L, -2, "max_ctx");
