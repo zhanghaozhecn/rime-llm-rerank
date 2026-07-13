@@ -41,18 +41,58 @@ with open(DICT_PATH, encoding="utf-8") as f:
         parts = line.split("\t")
         if len(parts) < 2:
             continue
-        word, code = parts[0], parts[1]
-        if len(code) != 4:
-            continue
+        word = parts[0]
         if word not in word_to_code:
-            word_to_code[word] = code
-for w, c in word_to_code.items():
-    code_to_words[c].append(w)
-print(f"  {len(word_to_code)} words, {len(code_to_words)} codes")
+            word_to_code[word] = set()
+        # 收录所有编码：简码（如有）+ 全码
+        if len(parts) > 2:
+            word_to_code[word].add(parts[1])  # 简码（1 码或 2 码）
+            word_to_code[word].add(parts[2])  # 全码（2 码或 3 码）
+        else:
+            word_to_code[word].add(parts[1])
+
+# 单字筛选：无 1 码 + 前 2 码唯一 + 有 3 码
+#   1 码字 → 直接跳过（打法固定，不参与重排）
+#   前 2 码 > 1 种 → 多编码字（多音字），跳过
+#   有 3 码形式 → 以 3 码作为评测编码
+single_char_code = {}   # word → 3-code (评测用)
+for w, codes in word_to_code.items():
+    if len(w) != 1:
+        continue
+    has_len1 = any(len(c) == 1 for c in codes)
+    if has_len1:
+        continue  # 有简码，跳过
+    # 提取所有 ≥2 码的前 2 码
+    prefixes = set(c[:2] for c in codes if len(c) >= 2)
+    if len(prefixes) != 1:
+        continue  # 多编码字（多音），跳过
+    # 取 3 码形式作为评测编码，没有则跳过
+    code3 = next((c for c in codes if len(c) == 3), None)
+    if code3 is None:
+        continue
+    single_char_code[w] = code3
+
+# 多字词
+multi_char_code = {}
+for w, codes in word_to_code.items():
+    if len(w) == 1:
+        continue
+    multi_char_code[w] = list(codes)[0]
+
+# 构建 code→words 映射（仅评测编码，简码不参与）
+for w, code in single_char_code.items():
+    code_to_words[code].append(w)
+for w, code in multi_char_code.items():
+    code_to_words[code].append(w)
+
+print(f"  Multi-char: {len(multi_char_code)}, single-char (3-code unique): {len(single_char_code)}")
+print(f"  Codes: {len(code_to_words)}")
 
 # ── 2. jieba with dict ──
 import jieba
-for word in word_to_code:
+for word in single_char_code:
+    jieba.add_word(word)
+for word in multi_char_code:
     jieba.add_word(word)
 print("  jieba ready")
 
@@ -80,12 +120,14 @@ for si, sent in enumerate(sentences):
         if pos < 0:
             char_pos += len(w)
             continue
-        if w in word_to_code:
-            hits_in_sent.append((char_pos, w))
+        # 单字用 single_char_code，多字词用 multi_char_code
+        if w in single_char_code:
+            hits_in_sent.append((char_pos, w, single_char_code[w]))
+        elif w in multi_char_code:
+            hits_in_sent.append((char_pos, w, multi_char_code[w]))
         char_pos = char_pos + len(w)
 
-    for char_pos, word in hits_in_sent:
-        code = word_to_code[word]
+    for char_pos, word, code in hits_in_sent:
         all_words = code_to_words[code]
         total = len(all_words)
         dict_pos = all_words.index(word)

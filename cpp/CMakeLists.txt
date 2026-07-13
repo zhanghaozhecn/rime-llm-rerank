@@ -75,6 +75,22 @@ if(MSVC)
     )
     target_compile_options(bench_sweep2 PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
+    # Real typing corpus accuracy
+    add_executable(bench_train bench_train.cpp)
+    target_include_directories(bench_train PRIVATE
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
+    target_link_libraries(bench_train PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
+    target_compile_options(bench_train PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
+    # Single-char 3-code accuracy (tok=10, cand=5)
+    add_executable(bench_single_char bench_single_char.cpp)
+    target_include_directories(bench_single_char PRIVATE
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
+    target_link_libraries(bench_single_char PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
+    target_compile_options(bench_single_char PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
     # 2B model accuracy sweep
     add_executable(bench_sweep_2b bench_sweep_2b.cpp)
     target_include_directories(bench_sweep_2b PRIVATE
