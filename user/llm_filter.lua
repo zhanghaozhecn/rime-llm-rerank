@@ -34,7 +34,9 @@ local function do_init(env)
     local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
     local ok, cpp = pcall(require, modname)
     if ok and cpp then
-        cpp.model_path = os.getenv("RIME_LLM_MODEL") or "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
+        -- model_path：schema 用户值 > Lua/C++ 双重默认（重复更稳健）
+        local mp = sc:get_string("llm_rerank/model_path")
+        cpp.model_path = (mp and mp ~= "") and mp or "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
         cpp.max_ctx    = cfg.max_tokens
         cpp.min_tokens = cfg.min_tokens
         if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end

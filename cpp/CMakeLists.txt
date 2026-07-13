@@ -75,6 +75,14 @@ if(MSVC)
     )
     target_compile_options(bench_sweep2 PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
+    # 2B model accuracy sweep
+    add_executable(bench_sweep_2b bench_sweep_2b.cpp)
+    target_include_directories(bench_sweep_2b PRIVATE
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
+    target_link_libraries(bench_sweep_2b PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
+    target_compile_options(bench_sweep_2b PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
     # Token distribution analysis
     add_executable(analyze_tokens analyze_tokens.cpp)
     target_include_directories(analyze_tokens PRIVATE

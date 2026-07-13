@@ -93,7 +93,7 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
 点击下载 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500MB），放到 `D:\gguf_models\`。
 
-> 放其他路径需设环境变量 `RIME_LLM_MODEL`。
+> 放其他路径需在 schema 中设置 `model_path` 或配置环境变量。
 
 ### 第二步：复制插件
 
@@ -133,9 +133,9 @@ user\llama.dll          →  ...
 ```yaml
 engine:
   processors:
-    - lua_processor@*llm_context
+    - lua_processor@*llm_processor
   filters:
-    - lua_filter@*llm_rerank
+    - lua_filter@*llm_filter
 ```
 
 3. 右键小狼毫 → **重新部署**
@@ -159,6 +159,7 @@ llm_rerank:
   max_tokens: 10       # 截取的上文 token 数（1-20），10 为性价比最优点
   max_candidates: 5    # 并行评分候选数（2-9），5 为延迟/准确率最佳平衡
   # cpu_cores: 0      # 可选。CPU 线程数，不设置=自动检测（max(4,ceil(总线程/3))）
+  # model_path: ""     # 可选。模型路径，不设置=内置默认 Qwen3.5-0.8B Q4_K_M。换模型只需改此处
   backend: cpu         # "cpu" 或 "gpu"（需对应 DLL 已部署）
 ```
 
@@ -169,6 +170,7 @@ llm_rerank:
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |
 | `cpu_cores` | auto | CPU 线程数。不设置=自动检测：`max(4, ceil(总线程数/3))`，如 20 线程→7 |
+| `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
 | `backend` | cpu | `cpu` 或 `gpu`，需对应 DLL 已部署到小狼毫目录 |
 
 ## 目录结构
@@ -176,8 +178,8 @@ llm_rerank:
 ```
 rime-llm-rerank\
 ├── user\                      # 用户安装文件（复制到 RIME）
-│   ├── llm_rerank.lua         #   候选重排 filter
-│   ├── llm_context.lua        #   上屏文字收集 processor
+│   ├── llm_filter.lua          #   候选重排 filter
+│   ├── llm_processor.lua       #   上屏文字收集 + 预解码 processor
 │   ├── rime_llm.dll           #   预编译 CPU 插件
 │   ├── rime_llm_cuda.dll      #   预编译 GPU 插件（可选）
 │   └── *.dll                  #   llama.cpp + CUDA 依赖 DLL
@@ -309,4 +311,4 @@ GPU 待机 P8（210MHz/1.6W），推理时升到 P0（2250MHz/19W），转换耗
 
 ### 7. 语料采集：码分配时机
 
-`llm_context.lua` 中 `pending_code`（手动选词码）和 `last_full`（4 码顶屏码）在**输入变空的瞬间**捕获。但一次上屏事件可能包含多个条目（词+标点+空格），码只应分配给含中文的条目，纯英文/标点应跳过，否则"d, c, lua"等会拿到前一个中文词的码。单字 3 码截为前 2 码——第 3 码是形码，由字本身决定，对训练无额外信息。
+`llm_processor.lua` 中 `pending_code`（手动选词码）和 `last_full`（4 码顶屏码）在**输入变空的瞬间**捕获。但一次上屏事件可能包含多个条目（词+标点+空格），码只应分配给含中文的条目，纯英文/标点应跳过，否则"d, c, lua"等会拿到前一个中文词的码。单字 3 码截为前 2 码——第 3 码是形码，由字本身决定，对训练无额外信息。
