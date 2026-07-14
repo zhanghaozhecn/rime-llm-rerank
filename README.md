@@ -1,57 +1,56 @@
 # RIME LLM 候选重排
 
-一个本地 AI 模型（Qwen3.5-0.8B），为任意 RIME **四码定长**方案（五笔、郑码、仓颉、拼读双拼等）提供打字时的智能候选排序。
+## 项目简介
+
+使用本地部署的LLM为任意 RIME **四码定长**方案（五笔、郑码、仓颉、拼读双拼等）提供打字时的智能候选排序。
 
 LLM 与编码方案无关——它只看到最终的中文候选词列表。
 
+默认配置 **10 token 上文 + 5 候选**，Qwen3.5-0.8B Q4_K_M。选重率可降至原方案的1/3。
+
+采用**预解码 + 分层并行解码**：上文在 commit 后立即异步预解码（Step 1），编码完成时只需候选 token decode（Step 2）。上下文 decode 1 次，候选 decode 1-2 次，总共最多 3 次。
+
+### 目录结构
+
+```
+rime-llm-rerank\
+├── user\                      # 用户安装文件（复制到 RIME）
+│   ├── llm_filter.lua          #   候选重排 filter
+│   ├── llm_processor.lua       #   上屏文字收集 + 预解码 processor
+│   ├── rime_llm.dll           #   预编译 CPU 插件
+│   ├── rime_llm_cuda.dll      #   预编译 GPU 插件（可选）
+│   └── *.dll                  #   llama.cpp + CUDA 依赖 DLL
+├── cpp\                       # 源码 + Lua 嵌入
+│   ├── rime_llm.cpp           #   CPU 插件源码
+│   ├── rime_llm_cuda.cpp      #   GPU 插件源码
+│   ├── CMakeLists.txt         #   CMake 配置（CPU + GPU 目标）
+│   └── l*.c / l*.h            #   Lua 5.4 源码
+└── README.md
+```
+
+---
+
+# 用户说明
+
 ## 效果与延迟
 
-默认配置 **10 token 上文 + 5 候选**，Qwen3.5-0.8B Q4_K_M。准确率 93.4%。参数根据 20000 样本扫参确定：cand=5→9 仅 +0.5pp 但 CPU 延迟翻倍，5 为延迟/准确率最佳平衡点。
-
-采用**预解码 + 分层并行解码**：上文在 commit 后立即异步预解码（Step 1），编码完成时只需候选 token decode（Step 2）。总 decode 次数：ctx 1 次 + 候选层 1-2 次。
-
-### 感知延迟（用户体感）
+### 延迟
 
 | 指标 | CPU (thr=7) | GPU (P0) |
 |------|:---:|:---:|
-| 准确率 (10tok/5cand) | **93.4%** | **93.4%** |
-| 感知延迟 (10tok/5cand) | **~43ms** | **~23ms** |
+| 延迟 (10tok/5cand) | **~43ms** | **~23ms** |
 | 其中 ctx decode (S1) | 0ms（预解码） | 0ms（预解码） |
 | 候选 decode (S2) | ~36ms | ~16ms |
-| 准确率 (10tok/5cand) | 93.4% | 93.4%（同算法） |
 | 内存/VRAM | ~497MB | ~1.2GB |
 | 依赖 | 零 | NVIDIA GPU + CUDA 12 |
 
-> ⚠️ **延迟为相对参考**，受 CPU/GPU 型号和线程数影响，不同机器差异显著。**准确率是唯一跨机器的绝对指标。**
->
+> ⚠️ **延迟为相对值**，受 CPU/GPU 型号和线程数影响，不同机器差异显著。
+> CPU 版经两台电脑测试7线程时延迟性能饱和。
 > GPU 版需在 NVIDIA 控制面板中将 `WeaselServer.exe` 设为「最高性能优先」，否则 P8→P0 降频导致延迟剧烈波动。
 
-### 预解码原理
+### 首选率（20000 样本，拼读双拼40万词）
 
-打字时，上文在 commit 后即已确定，而候选需要等编码打完才知道。利用这个时间差：
-
-1. **commit 时**：异步执行 ctx decode + 缓存 logits（~50ms CPU / ~10ms GPU）
-2. **编码打完**：skip ctx decode，直接 KV copy + 候选 decode（~36ms CPU / ~16ms GPU）
-3. **感知延迟**：从「ctx+候选」降到「仅候选」，约减半
-
-### 延迟扫参（全部 2-token 候选 = 最坏情况，不含预解码）
-
-#### thr × cand（tok=10，p50 ms，CPU）
-
-| thr\cand | cand=2 | cand=3 | cand=4 | **cand=5** | cand=6 | cand=7 | cand=8 | cand=9 |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 3 | 171 | 190 | 202 | 231 | 264 | 276 | 287 | 302 |
-| 4 | 154 | 169 | 180 | 211 | 225 | 243 | 262 | 282 |
-| **6** | 137 | 150 | 161 | **178** | 195 | 213 | 217 | 235 |
-| 8 | 121 | 135 | 145 | 167 | 186 | 207 | 217 | 238 |
-
-- 延迟随 cand 平滑增长，每增 1 候选 ≈ +14ms（thr=6）
-- 线程 3→6 持续收益，6→8 几乎持平
-- tok（上下文长度）每增 1 仅 +~5ms
-
-### 准确率（20000 样本，CPU Q4_K_M，同码词扫参）
-
-**有效首选率**：LLM 在同码词中将正确词排到第一位的概率。同码词只有一个时自动正确（无竞争），正确词不在前 N 候选时自动错误。指标反映 LLM 在真实同码竞争中的排序能力。
+**首选率**：LLM 在同码词中将正确词排到第一位的概率。同码词只有一个时自动正确，正确词不在前 N 候选时自动错误。指标反映 LLM 在真实同码竞争中的排序能力。
 
 | tok\cand | cand=2 | cand=3 | cand=4 | cand=5 | cand=6 | cand=7 | cand=8 | cand=9 |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -77,15 +76,13 @@ LLM 与编码方案无关——它只看到最终的中文候选词列表。
 | 20 | 89.3 | 92.1 | 93.2 | 93.7 | 94.0 | 94.2 | 94.2 | 94.3 |
 
 **关键结论：**
-- 生产默认 **10tok/5cand = 93.4%**，与独立 1000 样本验证（93.2%）高度一致
+- 生产默认 **10tok/5cand = 93.4%**
 - tok=1→5 跳升 ~7pp，5→10 微升 ~2pp，**10→20 饱和**——10 tok 已是最优上文窗口
 - cand 增至 9 时达 93.9%，但每增 1 候选延迟 +~13ms，5→9 的 0.5pp 收益不划算
 - 天花板 ~94.3%（tok≈13-15），是 Qwen3.5-0.8B Q4_K_M 在此任务上的上限
 - 评估方法：wiki 语料 jieba 分词 + dict 同码词采样，分层并行解码（与生产一致），CPU 后端总耗时 7.7h
 
-> 延迟主因是候选数而非上下文长度。最坏情况下（全部 2-token 候选），每增 1 候选延迟 +~14ms（thr=6）。线程 6→8 几乎无收益。
-
-### 2B 模型对比（20000 样本，CPU Q4_K_M）
+#### 2B 模型对比（20000 样本）
 
 Qwen3.5-2B Q4_K_M (1.3GB) vs 0.8B (508MB)，10tok/5cand：
 
@@ -110,28 +107,21 @@ Qwen3.5-2B Q4_K_M (1.3GB) vs 0.8B (508MB)，10tok/5cand：
 
 **结论：2B 几乎无优势**，+0.3pp 不抵 3× 延迟和 2.6× 体积。0.8B 是最优选择。
 
-### 单字 3 码首选率（5535 样本，10tok/5cand）
+#### 单字 3 码首选率（5535 样本，10tok/5cand）
 
-单字只取"单编码字"（无简码、前 2 码唯一、有 3 码形码），消除多音字编码歧义后评测：
+单字只取"单编码字"（无简码、前 2 码唯一、有 3 码形码），消除多音字编码歧义后评测，首选率从89.8%提升至96.8%。
 
-| | 基线（dict 序） | LLM 重排 | 提升 |
-|------|:---:|:---:|:---:|
-| 含 W=1 | 89.8% | **96.8%** | +7.0pp |
-| 仅 W≥2（真实竞争） | 83.6% | **94.8%** | +11.2pp |
+### 安装（三步）
 
-单字同码竞争核心在形码，LLM 通过上文区分形码变体效果显著。
-
-## 安装（三步）
-
-### 第一步：下载模型
+#### 第一步：下载模型
 
 打开 https://www.modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/files
 
 点击下载 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500MB），放到 `D:\gguf_models\`。
 
-> 放其他路径需在 schema 中设置 `model_path` 或配置环境变量。
+> 放其他路径需在 schema 中设置 `model_path`。
 
-### 第二步：复制插件
+#### 第二步：复制插件
 
 **CPU（所有机器可用，零依赖）：** 将 `user\rime_llm.dll` 复制到小狼毫安装目录（需管理员）：
 
@@ -143,7 +133,7 @@ user\rime_llm.dll  →  C:\Program Files\Rime\weasel-0.17.4\
 
 1. 安装 [CUDA Toolkit 12.8](https://developer.nvidia.com/cuda-12-8-0-download-archive)
 2. 复制 `user\` 下所有 DLL 到小狼毫目录
-3. 从 CUDA Toolkit 安装目录（如 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\`）复制以下文件到小狼毫目录：
+3. 从 CUDA Toolkit 安装目录（如 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\`）复制以下文件到小狼毫目录，CUDA 版本必须为 12.8，其他版本未经测试：
    - `cudart64_12.dll`
    - `cublas64_12.dll`
    - `cublasLt64_12.dll`
@@ -157,11 +147,9 @@ user\llama.dll          →  ...
 <CUDA>\bin\cublasLt64_12.dll →  ...
 ```
 
-> ⚠️ 需在 NVIDIA 控制面板中将 `WeaselServer.exe` 设为「最高性能优先」，否则延迟波动严重。CUDA 版本必须为 12.8，其他版本未经测试。
+**Q: 如何关闭？** 将 `rime_llm*.dll` 重命名为其他后缀（如 `.dll.bak`），重新部署即恢复字典序。LLM 插件仅占约 497 MB 内存（GPU 版约 1.2GB 显存），对现代电脑影响不大，建议常驻。
 
-插件默认 6 线程 + 10 token 上文，通常无需调整。如需自定义见下方配置参数。
-
-### 第三步：配置 RIME
+#### 第三步：配置 RIME
 
 1. 将 `user\` 下的两个 `.lua` 文件复制到方案 `lua\` 目录
 2. 在 `schema.yaml` 中添加：
@@ -184,7 +172,7 @@ Get-Content "$env:TEMP\rime_llm_events.txt" -Tail 5
 
 每行格式：`时间|计数|编码|候选列表|上文|LLM结果|延迟ms`
 
-## 配置参数
+### 配置参数
 
 在方案的 `schema.yaml` 中配置（全部可选）：
 
@@ -209,40 +197,17 @@ llm_rerank:
 | `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
 | `backend` | cpu | `cpu` 或 `gpu`，需对应 DLL 已部署到小狼毫目录 |
 
-## 目录结构
+---
 
-```
-rime-llm-rerank\
-├── user\                      # 用户安装文件（复制到 RIME）
-│   ├── llm_filter.lua          #   候选重排 filter
-│   ├── llm_processor.lua       #   上屏文字收集 + 预解码 processor
-│   ├── rime_llm.dll           #   预编译 CPU 插件
-│   ├── rime_llm_cuda.dll      #   预编译 GPU 插件（可选）
-│   └── *.dll                  #   llama.cpp + CUDA 依赖 DLL
-├── cpp\                       # 源码 + Lua 嵌入
-│   ├── rime_llm.cpp           #   CPU 插件源码
-│   ├── rime_llm_cuda.cpp      #   GPU 插件源码
-│   ├── CMakeLists.txt         #   CMake 配置（CPU + GPU 目标）
-│   └── l*.c / l*.h            #   Lua 5.4 源码
-└── README.md
-```
+# 开发者说明
 
-## 调试接口
+## 预解码原理
 
-C++ 插件提供 `get_scores()` 方法，在 `score()` 调用后返回 `{[候选词] = 分数}` 的 Lua 表。仅用于调试和分析，Lua filter 层不消费。
+打字时，上文在 commit 后即已确定，而候选需要等编码打完才知道。利用这个时间差：
 
-```lua
-local ranked = llm.score(ctx, cands)     -- 排序表（正常使用）
-local scores = llm.get_scores()          -- 数值分数（调试用）
-```
-
-## 常见问题
-
-**Q: CPU 延迟异常？** 正常（全部 2-token 候选）5 候选 ~178ms，9 候选 ~235ms（thr=6）。超过 300ms 检查 CPU 是否被占满或线程数配置。默认7（实测多台饱和）线程数 = `max(4, ceil(总线程/3))`，可按需手动调大。
-
-**Q: GPU 延迟波动大？** 检查 NVIDIA 控制面板是否为 `WeaselServer.exe` 设置了「最高性能优先」。未设置时 GPU 在 P8（待机）和 P0（性能）之间频繁切换，P8→P0 转换耗时 50-200ms，导致延迟从 30ms 跳到 200ms。
-
-**Q: 如何关闭？** 将 `rime_llm*.dll` 重命名为其他后缀（如 `.dll.bak`），重新部署即恢复字典序。LLM 插件仅占约 497 MB 内存（GPU 版约 1.2GB 显存），对现代电脑影响不大，建议常驻。
+1. **commit 时**：异步执行 ctx decode + 缓存 logits（~50ms CPU / ~10ms GPU）
+2. **编码打完**：skip ctx decode，直接 KV copy + 候选 decode（~36ms CPU / ~16ms GPU）
+3. **感知延迟**：从「ctx+候选」降到「仅候选」，约减半
 
 ## 编译
 
@@ -270,7 +235,16 @@ ninja -C build_gpu rime_llm_cuda
 
 编译得到的 DLL 需复制到小狼毫程序目录。部署前需先**退出小狼毫**（右键托盘图标 → 退出），复制 DLL 及其依赖，再重新启动。
 
-## 开发者笔记
+## 调试接口
+
+C++ 插件提供 `get_scores()` 方法，在 `score()` 调用后返回 `{[候选词] = 分数}` 的 Lua 表。仅用于调试和分析，Lua filter 层不消费。
+
+```lua
+local ranked = llm.score(ctx, cands)     -- 排序表（正常使用）
+local scores = llm.get_scores()          -- 数值分数（调试用）
+```
+
+## 核心架构
 
 插件用 C 调用 Lua 5.4 嵌入式 API（`luaopen_*` 入口），链接 llama.cpp 完成推理。以下按代码骨架走一遍关键步骤和踩过的坑。
 

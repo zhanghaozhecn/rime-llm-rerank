@@ -3,8 +3,8 @@ project(rime_llm LANGUAGES C CXX)
 
 set(LLAMA_ROOT "D:/llama.cpp-mirror" CACHE PATH "llama.cpp mirror root")
 
-# Lua 5.4 source (embedded)
-file(GLOB LUA_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/l*.c")
+# Lua 5.4 source (embedded, in lua/ subdirectory)
+file(GLOB LUA_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/lua/l*.c")
 list(FILTER LUA_SRCS EXCLUDE REGEX "lua\\.c$")
 list(FILTER LUA_SRCS EXCLUDE REGEX "luac\\.c$")
 
@@ -14,6 +14,7 @@ target_include_directories(rime_llm PRIVATE
     "${LLAMA_ROOT}/include"
     "${LLAMA_ROOT}/ggml/include"
     "${LLAMA_ROOT}/common"
+    "${CMAKE_CURRENT_SOURCE_DIR}/lua"
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
@@ -146,7 +147,7 @@ if(MSVC)
     # GPU production DLL (CUDA backend, same layered algorithm as CPU)
     add_library(rime_llm_cuda SHARED rime_llm_cuda.cpp ${LUA_SRCS})
     target_include_directories(rime_llm_cuda PRIVATE
-        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common" "${CMAKE_CURRENT_SOURCE_DIR}")
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common" "${CMAKE_CURRENT_SOURCE_DIR}/lua" "${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_definitions(rime_llm_cuda PRIVATE LUA_USE_WINDOWS)
     target_link_libraries(rime_llm_cuda PRIVATE
         "${LLAMA_CUDA_ROOT}/src/llama.lib"
