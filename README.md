@@ -20,11 +20,15 @@ rime-llm-rerank\
 │   ├── rime_llm.dll           #   预编译 CPU 插件
 │   ├── rime_llm_cuda.dll      #   预编译 GPU 插件（可选）
 │   └── *.dll                  #   llama.cpp + CUDA 依赖 DLL
-├── cpp\                       # 源码 + Lua 嵌入
-│   ├── rime_llm.cpp           #   CPU 插件源码
-│   ├── rime_llm_cuda.cpp      #   GPU 插件源码
-│   ├── CMakeLists.txt         #   CMake 配置（CPU + GPU 目标）
-│   └── l*.c / l*.h            #   Lua 5.4 源码
+├── cpp\                       # 源码
+│   ├── rime_llm.cpp           #   CPU 插件
+│   ├── rime_llm_cuda.cpp      #   GPU 插件
+│   ├── test_core.cpp          #   回归测试
+│   ├── bench_sweep2.cpp       #   准确率扫参
+│   ├── bench_thr.cpp          #   线程数扫参
+│   ├── bench_single_char.cpp  #   单字首选率评测
+│   ├── CMakeLists.txt         #   CMake 配置
+│   └── lua/                   #   Lua 5.4 嵌入 (59个源文件)
 └── README.md
 ```
 
