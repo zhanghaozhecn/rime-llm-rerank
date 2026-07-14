@@ -194,7 +194,7 @@ llm_rerank:
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 10       # 截取的上文 token 数（1-20），10 为性价比最优点
   max_candidates: 5    # 并行评分候选数（2-9），5 为延迟/准确率最佳平衡
-  # cpu_cores: 0      # 可选。CPU 线程数，不设置=自动检测（max(4,ceil(总线程/3))）
+  # cpu_cores: 0      # 可选。CPU 线程数，不设置=7（实测多台饱和）（max(4,ceil(总线程/3))）
   # model_path: ""     # 可选。模型路径，不设置=内置默认 Qwen3.5-0.8B Q4_K_M。换模型只需改此处
   backend: cpu         # "cpu" 或 "gpu"（需对应 DLL 已部署）
 ```
@@ -205,7 +205,7 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |
-| `cpu_cores` | auto | CPU 线程数。不设置=自动检测：`max(4, ceil(总线程数/3))`，如 20 线程→7 |
+| `cpu_cores` | auto | CPU 线程数。不设置=7（实测多台饱和）：`max(4, ceil(总线程数/3))`，如 20 线程→7 |
 | `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
 | `backend` | cpu | `cpu` 或 `gpu`，需对应 DLL 已部署到小狼毫目录 |
 
@@ -238,7 +238,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 ## 常见问题
 
-**Q: CPU 延迟异常？** 正常（全部 2-token 候选）5 候选 ~178ms，9 候选 ~235ms（thr=6）。超过 300ms 检查 CPU 是否被占满或线程数配置。默认自动检测线程数 = `max(4, ceil(总线程/3))`，可按需手动调大。
+**Q: CPU 延迟异常？** 正常（全部 2-token 候选）5 候选 ~178ms，9 候选 ~235ms（thr=6）。超过 300ms 检查 CPU 是否被占满或线程数配置。默认7（实测多台饱和）线程数 = `max(4, ceil(总线程/3))`，可按需手动调大。
 
 **Q: GPU 延迟波动大？** 检查 NVIDIA 控制面板是否为 `WeaselServer.exe` 设置了「最高性能优先」。未设置时 GPU 在 P8（待机）和 P0（性能）之间频繁切换，P8→P0 转换耗时 50-200ms，导致延迟从 30ms 跳到 200ms。
 

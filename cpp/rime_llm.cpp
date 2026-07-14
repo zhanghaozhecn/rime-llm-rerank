@@ -33,15 +33,7 @@ extern "C" {
 static std::string  g_model_path      = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static int          g_min_tokens      = 1;
 static int          g_max_ctx_tokens  = 10; // tok=10 准确率 93.4%，10→17 收益仅 +1.1pp 但延迟翻倍
-static int          g_n_threads       = 0;  // 0=auto: max(4, ceil(hw_threads/3))，用户设置后覆盖
-
-// 自动检测默认线程数：总线程数的 1/3 向上取整，最少 4
-static int auto_threads() {
-    unsigned int hw = std::thread::hardware_concurrency();
-    if (hw == 0) return 6;  // 无法检测时回退 6
-    int t = (int)std::ceil(hw / 3.0);
-    return (t < 4) ? 4 : t;
-}
+static int          g_n_threads       = 7;  // 实测 14 线程和 20 线程均在 thr=7 饱和
 static int          g_n_ctx           = 64;
 static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker seq
 
@@ -105,11 +97,7 @@ static void load_model_async() {
         }
         g_vocab = llama_model_get_vocab(g_model);
 
-        // 解析线程数：0 = 自动检测
         int n_thr = g_n_threads;
-        if (n_thr <= 0) n_thr = auto_threads();
-        log_msg("threads: hw=%u auto=%d user=%d final=%d",
-                std::thread::hardware_concurrency(), auto_threads(), g_n_threads, n_thr);
 
         llama_context_params cparams = llama_context_default_params();
         cparams.n_ctx           = g_n_ctx;
@@ -488,7 +476,7 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
     else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);
     else if (strcmp(key, "min_tokens") == 0) lua_pushinteger(L, g_min_tokens);
-    else if (strcmp(key, "n_threads") == 0) lua_pushinteger(L, g_n_threads > 0 ? g_n_threads : auto_threads());
+    else if (strcmp(key, "n_threads") == 0) lua_pushinteger(L, g_n_threads);
     else if (strcmp(key, "n_ctx") == 0)     lua_pushinteger(L, g_n_ctx);
     else if (strcmp(key, "n_seq_max") == 0) lua_pushinteger(L, g_n_seq_max);
     else lua_pushnil(L);
