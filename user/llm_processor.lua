@@ -140,10 +140,12 @@ local function processor(key, env)
         for _, v in ipairs(history) do table.insert(prev_hist, v) end
 
         -- Context 已更新，立即预解码。与 filter 使用同一个 DLL
-        if not llm_prep then
-            -- 读取 backend 配置，和 filter 一致
-            local sc = env.engine.schema.config
-            local backend = (sc:get_string("llm_rerank/backend") or "cpu")
+        -- 读取 backend 配置：off 时跳过 DLL 加载和预解码
+        local sc = env.engine.schema.config
+        local backend = (sc:get_string("llm_rerank/backend") or "cpu")
+        if backend == "off" then
+            llm_prep = nil  -- 释放已加载的 DLL 引用
+        elseif not llm_prep then
             local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
             local ok, result = pcall(require, modname)
             if ok then llm_prep = result end
