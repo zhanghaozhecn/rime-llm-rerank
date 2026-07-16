@@ -142,7 +142,7 @@ local function processor(key, env)
         -- Context 已更新，立即预解码。与 filter 使用同一个 DLL
         -- 读取 backend 配置：off 时跳过 DLL 加载和预解码
         local sc = env.engine.schema.config
-        local backend = (sc:get_string("llm_rerank/backend") or "cpu")
+        local backend = (sc:get_string("llm_rerank/backend") or "off")
         if backend == "off" then
             llm_prep = nil  -- 释放已加载的 DLL 引用
         elseif not llm_prep then

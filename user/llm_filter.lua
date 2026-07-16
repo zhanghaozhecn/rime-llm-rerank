@@ -49,7 +49,7 @@ end
 return function(translation, env)
     -- 每次调用都从 schema 读取 backend，确保重新部署后立即生效
     local sc = env.engine.schema.config
-    local backend = (sc:get_string("llm_rerank/backend") or "cpu")
+    local backend = (sc:get_string("llm_rerank/backend") or "off")
 
     -- Init config once (non-DLL config doesn't invalidate on redeploy)
     if not cfg._inited then
