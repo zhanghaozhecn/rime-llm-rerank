@@ -60,20 +60,13 @@ local function processor(key, env)
     end
     prev_input = ctx.input
 
-    -- 退格
-    if ctx.input == "" and key:repr() == "BackSpace" then
+    -- 退格 / Delete: 记录训练数据，不 return——
+    -- 继续同步 commit_history，使缩短后的 ctx 也能触发 prepare
+    -- (引擎 Pop 已更新 commit_history 时生效；未更新则本次无副作用)
+    if ctx.input == "" and (key:repr() == "BackSpace" or key:repr() == "Delete") then
         if #history > 0 then
             append_raw(SPLIT .. BSP)
         end
-        return 2
-    end
-
-    -- Delete
-    if ctx.input == "" and key:repr() == "Delete" then
-        if #history > 0 then
-            append_raw(SPLIT .. BSP)
-        end
-        return 2
     end
 
     -- 导航键 → 换行
@@ -148,7 +141,12 @@ local function processor(key, env)
         elseif not llm_prep then
             local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
             local ok, result = pcall(require, modname)
-            if ok then llm_prep = result end
+            if ok then
+                -- 日志目录: RIME 用户目录 (与 filter 共用同一模块实例)
+                local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
+                if okd and ud and ud ~= "" then result.log_dir = ud end
+                llm_prep = result
+            end
         end
         local cur_ctx = _G.llm_context_get()
         if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then

@@ -171,7 +171,7 @@ engine:
 LLM 选中的候选显示 `AI`。事件日志：
 
 ```powershell
-Get-Content "$env:TEMP\rime_llm_events.txt" -Tail 5
+Get-Content "$env:APPDATA\Rime\rime_llm_events.txt" -Tail 5
 ```
 
 每行格式：`时间|计数|编码|候选列表|上文|LLM结果|延迟ms`

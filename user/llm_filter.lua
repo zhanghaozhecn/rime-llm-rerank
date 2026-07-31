@@ -16,6 +16,9 @@ local cfg = {
 local lat_max   = 0
 local lat_count = 0
 
+-- 结果缓存: 同一 (ctx, input) 的评分结果复用 (翻页/候选窗重建不重复推理)
+local cache_ctx, cache_input, cache_result = nil, nil, nil
+
 local function load_llm(env, backend)
     local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
     local ok, cpp = pcall(require, modname)
@@ -26,6 +29,9 @@ local function load_llm(env, backend)
         cpp.max_ctx    = cfg.max_tokens
         cpp.min_tokens = cfg.min_tokens
         if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end
+        -- 日志目录: RIME 用户目录 (未设置时 C++ 回退 %TEMP%)
+        local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
+        if okd and ud and ud ~= "" then cpp.log_dir = ud end
         llm = cpp
         llm_loaded_for = backend
     end
@@ -88,28 +94,40 @@ return function(translation, env)
         table.insert(cands, c.text)
     end
 
-    local t0 = os.clock()
-    local ok, result = pcall(function() return llm.score(context, cands) end)
-    local elapsed_ms = (os.clock() - t0) * 1000
-
-    -- Event log
-    local TEMP = os.getenv("TEMP") or "C:\\Windows\\Temp"
-    local ef = io.open(TEMP .. "\\rime_llm_events.txt", "a")
-    if ef then
-        local cand_str = table.concat(cands, ","):gsub("|", "/")
-        local ctx_safe = context:gsub("|", "/"):gsub("\n", " ")
-        local res_info = "nil"
+    -- 缓存命中: 同 (ctx, input) 的评分结果直接复用 (翻页/候选窗重建不重复推理)
+    local ok, result
+    if cache_ctx == context and cache_input == input and cache_result then
+        ok, result = true, cache_result
+    else
+        local t0 = os.clock()
+        ok, result = pcall(function() return llm.score(context, cands) end)
+        local elapsed_ms = (os.clock() - t0) * 1000
         if ok and type(result) == "table" then
-            res_info = table.concat(result, ","):gsub("|", "/")
-        elseif ok and result then
-            res_info = tostring(result)
+            cache_ctx, cache_input, cache_result = context, input, result
         end
-        lat_count = lat_count + 1
-        if elapsed_ms > lat_max then lat_max = elapsed_ms end
-        ef:write(string.format("%s|%d|%s|%s|%s|%s|%.0fms\n",
-            os.date("%H:%M:%S"), lat_count, input,
-            cand_str, ctx_safe, res_info, elapsed_ms))
-        ef:close()
+
+        -- Event log (仅真实推理时写; RIME 用户目录, 回退 %TEMP%)
+        local okd, log_dir = pcall(function() return rime_api.get_user_data_dir() end)
+        if not okd or not log_dir or log_dir == "" then
+            log_dir = os.getenv("TEMP") or "C:\\Windows\\Temp"
+        end
+        local ef = io.open(log_dir .. "\\rime_llm_events.txt", "a")
+        if ef then
+            local cand_str = table.concat(cands, ","):gsub("|", "/")
+            local ctx_safe = context:gsub("|", "/"):gsub("\n", " ")
+            local res_info = "nil"
+            if ok and type(result) == "table" then
+                res_info = table.concat(result, ","):gsub("|", "/")
+            elseif ok and result then
+                res_info = tostring(result)
+            end
+            lat_count = lat_count + 1
+            if elapsed_ms > lat_max then lat_max = elapsed_ms end
+            ef:write(string.format("%s|%d|%s|%s|%s|%s|%.0fms\n",
+                os.date("%H:%M:%S"), lat_count, input,
+                cand_str, ctx_safe, res_info, elapsed_ms))
+            ef:close()
+        end
     end
 
     if ok and result then

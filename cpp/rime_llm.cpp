@@ -57,10 +57,17 @@ static std::vector<llama_token> g_prep_ctx;     // 预解码的上下文 token
 static std::vector<float>       g_prep_logits;  // ctx_last logits
 static bool                      g_prep_ready = false; // prepare() 已完成
 static std::atomic<int>         g_prep_seq{0};  // 请求序列号，跳过过期请求
+static long                      g_seq0_gen = 0; // seq0 KV 代次: 任何覆盖 seq0 的 decode 递增
+static long                      g_prep_gen = 0; // prepare 完成时的代次
+
+static int g_score_log_cnt = 0;  // score 日志限频计数器
 
 // ============================================================
 // 轻量日志
+// 目录: Lua 侧设置 log_dir (RIME 用户目录); 未设置则回退 %TEMP%
 // ============================================================
+static std::string g_log_dir;
+
 static void log_msg(const char * fmt, ...) {
     char buf[512];
     va_list ap;
@@ -68,8 +75,13 @@ static void log_msg(const char * fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     char path[MAX_PATH];
-    GetTempPathA(sizeof(path), path);
-    strcat_s(path, sizeof(path), "rime_llm_log.txt");
+    if (!g_log_dir.empty() && g_log_dir.size() < MAX_PATH - 32) {
+        strcpy_s(path, g_log_dir.c_str());
+        strcat_s(path, "\\rime_llm_log.txt");
+    } else {
+        GetTempPathA(sizeof(path), path);
+        strcat_s(path, sizeof(path), "rime_llm_log.txt");
+    }
     FILE * f = fopen(path, "a");
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
 }
@@ -197,8 +209,9 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     int K = (int)idx3.size();
     std::vector<int> cand_to_seq(n_cands, -1);  // candidate index → seq id
 
-    // 检测预解码状态：ctx 完全匹配 → 跳过 Step 1
-    bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx;
+    // 检测预解码状态：ctx 完全匹配 且 seq0 未被其他 decode 覆盖 → 跳过 Step 1
+    // 代次匹配防止: 完整流程 score 覆盖 seq0 后, 旧 prep 状态被误用 (KV 与 logits 不一致)
+    bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen;
     std::vector<float> ctx_logits;
     double ms1 = 0;
 
@@ -214,6 +227,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         ctx_batch.logits[ctx_len - 1] = 1;
         ctx_batch.n_tokens = ctx_len;
         if (llama_decode(g_ctx, ctx_batch) == 0) {
+            g_seq0_gen++;  // seq0 KV 已更新
             float* cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
             if (cl) ctx_logits.assign(cl, cl + vs);
         }
@@ -301,13 +315,15 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         scores_out[i] = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
     }
 
-    // 预解码状态已消耗
-    if (use_prep) g_prep_ready = false;
+    // 注意: prep 状态不消耗——同一 ctx 期间可重复命中
+    // (代次机制保证 seq0 被覆盖后自动失效, 无需主动清除)
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
-    log_msg("score: wait=%.0fms S1=%.0fms KV=%.0fms S2=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d",
-            wait_ms, ms1, ms2a, ms2b, total_ms, use_prep ? 1 : 0, ctx_len, n_cands);
+    // 日志限频: 每 10 次记一次, 慢请求 (总耗时 > 100ms) 始终记录
+    if (++g_score_log_cnt % 10 == 1 || total_ms > 100)
+        log_msg("score: wait=%.0fms S1=%.0fms KV=%.0fms S2=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d",
+                wait_ms, ms1, ms2a, ms2b, total_ms, use_prep ? 1 : 0, ctx_len, n_cands);
 }
 
 // ============================================================
@@ -355,6 +371,8 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     // 不预复制 KV——n_ctx=64 太小，且 KV copy 本身很快
     // score() 检测 ctx 一致时跳过 Step 1，但仍执行 KV copy + Step 2
 
+    g_seq0_gen++;   // seq0 KV 已更新 (本代)
+    g_prep_gen = g_seq0_gen;
     g_prep_ctx = ctx_ids;
     g_prep_ready = true;
     log_msg("prepare: done ctx_tok=%d seq=%d", ctx_len, seq);
@@ -491,6 +509,7 @@ static int lua_newindex(lua_State * L) {
     else if (strcmp(key, "n_threads") == 0)  g_n_threads = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_ctx") == 0)      g_n_ctx = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_seq_max") == 0)  g_n_seq_max = (int)luaL_checkinteger(L, 3);
+    else if (strcmp(key, "log_dir") == 0)    g_log_dir = luaL_checkstring(L, 3);  // RIME 用户目录
     return 0;
 }
 

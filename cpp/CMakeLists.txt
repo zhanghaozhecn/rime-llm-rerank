@@ -76,14 +76,6 @@ if(MSVC)
     )
     target_compile_options(bench_sweep2 PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
-    # Real typing corpus accuracy
-    add_executable(bench_train bench_train.cpp)
-    target_include_directories(bench_train PRIVATE
-        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
-    target_link_libraries(bench_train PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
-    target_compile_options(bench_train PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
-
     # Single-char 3-code accuracy (tok=10, cand=5)
     add_executable(bench_single_char bench_single_char.cpp)
     target_include_directories(bench_single_char PRIVATE
@@ -91,46 +83,6 @@ if(MSVC)
     target_link_libraries(bench_single_char PRIVATE
         llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
     target_compile_options(bench_single_char PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
-
-    # 2B model accuracy sweep
-    add_executable(bench_sweep_2b bench_sweep_2b.cpp)
-    target_include_directories(bench_sweep_2b PRIVATE
-        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
-    target_link_libraries(bench_sweep_2b PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
-    target_compile_options(bench_sweep_2b PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
-
-    # Token distribution analysis
-    add_executable(analyze_tokens analyze_tokens.cpp)
-    target_include_directories(analyze_tokens PRIVATE
-        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
-    target_link_libraries(analyze_tokens PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
-    target_compile_options(analyze_tokens PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
-
-    # Thread x cand latency sweep
-    add_executable(bench_thr_cand bench_thr_cand.cpp)
-    target_include_directories(bench_thr_cand PRIVATE
-        "${LLAMA_ROOT}/include"
-        "${LLAMA_ROOT}/ggml/include"
-        "${LLAMA_ROOT}/common"
-    )
-    target_link_libraries(bench_thr_cand PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
-    )
-    target_compile_options(bench_thr_cand PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
-
-    # Latency sweep benchmark (tok x cand)
-    add_executable(bench_latency bench_latency.cpp)
-    target_include_directories(bench_latency PRIVATE
-        "${LLAMA_ROOT}/include"
-        "${LLAMA_ROOT}/ggml/include"
-        "${LLAMA_ROOT}/common"
-    )
-    target_link_libraries(bench_latency PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
-    )
-    target_compile_options(bench_latency PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
     # Thread count sweep benchmark
     add_executable(bench_thr bench_thr.cpp)
@@ -143,6 +95,14 @@ if(MSVC)
         llama_cpu ggml_cpu ggml_base ggml_cpu_impl
     )
     target_compile_options(bench_thr PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
+
+    # Interactive rerank simulator (context + candidates → ranked output)
+    add_executable(sim_rerank sim_rerank.cpp)
+    target_include_directories(sim_rerank PRIVATE
+        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
+    target_link_libraries(sim_rerank PRIVATE
+        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
+    target_compile_options(sim_rerank PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
     # GPU production DLL (CUDA backend, same layered algorithm as CPU)
     add_library(rime_llm_cuda SHARED rime_llm_cuda.cpp ${LUA_SRCS})
