@@ -113,11 +113,20 @@ local function processor(key, env)
                 end
                 pending_code = ""
                 last_full = ""
+                -- 真实候选窗快照 (llm_filter 记录): 用截断前的完整码匹配
+                -- (filter 记录的是完整 input; 训练样本带真实候选窗 词\t码\t候选1,候选2,...,
+                -- LLM 重排目标 = 在窗内把正确词排第一; 无快照/不匹配回退旧格式 仅词+码)
+                local window_cands = ""
+                if code ~= "" and _G.llm_last_window
+                        and _G.llm_last_window.input == code then
+                    window_cands = TAB .. table.concat(_G.llm_last_window.cands, ",")
+                    _G.llm_last_window = nil  -- 已消费
+                end
                 -- 单字 3 码只需前 2 码（第 3 码是形码，由字本身决定）
                 if #w == 1 and #code >= 3 then
                     code = code:sub(1, 2)
                 end
-                table.insert(parts, w .. TAB .. code)
+                table.insert(parts, w .. TAB .. code .. window_cands)
             end
             local sep = (overlap > 0 and SPLIT or "")
             append_raw(sep .. table.concat(parts, SPLIT))

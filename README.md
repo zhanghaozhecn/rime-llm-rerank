@@ -213,6 +213,8 @@ llm_rerank:
 2. **编码打完**：skip ctx decode，直接 KV copy + 候选 decode（~36ms CPU / ~16ms GPU）
 3. **感知延迟**：从「ctx+候选」降到「仅候选」，约减半
 
+**KV 代次与可重复命中**：prepare 完成后保存 `(ctx, logits, 代次)`；score 命中条件 = ctx 完全匹配且 seq0 未被其他 decode 覆盖（`g_seq0_gen == g_prep_gen`）。代次防止完整流程覆盖 seq0 后旧 logits 被误用（退格删词→重打同词的编辑流）。**完整流程 score 会自我刷新 prep 状态**——刚解码的 `(ctx, logits)` 代次同步写回，同 ctx 的翻页/候选窗重建全部命中，避免"一次未命中 → 代次永久失配 → 连锁全部重解码"（曾占 30% 的 score 请求）。
+
 ## 编译
 
 需要 Visual Studio Build Tools 2022 + CMake + Ninja + llama.cpp。
@@ -326,3 +328,5 @@ GPU 待机 P8（210MHz/1.6W），推理时升到 P0（2250MHz/19W），转换耗
 ### 7. 语料采集：码分配时机
 
 `llm_processor.lua` 中 `pending_code`（手动选词码）和 `last_full`（4 码顶屏码）在**输入变空的瞬间**捕获。但一次上屏事件可能包含多个条目（词+标点+空格），码只应分配给含中文的条目，纯英文/标点应跳过，否则"d, c, lua"等会拿到前一个中文词的码。单字 3 码截为前 2 码——第 3 码是形码，由字本身决定，对训练无额外信息。
+
+**真实候选窗快照（2026-08-02）**：`llm_filter.lua` 每次调用时（含 backend off/未评分路径）把 `(input, 前 max_candidates 候选)` 存入全局 `llm_last_window`；`llm_processor.lua` 上屏时用截断前完整码匹配窗口，训练语料行变为 `词\t码\t候选1,候选2,...`。`prep_training.py` 优先使用真实候选窗——位置/候选/总数取自用户实际看到的候选窗，编码用用户实际打的码；无快照时回退字典反推。此前从字典反推同码候选（字典序 vs 词频序）导致训练分布与真实使用不一致。

@@ -67,6 +67,19 @@ return function(translation, env)
     for cand in translation:iter() do table.insert(all, cand) end
     if #all < 2 then for _, c in ipairs(all) do yield(c) end; return end
 
+    local input = env.engine.context.input or ""
+
+    -- 候选窗快照: (input, 前 max_candidates 个候选) 供 llm_processor 上屏时
+    -- 关联真实候选窗写入训练语料 (与 LLM 打分范围一致)。所有路径统一记录,
+    -- 含 off/未加载/min_code_len 未达的透传路径——候选窗是 RIME 实际显示的集合,
+    -- 即使不评分也构成训练样本 (LLM 要学的是在真实窗内把正确词排第一)。
+    local win = {}
+    for i, c in ipairs(all) do
+        if i > cfg.max_candidates then break end
+        win[#win + 1] = c.text
+    end
+    _G.llm_last_window = { input = input, cands = win }
+
     -- backend off → 原样透传，不推理
     if backend == "off" then
         for _, c in ipairs(all) do yield(c) end; return
@@ -82,7 +95,6 @@ return function(translation, env)
         for _, c in ipairs(all) do yield(c) end; return
     end
 
-    local input = env.engine.context.input or ""
     if #input < cfg.min_code_len then
         for _, c in ipairs(all) do yield(c) end; return
     end

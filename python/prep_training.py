@@ -4,14 +4,16 @@
 
 输入: llm_training.txt（llm_processor.lua 收集）
 格式: 词1\t码1|词2\t码2|←|词3\t码3
+      词\t码\t候选1,候选2,...（2026-08-02 起: llm_filter 快照的真实候选窗, 优先使用）
 
 输出: train_samples.tsv（与 eval_samples.tsv 相同格式）
       上文\t正确词\t编码\t候选位置\t候选列表\t同码总数
 
 处理:
   1. 解析场景，按退格(←)修正序列
-  2. 对有码条目从 dict 查找同码候选
-  3. 单字只取单编码字（与 eval 一致）
+  2. 有真实候选窗 → 位置/候选/总数直接用窗内值（用户当时实际看到的候选窗）
+  3. 无候选窗（旧数据/窗口失配）→ 从 dict 查找同码候选
+  4. 单字只取单编码字（与 eval 一致）
 """
 
 import re
@@ -84,15 +86,18 @@ with open(train_file, encoding="utf-8") as f:
         line = line.strip()
         if not line:
             continue
-        entries = []  # [(word, code), ...] code="" means no code
+        entries = []  # [(word, code, cands_win), ...] cands_win=None 表无候选窗快照
         for part in line.split("|"):
             if part == "←":
-                entries.append(("←", ""))
+                entries.append(("←", "", None))
             elif "\t" in part:
-                w, c = part.split("\t", 1)
-                entries.append((w, c))
+                fields = part.split("\t")
+                w = fields[0]
+                c = fields[1] if len(fields) > 1 else ""
+                cands_win = fields[2].split(",") if len(fields) > 2 and fields[2] else None
+                entries.append((w, c, cands_win))
             else:
-                entries.append((part, ""))
+                entries.append((part, "", None))
         scenes.append(entries)
 
 print(f"  Scenes: {len(scenes)}, entries: {sum(len(s) for s in scenes)}")
@@ -100,21 +105,21 @@ print(f"  Scenes: {len(scenes)}, entries: {sum(len(s) for s in scenes)}")
 # ── 3. Build samples ──
 samples = []
 stats = {"total": 0, "with_code": 0, "single_char": 0, "multi_char": 0,
-         "no_dict_match": 0, "w1": 0, "skipped": 0}
+         "no_dict_match": 0, "no_window_match": 0, "w1": 0, "skipped": 0}
 
 for scene in scenes:
     # Apply backspace to get final sequence
-    words = []  # [(text, code)]
-    for text, code in scene:
+    words = []  # [(text, code, cands_win)]
+    for text, code, cands_win in scene:
         if text == "←":
             if words:
                 words.pop()
         else:
-            words.append((text, code))
+            words.append((text, code, cands_win))
 
     # Build context incrementally, generate samples
     ctx_parts = []
-    for text, code in words:
+    for text, code, cands_win in words:
         # Skip entries without Chinese (no code assigned by processor)
         has_cn = bool(re.search(r"[^\x01-\x7f]", text))
         if not has_cn:
@@ -127,6 +132,25 @@ for scene in scenes:
         stats["total"] += 1
         stats["with_code"] += 1
 
+        # 真实候选窗快照优先: 位置/候选/总数全部取自用户当时实际看到的窗
+        if cands_win is not None:
+            if text not in cands_win:
+                stats["no_window_match"] += 1
+                ctx_parts.append(text)
+                continue
+            pos = cands_win.index(text)
+            cand_str = ",".join(w for w in cands_win if w != text)
+            total = len(cands_win)
+            eval_code = code  # 用户实际打的码
+            if len(text) == 1: stats["single_char"] += 1
+            else:              stats["multi_char"] += 1
+            if total == 1: stats["w1"] += 1
+            context = "".join(ctx_parts)
+            samples.append((context, text, eval_code, pos, cand_str, total))
+            ctx_parts.append(text)
+            continue
+
+        # 无快照回退: 从字典反推同码候选
         # Determine evaluation code
         if len(text) == 1:
             if text not in single_char_code:
@@ -173,6 +197,7 @@ print(f"\n  Total coded entries: {stats['total']}")
 print(f"  Valid samples: {len(samples)}")
 print(f"  Single-char: {stats['single_char']}, multi-char: {stats['multi_char']}")
 print(f"  Skipped (no dict match/多音字): {stats['skipped']}")
+print(f"  No window match (快照与词不符): {stats['no_window_match']}")
 print(f"  W=1 (no competition): {stats['w1']}")
 
 # ── 4. Save ──

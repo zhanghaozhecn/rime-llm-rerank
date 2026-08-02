@@ -234,6 +234,13 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         llama_batch_free(ctx_batch);
 
         if (ctx_logits.empty()) return;  // decode failed
+        // 完整流程自我刷新 prep: 刚 decode 完 seq0 (代次已递增), KV/logits 一致,
+        // 保存后同 ctx 的后续 score (翻页/候选窗重建) 全部命中——
+        // 否则一次未命中导致代次失配, 后续 score 连锁全部 prep=0 直到下次 commit
+        g_prep_gen = g_seq0_gen;
+        g_prep_ctx = ctx_ids;
+        g_prep_logits = ctx_logits;
+        g_prep_ready = true;
         auto ts1_1 = std::chrono::high_resolution_clock::now();
         ms1 = std::chrono::duration<double, std::milli>(ts1_1 - ts1_0).count();
     } else {

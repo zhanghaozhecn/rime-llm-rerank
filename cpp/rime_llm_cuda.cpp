@@ -56,6 +56,8 @@ static std::vector<llama_token> g_prep_ctx;
 static std::vector<float>       g_prep_logits;
 static bool                      g_prep_ready = false;
 static std::atomic<int>         g_prep_seq{0};
+static long                      g_seq0_gen = 0; // seq0 KV 代次: 任何覆盖 seq0 的 decode 递增
+static long                      g_prep_gen = 0; // prepare 完成时的代次
 
 // ============================================================
 // 轻量日志
@@ -172,8 +174,9 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     int M = (int)idx2.size(), K = (int)idx3.size();
     std::vector<int> cand_to_seq(n_cands, -1);
 
-    // 检测预解码
-    bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx;
+    // 检测预解码: ctx 完全匹配 且 seq0 未被其他 decode 覆盖 → 跳过 Step 1
+    // 代次匹配防止: 完整流程 score 覆盖 seq0 后, 旧 prep 状态被误用 (KV 与 logits 不一致)
+    bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen;
     std::vector<float> ctx_logits;
     double ms1 = 0;
 
@@ -189,6 +192,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         ctx_batch.logits[ctx_len - 1] = 1; ctx_batch.n_tokens = ctx_len;
         int rc1 = llama_decode(g_ctx, ctx_batch);
         if (rc1 == 0) {
+            g_seq0_gen++;  // seq0 KV 已更新
             float* cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
             if (cl) ctx_logits.assign(cl, cl + vs);
         }
@@ -196,6 +200,13 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         auto t1_1 = std::chrono::high_resolution_clock::now();
         ms1 = std::chrono::duration<double, std::milli>(t1_1 - t1_0).count();
         if (ctx_logits.empty()) { log_msg("score: S1 FAILED rc=%d", rc1); return; }
+        // 完整流程自我刷新 prep: 刚 decode 完 seq0 (代次已递增), KV/logits 一致,
+        // 保存后同 ctx 的后续 score (翻页/候选窗重建) 全部命中——
+        // 否则一次未命中导致代次失配, 后续 score 连锁全部 prep=0 直到下次 commit
+        g_prep_gen = g_seq0_gen;
+        g_prep_ctx = ctx_ids;
+        g_prep_logits = ctx_logits;
+        g_prep_ready = true;
     } else {
         // 预解码命中
         ctx_logits = g_prep_logits;
@@ -264,7 +275,8 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     for (int i = 0; i < n_cands; i++)
         scores_out[i] = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
 
-    if (use_prep) g_prep_ready = false;
+    // 注意: prep 状态不消耗——同一 ctx 期间可重复命中
+    // (代次机制保证 seq0 被覆盖后自动失效, 无需主动清除)
 
     auto t_total_1 = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count();
@@ -312,6 +324,8 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     g_prep_logits.assign(cl, cl + vs);
     llama_batch_free(ctx_batch);
 
+    g_seq0_gen++;   // seq0 KV 已更新 (本代)
+    g_prep_gen = g_seq0_gen;
     g_prep_ctx = ctx_ids;
     g_prep_ready = true;
     log_msg("prepare: done ctx_tok=%d seq=%d", ctx_len, seq);
