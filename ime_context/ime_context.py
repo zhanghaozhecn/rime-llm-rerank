@@ -144,12 +144,26 @@ def _acquire_single_instance(name="ime_context_mutex"):
     kernel32.CreateMutexW(None, False, name)
     return kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS → False (已在运行)
 
-# ── 双击启动 + 开机自启: 自定位 VBS (无需终端, 文件夹可任意移动) ──
+# ── 双击启动 + 开机自启: 双路径 VBS (无需终端) ──
+# 服务代码路径解析顺序:
+#   1. vbs 同文件夹 (双击场景: vbs 与 ime_context.py 在一起)
+#   2. 生成时写死的原路径 (复制 vbs 到启动文件夹场景: vbs 在启动文件夹,
+#      原文件夹路径由 {script_main} 兜底)
 _VBS_LINES = [
     "' 编辑器上文服务 - 双击本文件启动; 复制本文件到启动文件夹即开机自启",
     "' 删除本文件即停止服务/取消自启",
     'Set fso = CreateObject("Scripting.FileSystemObject")',
     'base = fso.GetParentFolderName(WScript.ScriptFullName)',
+    'script = ""',
+    'If fso.FileExists(base & "\\ime_context.py") Then',
+    '    script = base & "\\ime_context.py"',
+    'ElseIf fso.FileExists("{script_main}") Then',
+    '    script = "{script_main}"',
+    'End If',
+    'If script = "" Then',
+    '    MsgBox "未找到 ime_context.py，请重新生成本文件", 48, "编辑器上文服务"',
+    '    WScript.Quit',
+    'End If',
     'pyw = ""',
     'For Each p In Array( _',
     '    "{pyw_main}", _',
@@ -162,7 +176,7 @@ _VBS_LINES = [
     '    MsgBox "未找到 pythonw.exe，请安装 Python 或修改本文件中的路径", 48, "编辑器上文服务"',
     '    WScript.Quit',
     'End If',
-    'CreateObject("WScript.Shell").Run """" & pyw & """ """ & base & "\\ime_context.py""", 0, False',
+    'CreateObject("WScript.Shell").Run """" & pyw & """ """ & script & """", 0, False',
 ]
 _VBS_TEMPLATE = "\r\n".join(_VBS_LINES) + "\r\n"
 
@@ -173,7 +187,9 @@ def _make_autostart_vbs():
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     if not os.path.exists(pyw):
         pyw = sys.executable
-    body = _VBS_TEMPLATE.replace("{pyw_main}", pyw.replace("\\", "\\\\"))
+    # VBS 无反斜杠转义 (只有 "" 转义引号) → 路径直接写单反斜杠
+    body = _VBS_TEMPLATE.replace("{script_main}", os.path.abspath(__file__))
+    body = body.replace("{pyw_main}", pyw)
     out = Path(__file__).resolve().parent / "启动-编辑器上文服务.vbs"
     out.write_bytes(body.encode("utf-16"))  # UTF-16 LE + BOM, 中文提示安全
     return out
