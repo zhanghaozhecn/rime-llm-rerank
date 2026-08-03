@@ -26,6 +26,23 @@ local function append_raw(text)
     end
 end
 
+-- 读取编辑器上文外挂 (ime_context.py) 提供的光标前文本
+-- 文件格式: <unix_ms 心跳>\t<光标前文本>; 心跳 30s 内有效, 空文本/无文件 → nil
+local function get_editor_context()
+    local p = rime_api.get_user_data_dir() .. "\\ime_context.txt"
+    local f = io.open(p, "r")
+    if not f then return nil end
+    local line = f:read("*l")
+    f:close()
+    if not line then return nil end
+    local ts_s, text = line:match("^(%d+)\t(.*)$")
+    if not ts_s then return nil end
+    local ts = tonumber(ts_s)
+    if not ts or os.time() * 1000 - ts > 30000 then return nil end
+    if text == "" then return nil end
+    return text
+end
+
 local function find_overlap(prev, curr)
     local np, nc = #prev, #curr
     for len = math.min(np, nc), 0, -1 do
@@ -43,6 +60,28 @@ end
 
 local function processor(key, env)
     if key:release() then return 2 end
+
+    -- 上文检查 + 预解码 (每次按键): 编辑器上文 (外挂) 或 commit_history 任一变化
+    -- → 立即异步预解码。覆盖: 光标移动/编辑后打第一键 (外挂文件已更新) 与上屏 (commit)
+    local sc = env.engine.schema.config
+    local backend = (sc:get_string("llm_rerank/backend") or "off")
+    if backend == "off" then
+        llm_prep = nil  -- 释放已加载的 DLL 引用
+    elseif not llm_prep then
+        local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
+        local ok, result = pcall(require, modname)
+        if ok then
+            -- 日志目录: RIME 用户目录 (与 filter 共用同一模块实例)
+            local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
+            if okd and ud and ud ~= "" then result.log_dir = ud end
+            llm_prep = result
+        end
+    end
+    local cur_ctx = _G.llm_context_get()
+    if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
+        last_prep_ctx = cur_ctx
+        llm_prep.prepare(cur_ctx)
+    end
 
     local ctx = env.engine.context
     local ch = ctx.commit_history
@@ -140,34 +179,15 @@ local function processor(key, env)
 
         prev_hist = {}
         for _, v in ipairs(history) do table.insert(prev_hist, v) end
-
-        -- Context 已更新，立即预解码。与 filter 使用同一个 DLL
-        -- 读取 backend 配置：off 时跳过 DLL 加载和预解码
-        local sc = env.engine.schema.config
-        local backend = (sc:get_string("llm_rerank/backend") or "off")
-        if backend == "off" then
-            llm_prep = nil  -- 释放已加载的 DLL 引用
-        elseif not llm_prep then
-            local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
-            local ok, result = pcall(require, modname)
-            if ok then
-                -- 日志目录: RIME 用户目录 (与 filter 共用同一模块实例)
-                local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
-                if okd and ud and ud ~= "" then result.log_dir = ud end
-                llm_prep = result
-            end
-        end
-        local cur_ctx = _G.llm_context_get()
-        if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
-            last_prep_ctx = cur_ctx
-            llm_prep.prepare(cur_ctx)
-        end
     end
 
     return 2
 end
 
 local function get_context()
+    -- 编辑器上文优先 (外挂提供的光标前文本), 无效回退 commit_history
+    local ctx = get_editor_context()
+    if ctx then return ctx end
     return table.concat(history, "")
 end
 
