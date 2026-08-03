@@ -144,25 +144,51 @@ def _acquire_single_instance(name="ime_context_mutex"):
     kernel32.CreateMutexW(None, False, name)
     return kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS → False (已在运行)
 
-# ── 开机自启: 生成 VBS (复制到启动文件夹即生效, 删文件即卸载) ──
+# ── 双击启动 + 开机自启: 自定位 VBS (无需终端, 文件夹可任意移动) ──
+_VBS_LINES = [
+    "' 编辑器上文服务 - 双击本文件启动; 复制本文件到启动文件夹即开机自启",
+    "' 删除本文件即停止服务/取消自启",
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    'base = fso.GetParentFolderName(WScript.ScriptFullName)',
+    'pyw = ""',
+    'For Each p In Array( _',
+    '    "{pyw_main}", _',
+    '    "C:\\Python312\\pythonw.exe", "C:\\Python\\pythonw.exe", _',
+    '    "D:\\Python\\pythonw.exe", "%LOCALAPPDATA%\\Programs\\Python\\Python312\\pythonw.exe")',
+    '    p = fso.BuildPath(fso.GetParentFolderName(p), fso.GetFileName(p))',
+    '    If fso.FileExists(p) Then pyw = p : Exit For',
+    'Next',
+    'If pyw = "" Then',
+    '    MsgBox "未找到 pythonw.exe，请安装 Python 或修改本文件中的路径", 48, "编辑器上文服务"',
+    '    WScript.Quit',
+    'End If',
+    'CreateObject("WScript.Shell").Run """" & pyw & """ """ & base & "\\ime_context.py""", 0, False',
+]
+_VBS_TEMPLATE = "\r\n".join(_VBS_LINES) + "\r\n"
+
 def _make_autostart_vbs():
-    """生成 ime_context-开机自启.vbs 到脚本同目录 (pythonw 无窗口运行)"""
-    script = os.path.abspath(__file__)
+    """生成 启动-编辑器上文服务.vbs 到脚本同目录:
+    双击即运行 (pythonw 无窗口), 复制到启动文件夹即开机自启。
+    ime_context.py 路径相对 vbs 自身 (文件夹可移动), pythonw 自动探测。"""
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    exe = pyw if os.path.exists(pyw) else sys.executable
-    # VBS: Run "exe" "script", 0=隐藏窗口, False=不等待。VBS 字符串内 "" 转义引号
-    body = (f'CreateObject("WScript.Shell").Run """{exe}"" ""{script}""", 0, False\r\n'
-            f"' ime_context 编辑器上文外挂开机自启\r\n' 删除本文件即取消自启\r\n")
-    out = Path(__file__).resolve().parent / "ime_context-开机自启.vbs"
-    out.write_bytes(body.encode("utf-16"))  # UTF-16 LE + BOM, 路径含中文也安全
+    if not os.path.exists(pyw):
+        pyw = sys.executable
+    body = _VBS_TEMPLATE.replace("{pyw_main}", pyw.replace("\\", "\\\\"))
+    out = Path(__file__).resolve().parent / "启动-编辑器上文服务.vbs"
+    out.write_bytes(body.encode("utf-16"))  # UTF-16 LE + BOM, 中文提示安全
     return out
 
 def install_autostart():
     vbs = _make_autostart_vbs()
     startup = Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs\Startup"
     print(f"已生成: {vbs}")
-    print(f"复制到启动文件夹即开机自启: {startup}")
-    print("  (Win+R 输入 shell:startup 可快速打开; 删除该 vbs 即取消自启)")
+    print()
+    print("使用方法 (无需终端):")
+    print(f"  1. 双击 {vbs.name}           → 立即启动服务")
+    print(f"  2. 复制该文件到启动文件夹    → 开机自动启动")
+    print(f"     ({startup})")
+    print(f"  3. 删除该文件                → 停止服务/取消自启")
+    print(f"  整个文件夹可以移动到任意位置 (vbs 自动定位 ime_context.py)")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -177,7 +203,7 @@ def main():
         install_autostart()
         return
     if args.uninstall:
-        vbs = Path(__file__).resolve().parent / "ime_context-开机自启.vbs"
+        vbs = Path(__file__).resolve().parent / "启动-编辑器上文服务.vbs"
         if vbs.exists():
             vbs.unlink()
             print(f"已删除 {vbs.name} (若已复制到启动文件夹, 请手动删除那边的一份)")
