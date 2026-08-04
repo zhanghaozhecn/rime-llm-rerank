@@ -40,15 +40,16 @@ RIME 的 LLM 上文默认来自 `commit_history`（本次输入法会话上屏�
 
 支持：记事本、Edge/Chrome、QQ NT、VS Code 等所有支持 UIA 文本模式的应用；不支持的环境（终端等）自动回退，不影响使用。
 
-**使用（无需终端）**：
+**使用（无需终端，免安装 exe）**：
 
 ```
-1. 双击 ime_context\启动-编辑器上文服务.vbs   → 服务启动（无窗口）
-2. 复制该 vbs 到启动文件夹（shell:startup）   → 开机自启
-3. 删除该 vbs                                  → 停止服务/取消自启
+1. 双击 ime_context\ime_context.exe        → 服务启动（无窗口）
+2. 复制 ime_context.exe 到启动文件夹（shell:startup）→ 开机自启
+3. 双击 ime_context\停止-编辑器上文服务.vbs → 停止服务
+4. 删除启动文件夹中的 exe 副本             → 取消开机自启
 ```
 
-文件夹可任意移动（vbs 自动定位 ime_context.py），依赖 Python 3 + uiautomation 库。调试命令：`python ime_context\ime_context.py --once`（单次读取）。
+免安装：exe 已打包 Python 运行时 + uiautomation 库，无需任何依赖。调试命令：`python ime_context\ime_context.py --once`（单次读取，需 Python 环境）。
 
 依赖：Python 3 + uiautomation 库。日志：`%APPDATA%\Rime\ime_context.log`。
 

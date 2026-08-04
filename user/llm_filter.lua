@@ -16,8 +16,11 @@ local cfg = {
 local lat_max   = 0
 local lat_count = 0
 
--- 结果缓存: 同一 (ctx, input) 的评分结果复用 (翻页/候选窗重建不重复推理)
-local cache_ctx, cache_input, cache_result = nil, nil, nil
+-- 结果缓存: 同一 (ctx, input) 的评分结果复用 (翻页/候选窗重建不重复推理)。
+-- 存 _G 以便 llm_processor 在编辑操作 (退格/导航/回车) 时清空——
+-- 编辑后重打相同词 (ctx+input 相同) 必须重新推理, 缓存会误命中导致无推理记录。
+-- 翻页/候选窗重建 (无编辑) 缓存保留命中。
+_G.llm_filter_cache = _G.llm_filter_cache or nil
 
 local function load_llm(env, backend)
     local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
@@ -99,23 +102,33 @@ return function(translation, env)
         for _, c in ipairs(all) do yield(c) end; return
     end
 
-    local context = ((_G.llm_context_get and _G.llm_context_get()) or ""):gsub('%s+', '')
+    local ctx_text, ctx_src = "", "rime"
+    if _G.llm_context_get then
+        ctx_text, ctx_src = _G.llm_context_get()
+    end
+    -- 去空白: 上文中允许字母存在 (英文/数字是合法上文)。
+    -- 不需过滤尾部 ASCII: Rime 编码显示在候选窗, 不写入编辑器,
+    -- 外挂读到的光标前文本不会包含编码字母 (微软拼音式 inline composition 才会)
+    local context = (ctx_text or ""):gsub('%s+', '')
     local cands = {}
     for i, c in ipairs(all) do
         if i > cfg.max_candidates then break end
         table.insert(cands, c.text)
     end
 
-    -- 缓存命中: 同 (ctx, input) 的评分结果直接复用 (翻页/候选窗重建不重复推理)
+    -- 缓存命中: 同 (ctx, input) 的评分结果直接复用 (翻页/候选窗重建不重复推理)。
+    -- 编辑操作 (退格/导航/回车) 后 llm_processor 清空 _G.llm_filter_cache,
+    -- 重打相同词重新推理 (同 ctx+input 的旧结果不适用于编辑后的新候选窗)
+    local cache = _G.llm_filter_cache
     local ok, result
-    if cache_ctx == context and cache_input == input and cache_result then
-        ok, result = true, cache_result
+    if cache and cache.ctx == context and cache.input == input and cache.result then
+        ok, result = true, cache.result
     else
         local t0 = os.clock()
         ok, result = pcall(function() return llm.score(context, cands) end)
         local elapsed_ms = (os.clock() - t0) * 1000
         if ok and type(result) == "table" then
-            cache_ctx, cache_input, cache_result = context, input, result
+            _G.llm_filter_cache = { ctx = context, input = input, result = result }
         end
 
         -- Event log (仅真实推理时写; RIME 用户目录, 回退 %TEMP%)
@@ -135,9 +148,9 @@ return function(translation, env)
             end
             lat_count = lat_count + 1
             if elapsed_ms > lat_max then lat_max = elapsed_ms end
-            ef:write(string.format("%s|%d|%s|%s|%s|%s|%.0fms\n",
+            ef:write(string.format("%s|%d|%s|%s|%s|%s|%.0fms|%s\n",
                 os.date("%H:%M:%S"), lat_count, input,
-                cand_str, ctx_safe, res_info, elapsed_ms))
+                cand_str, ctx_safe, res_info, elapsed_ms, ctx_src))
             ef:close()
         end
     end

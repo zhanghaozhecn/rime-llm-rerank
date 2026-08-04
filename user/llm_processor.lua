@@ -17,6 +17,20 @@ local last_prep_ctx = "" -- 上次 prepare 的 context，避免重复调用
 
 local NAV_KEYS = { Left=true, Right=true, Up=true, Down=true,
                    Home=true, End=true, Page_Up=true, Page_Down=true }
+-- 编辑位置变化键: 退格/删除 (删词) + 导航键 (光标移动/滚动) + 回车 (换行)
+-- 这些键使会话上屏词序列不再代表光标前上文 → rime 来源上文重置为空
+-- (不影响 editor 来源: 外挂光标上文独立, 不受重置影响)
+local function is_edit_key(k)
+    return k == "BackSpace" or k == "Delete"
+        or k == "Control+BackSpace" or k == "Control+Delete"
+        or NAV_KEYS[k]
+        or k == "Return" or k == "KP_Enter"  -- 回车换行: 新段落, 上屏词序列断开
+end
+
+local function reset_history()
+    history = {}
+    prev_hist = {}
+end
 
 local function append_raw(text)
     local f = io.open(rime_api.get_user_data_dir() .. "\\llm_training.txt", "a")
@@ -77,7 +91,10 @@ local function processor(key, env)
             llm_prep = result
         end
     end
-    local cur_ctx = _G.llm_context_get()
+    -- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,
+    -- 不一致会导致 prep 永远不命中 → 每次 score 完整解码 (~50ms)。
+    -- 中文无空白两者相同; 含英文/空格 (如 "Hello world 你好") 时保证一致。
+    local cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
     if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
         last_prep_ctx = cur_ctx
         llm_prep.prepare(cur_ctx)
@@ -97,21 +114,40 @@ local function processor(key, env)
         pending_code = prev_input
         last_full = ""  -- 已消费
     end
+    -- 第 1 码 (输入从空到非空): 移动光标/退格/回车后开始打新词,
+    -- 请求外挂立即更新光标上文 (不等轮询间隔——慢窗口已自适应降频到 2-5s)。
+    -- 外挂主循环 20ms 粒度检测请求文件 → 立即读取 → 第 2-4 码重排用新上文。
+    local started = (prev_input == "" and ctx.input ~= "")
     prev_input = ctx.input
-
-    -- 退格 / Delete: 记录训练数据，不 return——
-    -- 继续同步 commit_history，使缩短后的 ctx 也能触发 prepare
-    -- (引擎 Pop 已更新 commit_history 时生效；未更新则本次无副作用)
-    if ctx.input == "" and (key:repr() == "BackSpace" or key:repr() == "Delete") then
-        if #history > 0 then
-            append_raw(SPLIT .. BSP)
+    if started then
+        local req = io.open(rime_api.get_user_data_dir() .. "\\ime_context_req.txt", "w")
+        if req then
+            req:write(tostring(os.time()))
+            req:close()
         end
     end
 
-    -- 导航键 → 换行
-    if ctx.input == "" and NAV_KEYS[key:repr()] then
-        if #history > 0 then
-            append_raw("\n")
+    -- 退格 / Delete / 导航键 (composition 为空时): 编辑位置变化
+    --   rime 来源上文重置为空 (会话上屏词序列不再代表光标前上文), 立即重新预解码
+    --   return 2 跳过 commit_history 同步 (引擎 Pop 会重建 history, 覆盖重置;
+    --   且退格后剩余词不应作为新词重新记录训练数据)
+    if ctx.input == "" and is_edit_key(key:repr()) then
+        local k = key:repr()
+        if NAV_KEYS[k] or k == "Return" or k == "KP_Enter" then
+            if #history > 0 then
+                append_raw("\n")
+            end
+        elseif #history > 0 then
+            append_raw(SPLIT .. BSP)
+        end
+        reset_history()
+        -- 编辑后重打相同词 (ctx+input 相同) 必须重新推理: 清空 filter 结果缓存
+        _G.llm_filter_cache = nil
+        -- 上文已重置 → 立即异步预解码 (空上文)
+        cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
+        if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
+            last_prep_ctx = cur_ctx
+            llm_prep.prepare(cur_ctx)
         end
         return 2
     end
@@ -186,9 +222,10 @@ end
 
 local function get_context()
     -- 编辑器上文优先 (外挂提供的光标前文本), 无效回退 commit_history
+    -- 返回 (文本, 来源): "editor" = 光标上文服务, "rime" = commit_history
     local ctx = get_editor_context()
-    if ctx then return ctx end
-    return table.concat(history, "")
+    if ctx then return ctx, "editor" end
+    return table.concat(history, ""), "rime"
 end
 
 _G.llm_context_get = get_context

@@ -11,138 +11,255 @@ RIME 侧 (llm_processor.lua) 优先使用该文件作为上文。
   <unix_ms 心跳时间戳>\\t<光标前文本(最近 ~200 字符)>
 心跳: 文本变化立即写; 无变化每 1s 写心跳。RIME 侧 30s 内无心跳 → 回退 commit_history。
 
-依赖: pip install uiautomation
-用法: python ime_context.py [--interval 150] [--max-chars 200]
-退出: Ctrl+C (或 taskkill /f /im python.exe 需定位)
-"""
-import argparse, os, sys, time
-from pathlib import Path
+实现要点 (2026-08-04 重构):
+  - UIA 读取用 comtypes 动态类型库 (GetModule UIAutomationCore.dll),
+    不用 uiautomation 库 (其事件订阅依赖线程消息泵, 且 COM 调用
+    对 Electron 等窗口可能无限挂起 → 主循环卡死 → 心跳停)。
+  - 读取在独立常驻线程 (独立 COM 上下文): 挂起只影响读取线程,
+    主循环 wait 超时后重建线程并标记该窗口 60s 跳过 → 心跳永不中断。
+  - 输入钩子 (WH_KEYBOARD_LL/WH_MOUSE_LL) 已弃用: 实测导致全局鼠标卡顿
+    (鼠标移动事件风暴触发频繁 COM 读取)。
+  - 移动光标后立即打字的时序由 RIME 侧驱动: llm_processor 在第 1 码
+    (输入空→非空) 写请求文件 → 外挂 ≤20ms 响应立即读取 (唯一驱动,
+    无轮询) → 第 2 码 prepare 新上文 → 第 3/4 码重排用新上文。
+  - 快速连打 (一码字 "a 空格 a") 的两次请求: pending 标志保持,
+    读取线程忙时等待, 完成后补读, 不丢请求。
+  - 心跳由每次读取写入的文件时间戳承担: 打词间隔 >30s 时心跳过期,
+    RIME 回退 commit_history, 第 1 码请求后第 2 码即恢复 editor 来源。
 
-import uiautomation as auto
+依赖: pip install comtypes
+用法: python ime_context.py [--max-chars 200]
+退出: Ctrl+C (或 taskkill /f /im ime_context.exe 需定位)
+"""
+import argparse, os, subprocess, sys, threading, time
+from pathlib import Path
 
 RIME_DIR = Path(os.environ.get("APPDATA", "")) / "Rime"
 OUT = RIME_DIR / "ime_context.txt"
 
-_tp_cache = {}  # hwnd → [(element, TextPattern), ts] 候选列表缓存 (ts: 收集时间)
-_prefer = {}    # hwnd → 上次成功读取的候选索引 (QQ 输入框 Edit 命中后优先试它, 免遍历 64 候选)
-_CACHE_TTL = 60  # 候选列表缓存有效期秒 — 页面加载中收集的列表缺输入框 Edit,
-                 # 而 Document 兜底"成功"不会触发自愈 → 定期重建 (最多延迟 60s 恢复)
+# UIA 常量 (UIAutomationCore.h)
+_CTL_DOCUMENT = 50030
+_CTL_EDIT = 50004
+_CTL_TEXT = 50020
+_TEXT_PATTERN_ID = 10014
+_EP_START = 0  # TextPatternRangeEndpoint.Start
+_EP_END = 1    # TextPatternRangeEndpoint.End
+_TU_CHAR = 0   # TextUnit.Character
+_TS_DESC = 4   # TreeScope.Descendants
 
-# 有 selection 语义的控件类型才收集 (Document/Edit/Text), 按钮/标签等 TextPattern 无意义
-_TARGET_TYPES = ("Document", "Edit", "Text")
-_MAX_CANDIDATES = 64  # VS Code 等大树有数千候选, 上限防卡死; Document 优先保证主文档在首位
-_MAX_NODES = 600      # DFS 访问节点上限 (QQ 聊天记录树极大, 防首次收集 4s+)
 
-def _find_text_elements(el, depth=0, out=None, budget=None):
-    """DFS 收集支持 TextPattern 且类型为 Document/Edit/Text 的后代元素
-    (候选/节点双上限, Document 优先; 不可见/无矩形元素跳过)。
-    深度 32: Chromium 内核 (Edge/QQ NT/VS Code) 的 UIA 树极深。
-    QQ 等应用有多个文本元素 (聊天记录 Document + 输入框 Edit), 只取一个会错过
-    光标所在控件 → 收集候选列表, 由读取方逐个尝试取第一个有效的。"""
-    if out is None or budget is None:
-        out, budget = [], [_MAX_NODES]
-    if depth > 32 or budget[0] <= 0 or len(out) >= _MAX_CANDIDATES:
-        return out
-    budget[0] -= 1
-    try:
-        tp = el.GetPattern(auto.PatternId.TextPattern)
-        if tp:
-            ctrl = getattr(el, "ControlTypeName", "") or ""
-            if any(k in ctrl for k in _TARGET_TYPES):
-                try:
-                    rect = el.BoundingRectangle
-                    if rect.right - rect.left < 2 or rect.bottom - rect.top < 2:
-                        tp = None  # 不可见元素跳过
-                except Exception:
-                    tp = None
-                if tp is not None:
-                    out.append((el, tp))
-    except Exception:
-        pass
-    try:
-        for ch in el.GetChildren():
-            _find_text_elements(ch, depth + 1, out, budget)
-    except Exception:
-        pass
-    return out
-
-def _ctrl_type(h):
-    return getattr(h[0], "ControlTypeName", "") or ""
-
-def _order_hits(hits, hwnd):
-    """候选排序: Edit (输入框) > Document (页面/编辑器) > Text (静态文本)。
-    浏览器输入框的 sel 属于页面级 Document, 读取"页面开头→光标"含导航垃圾;
-    Edit 候选 (搜索框/输入框自身) 的 sel 才是框内文本 → 优先。
-    prefer: 上次成功候选是 Edit 才排最前 (QQ 输入框命中后免遍历);
-    非 Edit (如页面 Document) 不 prefer——浏览器场景优先找真正的输入框。"""
-    pi = _prefer.get(hwnd)
-    if pi is not None and 0 <= pi < len(hits) and "Edit" in _ctrl_type(hits[pi]):
-        hits.insert(0, hits.pop(pi))
-    else:
-        hits.sort(key=lambda h: 0 if "Edit" in _ctrl_type(h) else
-                  (1 if "Document" in _ctrl_type(h) else 2))
-
-def _read_before_caret(tp, max_chars):
-    """用 TextPattern 读取光标前文本 (核心逻辑, 不含缓存管理)"""
+# ── comtypes UIA 读取 (线程内独立 COM 上下文) ──
+def _read_before_caret(tp, UIA, max_chars):
+    """从 TextPattern 读光标前文本。
+    返回: 非空文本 / "" (真实空上文) / None (无选区或非退化全选=无焦点)。"""
     doc = tp.DocumentRange
     sels = tp.GetSelection()
-    if not sels:
-        return None  # 无光标/选区报告
-    rng = sels[0]
+    if not sels or sels.Length == 0:
+        return None
+    rng = sels.GetElement(0)
+    # 退化检测: 非退化选区覆盖全文 (Chromium 无焦点"全选") → None
+    # 退化选区 (起点==终点) 是真实光标: 空文档/光标在开头 → 正常读取返回 ""
+    try:
+        same_start = rng.CompareEndpoints(_EP_START, doc, _EP_START)
+        same_end = rng.CompareEndpoints(_EP_END, doc, _EP_END)
+        sel_degen = rng.CompareEndpoints(_EP_START, rng, _EP_END) == 0
+        if same_start == 0 and same_end == 0 and not sel_degen:
+            return None
+    except Exception:
+        pass
     front = doc.Clone()
-    front.MoveEndpointByRange(auto.TextPatternRangeEndpoint.End, rng,
-                              auto.TextPatternRangeEndpoint.Start)
+    front.MoveEndpointByRange(_EP_END, rng, _EP_START)
     if max_chars > 0:
         try:
-            front.MoveEndpointByUnit(auto.TextPatternRangeEndpoint.Start,
-                                     auto.TextPatternUnit.Character, -max_chars)
+            front.MoveEndpointByUnit(_EP_START, _TU_CHAR, -max_chars)
         except Exception:
-            pass  # 起点已在文档边界 (文本短于 max_chars), 无需移动
-    text = front.GetText(-1)
-    # 限制返回长度 (保险)
-    return text[-max_chars:] if max_chars and len(text) > max_chars else text
+            pass
+    text = front.GetText(-1) or ""
+    # 排除换行及之前的文本: 只保留光标所在行 (最后一个换行符之后)
+    # UIA GetText 行分隔符因应用而异: \n (Chromium) / \r (记事本) / \r\n → 三者都处理
+    last_nl = max(text.rfind("\n"), text.rfind("\r"))
+    if last_nl >= 0:
+        text = text[last_nl + 1:]
+    if max_chars and len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
 
-# ── UIA 读取光标前文本 ──
-def get_text_before_caret(hwnd, max_chars):
-    """UIA TextPattern.GetSelection() 定位光标 (应用自行报告, 不依赖系统 caret——
-    系统 caret 在应用空闲时被销毁, GetGUIThreadInfo 不可靠)。
-    遍历所有 TextPattern 候选 (QQ 等有多文档: 聊天记录+输入框), 取第一个非空读取。
-    缓存失效自愈: Chromium (Edge/QQ) 页面刷新/重建时缓存的 UIA element 变 stale
-    (COMError RPC_E_CALL_REJECTED), 全失败后清缓存重查一次。"""
-    import time as _t
-    cached = _tp_cache.get(hwnd)
-    if cached is None or _t.time() - cached[1] > _CACHE_TTL:
-        hits = _find_text_elements(auto.ControlFromHandle(hwnd), out=[])
-        if not hits:
-            return None  # 应用不支持 UIA 文本模式
-        _order_hits(hits, hwnd)
-        _tp_cache[hwnd] = (hits, _t.time())
 
-    for _ in range(2):  # 第一轮走缓存, 第二轮自愈重查
-        hits = _tp_cache[hwnd][0]
-        for i in range(len(hits)):
-            el, tp = hits[i]
-            try:
-                t = _read_before_caret(tp, max_chars)
-                if t:
-                    _prefer[hwnd] = i
-                    return t
-            except Exception:
-                continue
-        # 全候选失败/为空 → 缓存失效? 清缓存重查一次
-        hits = _find_text_elements(auto.ControlFromHandle(hwnd), out=[])
-        if not hits:
-            return None
-        _order_hits(hits, hwnd)
-        _tp_cache[hwnd] = (hits, _t.time())
-    return None
+def _comtypes_read(hwnd, max_chars, UIA=None, cuia=None):
+    """在当前线程读取光标前文本 (独立 COM 上下文)。
+    返回: 非空文本 / "" (无候选或真实空上文 → 写空回退 commit_history)
+          / None (有候选但读取失败/退化 → 调用方保留旧值)。
+    UIA/cuia 可传入线程内已创建的实例 (避免每次重建)。"""
+    if UIA is None or cuia is None:
+        from comtypes.client import GetModule, CreateObject
+        UIA = GetModule("UIAutomationCore.dll")
+        cuia = CreateObject("{ff48dba4-60ef-4201-aa87-54103eef594e}",
+                            interface=UIA.IUIAutomation)
+    root = cuia.ElementFromHandle(hwnd)
+    # 候选: Document/Edit/Text 控件 (深度遍历), 排序 Edit < Document < Text
+    cond = cuia.CreateOrCondition(
+        cuia.CreateOrCondition(
+            cuia.CreatePropertyCondition(30003, _CTL_EDIT),
+            cuia.CreatePropertyCondition(30003, _CTL_DOCUMENT)),
+        cuia.CreatePropertyCondition(30003, _CTL_TEXT))
+    arr = root.FindAll(_TS_DESC, cond)
+    items = []
+    for i in range(arr.Length):
+        el = arr.GetElement(i)
+        ct = el.CurrentControlType
+        rank = 0 if ct == _CTL_EDIT else (1 if ct == _CTL_DOCUMENT else 2)
+        items.append((rank, el))
+    if not items:
+        return ""  # 无 TextPattern 候选 (终端/不支持窗口) → 写空
+    items.sort(key=lambda x: x[0])
+    for rank, el in items:
+        try:
+            p = el.GetCurrentPattern(_TEXT_PATTERN_ID)
+            tp = p.QueryInterface(UIA.IUIAutomationTextPattern)
+            t = _read_before_caret(tp, UIA, max_chars)
+            if t:
+                return t
+            if t == "":
+                # 最高优先候选确认光标前为空 (空文档/光标在开头):
+                # 真实空上文 → 写空。排序保证 Edit 在 Document 前。
+                return ""
+        except Exception:
+            continue  # 退化/COMError → 尝试下一候选
+    return None  # 有候选但全部读取失败/退化 → 保留旧值
+
+
+# ── 常驻读取线程 (独立 COM 上下文, 挂起隔离 + 候选缓存) ──
+class ReaderThread:
+    """读取线程: 与主循环分离。
+    - 挂起隔离: COM 调用对某些窗口 (Electron) 可能无限挂起, 只卡本线程,
+      主循环 wait 超时后重建新线程 (旧线程泄漏无害)。
+    - 候选缓存 (线程内): 元素列表只在首次/无候选 10s 后重建, 避免每轮
+      全树遍历 (100-500ms 占 CPU → 系统卡顿); 缓存内读取仅 ~10ms。
+      缓存的 element 在本线程创建使用, 无跨公寓问题。"""
+
+    _CACHE_TTL = 10  # 无候选缓存有效期秒 (有候选缓存不过期, 读取异常自愈重建)
+
+    def __init__(self):
+        self._req = threading.Event()   # 有新任务
+        self._done = threading.Event()  # 任务完成
+        self._result = [None]
+        self._state = {"hwnd": 0, "max_chars": 200}
+        self._cache = {}  # hwnd → (候选列表, ts) 仅本线程访问
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def busy(self):
+        """上一任务未完成 → 主循环跳过本轮 (限流, 避免读取风暴)"""
+        return self._req.is_set()
+
+    def submit(self, hwnd, max_chars):
+        self._state["hwnd"] = hwnd
+        self._state["max_chars"] = max_chars
+        self._result[0] = None
+        self._done.clear()
+        self._req.set()
+
+    def wait_result(self, timeout):
+        """返回: 读取结果 (含 ""/None) 或 _TIMEOUT 表示超时 (线程挂起)。"""
+        if not self._done.wait(timeout):
+            return _TIMEOUT
+        return self._result[0]
+
+    def _collect(self, hwnd, cuia):
+        """全树遍历收集候选 (Document/Edit/Text, 排序 Edit<Document<Text)。
+        仅本线程调用 (缓存内 element 跨线程不可用)。"""
+        root = cuia.ElementFromHandle(hwnd)
+        cond = cuia.CreateOrCondition(
+            cuia.CreateOrCondition(
+                cuia.CreatePropertyCondition(30003, _CTL_EDIT),
+                cuia.CreatePropertyCondition(30003, _CTL_DOCUMENT)),
+            cuia.CreatePropertyCondition(30003, _CTL_TEXT))
+        arr = root.FindAll(_TS_DESC, cond)
+        items = []
+        for i in range(arr.Length):
+            el = arr.GetElement(i)
+            ct = el.CurrentControlType
+            rank = 0 if ct == _CTL_EDIT else (1 if ct == _CTL_DOCUMENT else 2)
+            items.append((rank, el))
+        items.sort(key=lambda x: x[0])
+        return items
+
+    def _loop(self):
+        from comtypes import CoInitialize, CoUninitialize
+        from comtypes.client import GetModule, CreateObject
+        CoInitialize()
+        try:
+            UIA = GetModule("UIAutomationCore.dll")
+            cuia = CreateObject("{ff48dba4-60ef-4201-aa87-54103eef594e}",
+                                interface=UIA.IUIAutomation)
+        except Exception:
+            UIA = cuia = None
+        try:
+            while True:
+                self._req.wait()
+                self._req.clear()
+                hwnd = self._state["hwnd"]
+                max_chars = self._state["max_chars"]
+                try:
+                    # 候选缓存: 无候选 10s 重建; 有候选不过期 (读取异常自愈重建)
+                    cached = self._cache.get(hwnd)
+                    if cached is None or (not cached[0]
+                                          and time.time() - cached[1] > self._CACHE_TTL):
+                        items = self._collect(hwnd, cuia)
+                        self._cache[hwnd] = (items, time.time())
+                    else:
+                        items = cached[0]
+                    if not items:
+                        self._result[0] = ""  # 无候选 (终端等) → 写空
+                    else:
+                        t = None
+                        for rank, el in items:
+                            try:
+                                p = el.GetCurrentPattern(_TEXT_PATTERN_ID)
+                                tp = p.QueryInterface(UIA.IUIAutomationTextPattern)
+                                t = _read_before_caret(tp, UIA, max_chars)
+                                if t:
+                                    break
+                                if t == "":
+                                    break  # 最高优先候选真空 → 写空
+                            except Exception:
+                                t = None  # 异常 (stale) → 下一候选
+                        if t == "":
+                            self._result[0] = ""
+                        elif t is None:
+                            # 有候选但全部退化/异常 → 重建缓存 (stale 自愈) + 保留旧值
+                            if cached is not None and cached[0]:
+                                self._cache.pop(hwnd, None)
+                            self._result[0] = None
+                        else:
+                            self._result[0] = t
+                except Exception as e:
+                    sys.stderr.write(f"[read-thread] {e}\n")
+                    self._result[0] = None
+                self._done.set()
+        finally:
+            CoUninitialize()
+
+
+_TIMEOUT = object()  # wait_result 超时哨兵
+
 
 # ── 单实例互斥 (防止重复启动) ──
 def _acquire_single_instance(name="ime_context_mutex"):
     import ctypes
+    from ctypes import wintypes
     kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW(None, False, name)
-    return kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS → False (已在运行)
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    h = kernel32.CreateMutexW(None, False, name)
+    if kernel32.GetLastError() != 183:  # 非 ALREADY_EXISTS → 新建成功
+        return True
+    # 互斥已存在: 探测是否被持有。
+    #   0   = WAIT_OBJECT_0   无人持有 → 接管
+    #   128 = WAIT_ABANDONED  所有者被强杀/崩溃遗留 (已获所有权) → 接管
+    #   258 = WAIT_TIMEOUT    真被持有 (已有实例运行) → 拒绝
+    return kernel32.WaitForSingleObject(h, 0) != 258
+
 
 # ── 双击启动 + 开机自启: 双路径 VBS (无需终端) ──
 # 服务代码路径解析顺序:
@@ -155,68 +272,131 @@ _VBS_LINES = [
     'Set fso = CreateObject("Scripting.FileSystemObject")',
     'base = fso.GetParentFolderName(WScript.ScriptFullName)',
     'script = ""',
-    'If fso.FileExists(base & "\\ime_context.py") Then',
-    '    script = base & "\\ime_context.py"',
-    'ElseIf fso.FileExists("{script_main}") Then',
-    '    script = "{script_main}"',
+    'If fso.FileExists(base & "\\{exe_name}") Then',
+    '    script = base & "\\{exe_name}"',
+    'ElseIf fso.FileExists("{exe_main}") Then',
+    '    script = "{exe_main}"',
     'End If',
     'If script = "" Then',
-    '    MsgBox "未找到 ime_context.py，请重新生成本文件", 48, "编辑器上文服务"',
+    '    MsgBox "未找到 {exe_name}，请重新生成本文件", 48, "编辑器上文服务"',
     '    WScript.Quit',
     'End If',
-    'pyw = ""',
-    'For Each p In Array( _',
-    '    "{pyw_main}", _',
-    '    "C:\\Python312\\pythonw.exe", "C:\\Python\\pythonw.exe", _',
-    '    "D:\\Python\\pythonw.exe", "%LOCALAPPDATA%\\Programs\\Python\\Python312\\pythonw.exe")',
-    '    p = fso.BuildPath(fso.GetParentFolderName(p), fso.GetFileName(p))',
-    '    If fso.FileExists(p) Then pyw = p : Exit For',
-    'Next',
-    'If pyw = "" Then',
-    '    MsgBox "未找到 pythonw.exe，请安装 Python 或修改本文件中的路径", 48, "编辑器上文服务"',
-    '    WScript.Quit',
-    'End If',
-    'CreateObject("WScript.Shell").Run """" & pyw & """ """ & script & """", 0, False',
+    '{pyw_block}',
+    'CreateObject("WScript.Shell").Run {run_cmd}, 0, False',
 ]
 _VBS_TEMPLATE = "\r\n".join(_VBS_LINES) + "\r\n"
 
-def _make_autostart_vbs():
-    """生成 启动-编辑器上文服务.vbs 到脚本同目录:
-    双击即运行 (pythonw 无窗口), 复制到启动文件夹即开机自启。
-    ime_context.py 路径相对 vbs 自身 (文件夹可移动), pythonw 自动探测。"""
-    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    if not os.path.exists(pyw):
-        pyw = sys.executable
-    # VBS 无反斜杠转义 (只有 "" 转义引号) → 路径直接写单反斜杠
-    body = _VBS_TEMPLATE.replace("{script_main}", os.path.abspath(__file__))
-    body = body.replace("{pyw_main}", pyw)
-    out = Path(__file__).resolve().parent / "启动-编辑器上文服务.vbs"
+def _is_frozen():
+    """PyInstaller 打包后 sys.frozen=True, sys.executable = exe 路径"""
+    return getattr(sys, "frozen", False)
+
+def _base_dir():
+    """exe 版 = exe 所在目录; py 版 = 脚本所在目录"""
+    if _is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+_STOP_VBS_LINES = [
+    "' 停止编辑器上文服务 - 双击本文件即结束服务进程",
+    "' 服务占用内存 ~60MB, 停止后 LLM 重排回退 commit_history 上文",
+    'CreateObject("WScript.Shell").Run "taskkill /f /im ime_context.exe", 0, True',
+]
+
+def _make_stop_vbs(target_dir=None):
+    """生成 停止-编辑器上文服务.vbs (exe 版): 双击即结束服务进程"""
+    target = Path(target_dir) if target_dir else _base_dir()
+    out = target / "停止-编辑器上文服务.vbs"
+    out.write_bytes(("\r\n".join(_STOP_VBS_LINES) + "\r\n").encode("utf-16"))
+    return out
+
+def _make_autostart_vbs(target_dir=None):
+    """生成 启动-编辑器上文服务.vbs:
+    双击即运行 (无窗口), 复制到启动文件夹即开机自启。
+    exe 版: 运行 ime_context.exe (免 Python 依赖); py 版: pythonw 运行 ime_context.py。
+    target_dir: vbs 生成目录 (None = exe/脚本同目录); 兜底路径 = target_dir 内的 exe/py。"""
+    target = Path(target_dir) if target_dir else _base_dir()
+    if _is_frozen():
+        exe_name = Path(sys.executable).name
+        body = _VBS_TEMPLATE.replace("{exe_name}", exe_name)
+        body = body.replace("{exe_main}", str(target / exe_name))
+        body = body.replace("{pyw_block}", "rem exe 版无需 pythonw")
+        body = body.replace("{run_cmd}", '"""" & script & """"')
+    else:
+        exe_name = "ime_context.py"
+        body = _VBS_TEMPLATE.replace("{exe_name}", exe_name)
+        body = body.replace("{exe_main}", str(target / exe_name))
+        # py 版: pythonw 探测
+        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(pyw):
+            pyw = sys.executable
+        pyw_block = (
+            'pyw = ""\r\n'
+            'For Each p In Array( _\r\n'
+            f'    "{pyw}", _\r\n'
+            '    "C:\\Python312\\pythonw.exe", "C:\\Python\\pythonw.exe", _\r\n'
+            '    "D:\\Python\\pythonw.exe", "%LOCALAPPDATA%\\Programs\\Python\\Python312\\pythonw.exe")\r\n'
+            '    p = fso.BuildPath(fso.GetParentFolderName(p), fso.GetFileName(p))\r\n'
+            '    If fso.FileExists(p) Then pyw = p : Exit For\r\n'
+            'Next\r\n'
+            'If pyw = "" Then\r\n'
+            '    MsgBox "未找到 pythonw.exe，请安装 Python 或使用 exe 版", 48, "编辑器上文服务"\r\n'
+            '    WScript.Quit\r\n'
+            'End If')
+        body = body.replace("{pyw_block}", pyw_block)
+        body = body.replace("{run_cmd}", '"""" & pyw & """ """ & script & """"')
+    out = target / "启动-编辑器上文服务.vbs"
     out.write_bytes(body.encode("utf-16"))  # UTF-16 LE + BOM, 中文提示安全
     return out
 
-def install_autostart():
-    vbs = _make_autostart_vbs()
+def install_autostart(target_dir=None):
     startup = Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs\Startup"
-    print(f"已生成: {vbs}")
-    print()
-    print("使用方法 (无需终端):")
-    print(f"  1. 双击 {vbs.name}           → 立即启动服务")
-    print(f"  2. 复制该文件到启动文件夹    → 开机自动启动")
-    print(f"     ({startup})")
-    print(f"  3. 删除该文件                → 停止服务/取消自启")
-    print(f"  整个文件夹可以移动到任意位置 (vbs 自动定位 ime_context.py)")
+    if _is_frozen():
+        # exe 版: 无需启动 vbs — 双击 exe 即启动, 复制 exe 到启动文件夹即自启
+        stop_vbs = _make_stop_vbs(target_dir)
+        print(f"已生成: {stop_vbs}")
+        print()
+        print("使用方法 (无需终端):")
+        print(f"  1. 双击 ime_context.exe        → 立即启动服务")
+        print(f"  2. 复制 ime_context.exe 到启动文件夹 → 开机自动启动")
+        print(f"     ({startup})")
+        print(f"  3. 双击 {stop_vbs.name} → 停止服务")
+        print(f"  4. 删除启动文件夹中的 exe 副本 → 取消开机自启")
+        print(f"  整个文件夹可以移动到任意位置")
+    else:
+        vbs = _make_autostart_vbs(target_dir)
+        print(f"已生成: {vbs}")
+        print()
+        print("使用方法 (无需终端, py 版):")
+        print(f"  1. 双击 {vbs.name}           → 立即启动服务")
+        print(f"  2. 复制该文件到启动文件夹    → 开机自动启动")
+        print(f"     ({startup})")
+        print(f"  3. 删除该文件                → 停止服务/取消自启")
+        print(f"  整个文件夹可以移动到任意位置 (vbs 自动定位 ime_context.py)")
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--interval", type=int, default=150, help="轮询间隔 ms (默认 150)")
+    ap.add_argument("--interval", type=int, default=0, help="(兼容保留, 已弃用: 请求驱动模式无需轮询)")
     ap.add_argument("--max-chars", type=int, default=200, help="取光标前字符数 (默认 200)")
     ap.add_argument("--once", action="store_true", help="单次读取后打印退出 (调试)")
-    ap.add_argument("--install", action="store_true", help="注册开机自启 (无窗口后台运行)")
-    ap.add_argument("--uninstall", action="store_true", help="移除开机自启")
+    ap.add_argument("--install", action="store_true", help="生成启动 vbs (无窗口后台运行)")
+    ap.add_argument("--install-to", type=str, default=None,
+                    help="vbs 生成到指定目录 (部署用: 服务代码与 vbs 同目录, base 命中)")
+    ap.add_argument("--uninstall", action="store_true", help="移除启动 vbs")
+    ap.add_argument("--stop", action="store_true",
+                    help="停止服务 (exe 版: taskkill ime_context.exe; py 版: 提示用任务管理器)")
     args = ap.parse_args()
 
     if args.install:
-        install_autostart()
+        install_autostart(args.install_to)
+        return
+    if args.stop:
+        if _is_frozen():
+            # 异步杀 (含自身进程——Popen 不等待, 自身被杀后 taskkill 继续完成)
+            subprocess.Popen(["taskkill", "/f", "/im", "ime_context.exe"])
+            time.sleep(0.5)
+            os._exit(0)
+        else:
+            print("py 版请用任务管理器结束 pythonw.exe (含 ime_context.py 的进程)")
         return
     if args.uninstall:
         vbs = Path(__file__).resolve().parent / "启动-编辑器上文服务.vbs"
@@ -234,7 +414,7 @@ def main():
         hwnd = user32.GetForegroundWindow()
         print(f"foreground hwnd: {hwnd}")
         if hwnd:
-            t = get_text_before_caret(hwnd, args.max_chars)
+            t = _comtypes_read(hwnd, args.max_chars)
             print(f"text: {repr(t)}")
         return
 
@@ -249,28 +429,79 @@ def main():
     except Exception:
         pass
     print(f"ime_context 外挂启动 → {OUT} (日志: {err_log})")
-    print(f"轮询 {args.interval}ms, 光标前 {args.max_chars} 字符")
+    print(f"请求驱动模式, 光标前 {args.max_chars} 字符")
+    reader = ReaderThread()
+    hang = {}      # hwnd → 挂起跳过截止时间 (time.time)
     last_text = None
     last_write = 0.0
+    last_changed_write = 0.0  # 变化写入限流 (打字连续变化合并)
+    req_file = OUT.parent / "ime_context_req.txt"  # lua 第 1 码时写 → 立即读取
+    pending = False  # 请求待处理: reader 忙时保持, 完成后补读 (快速连打不丢请求)
     while True:
         try:
+            # 唯一驱动: RIME 侧 (llm_processor.lua) 第 1 码写入请求文件。
+            # 无轮询——打码必然经过第 1 码, 心跳由每次读取写入的文件时间戳承担
+            # (打词间隔 >30s 时心跳过期, RIME 回退 commit_history, 第 1 码
+            # 请求后第 2 码即恢复 editor 来源)。
+            if req_file.exists():
+                try:
+                    req_file.unlink()
+                except OSError:
+                    pass
+                pending = True
+            # pending 且读取线程空闲才读取; reader 忙时保持 pending (不丢请求)
+            if not (pending and not reader.busy()):
+                time.sleep(0.02)
+                continue
+            pending = False
             now = time.time()
             t_read = time.time()
             hwnd = user32.GetForegroundWindow()
             text = None
-            if hwnd:
-                text = get_text_before_caret(hwnd, args.max_chars)
+            if hwnd and hang.get(hwnd, 0) <= now:
+                reader.submit(hwnd, args.max_chars)
+                res = reader.wait_result(0.35)
+                if res is _TIMEOUT:
+                    # 读取线程挂起 (COM 卡死): 重建线程, 该窗口 60s 内跳过
+                    sys.stderr.write(f"[hang] hwnd={hwnd} COM 挂起, 重建读取线程\n")
+                    reader = ReaderThread()
+                    hang[hwnd] = now + 60
+                    text = None
+                else:
+                    text = res
             read_ms = (time.time() - t_read) * 1000
-            changed = (text is not None) and text != last_text
-            # 心跳: 文本变化立即写; 无变化每 1s 写 (供 RIME 判断外挂存活)
-            if changed or now - last_write >= 1.0:
-                if text is None:
-                    text = ""  # 不可读 → 写空, RIME 回退 commit_history
+            # 快速连打 (一码字 "a 空格 a"): 读取完成瞬间若已有新请求
+            # → 本次结果作废 (旧光标位置上文已无用), 不写文件, 立即接续读取。
+            # wait_result 阻塞期间循环顶不检测请求, 故在写入前即时检查。
+            # COM 串行无法打断进行中的调用, 但旧结果不落地 + 新请求零延迟接续。
+            if req_file.exists():
+                try:
+                    req_file.unlink()
+                except OSError:
+                    pass
+                pending = True
+                sys.stderr.write("[stale] 读取结果作废 (期间有新请求)\n")
+                continue
+            # 读不到时的处理:
+            #   None (有候选但读取失败/退化/挂起) → 保留上次有效内容
+            #   "" (无候选/真实空上文) → 写空, RIME 回退 commit_history
+            keep = False
+            if text is None:
+                text = last_text or ""
+                keep = True
+            changed = text != last_text
+            # 心跳: 文本变化立即写 (限流 100ms, 打字连续变化合并,
+            # 减少临时文件写入频率 → 降低 Defender 实时扫描干扰);
+            # 无变化每 1s 写 (供 RIME 判断外挂存活)
+            if (changed and now - last_changed_write >= 0.1) or now - last_write >= 1.0:
                 OUT.parent.mkdir(parents=True, exist_ok=True)
                 tmp = OUT.with_suffix(".tmp")
-                tmp.write_text(f"{int(now * 1000)}\t{text}", encoding="utf-8")
-                tmp.replace(OUT)
-                # 诊断日志: 窗口名 | 耗时ms | 结果长度 | 内容摘要 (仅变化时写)
+                try:
+                    tmp.write_text(f"{int(now * 1000)}\t{text}", encoding="utf-8")
+                    tmp.replace(OUT)
+                except OSError as e:
+                    sys.stderr.write(f"[write] {e}\n")
+                # 诊断日志: 窗口名 | 耗时ms | 结果长度 | 类型 | 摘要 (仅变化时写)
                 if changed:
                     wname = ""
                     try:
@@ -280,20 +511,14 @@ def main():
                     except Exception:
                         pass
                     summary = text.replace("\n", "⏎")[:60]
-                    ptype = ""
-                    try:
-                        pi = _prefer.get(hwnd)
-                        cached = _tp_cache.get(hwnd)
-                        if pi is not None and cached:
-                            ptype = _ctrl_type(cached[0][pi]).replace("Control", "")
-                    except Exception:
-                        pass
-                    sys.stderr.write(f"[read] {wname[:24]}|{read_ms:.0f}ms|{len(text)}字|{ptype}|{summary}\n")
-                last_text = text if text else last_text
+                    sys.stderr.write(f"[read] {wname[:24]}|{read_ms:.0f}ms|{len(text)}字|{'KEEP ' if keep else ''}{summary}\n")
+                last_text = text if text is not None else last_text
                 last_write = now
+                if changed:
+                    last_changed_write = now
         except Exception as e:
             sys.stderr.write(f"[err] {e}\n")
-        time.sleep(args.interval / 1000)
+        time.sleep(0.02)  # 20ms 分段: 轮询粒度
 
 if __name__ == "__main__":
     main()
