@@ -20,8 +20,6 @@ rime-llm-rerank\
 │   ├── rime_llm.dll           #   预编译 CPU 插件
 │   ├── rime_llm_cuda.dll      #   预编译 GPU 插件（可选）
 │   └── *.dll                  #   llama.cpp + CUDA 依赖 DLL
-├── ime_context\               # 编辑器上文外挂（可选，推荐）
-│   └── ime_context.py          #   UIA 读取光标前文本 → RIME 作为上文
 ├── cpp\                       # 源码
 │   ├── rime_llm.cpp           #   CPU 插件
 │   ├── rime_llm_cuda.cpp      #   GPU 插件
@@ -34,28 +32,7 @@ rime-llm-rerank\
 └── README.md
 ```
 
-## 编辑器上文外挂（ime_context）
 
-RIME 的 LLM 上文默认来自 `commit_history`（本次输入法会话上屏词）——退格、移动光标编辑后与文档实际光标前文本不符，导致 LLM 命中率下降。`ime_context.py` 通过 Windows UIAutomation 读取**活动编辑窗口光标前的文本**（最近 200 字符），写入 `%APPDATA%\Rime\ime_context.txt`，`llm_processor.lua` 自动优先使用该文件作为上文（30s 心跳内有效，失效回退 commit_history）。
-
-支持：记事本、Edge/Chrome、QQ NT、VS Code 等所有支持 UIA 文本模式的应用；不支持的环境（终端等）自动回退，不影响使用。
-
-**使用（无需终端，免安装 exe）**：
-
-```
-1. 双击 ime_context\ime_context.exe        → 服务启动（无窗口）
-2. 复制 ime_context.exe 到启动文件夹（shell:startup）→ 开机自启
-3. 双击 ime_context\停止-编辑器上文服务.vbs → 停止服务
-4. 删除启动文件夹中的 exe 副本             → 取消开机自启
-```
-
-免安装：exe 已打包 Python 运行时 + uiautomation 库，无需任何依赖。调试命令：`python ime_context\ime_context.py --once`（单次读取，需 Python 环境）。
-
-依赖：Python 3 + uiautomation 库。日志：`%APPDATA%\Rime\ime_context.log`。
-
----
-
-# 用户说明
 
 ## 效果与延迟
 

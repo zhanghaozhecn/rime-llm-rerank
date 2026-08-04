@@ -18,8 +18,7 @@ local last_prep_ctx = "" -- 上次 prepare 的 context，避免重复调用
 local NAV_KEYS = { Left=true, Right=true, Up=true, Down=true,
                    Home=true, End=true, Page_Up=true, Page_Down=true }
 -- 编辑位置变化键: 退格/删除 (删词) + 导航键 (光标移动/滚动) + 回车 (换行)
--- 这些键使会话上屏词序列不再代表光标前上文 → rime 来源上文重置为空
--- (不影响 editor 来源: 外挂光标上文独立, 不受重置影响)
+-- 这些键使会话上屏词序列不再代表光标前上文 → 上屏历史上文重置为空
 local function is_edit_key(k)
     return k == "BackSpace" or k == "Delete"
         or k == "Control+BackSpace" or k == "Control+Delete"
@@ -40,23 +39,6 @@ local function append_raw(text)
     end
 end
 
--- 读取编辑器上文外挂 (ime_context.py) 提供的光标前文本
--- 文件格式: <unix_ms 心跳>\t<光标前文本>; 心跳 30s 内有效, 空文本/无文件 → nil
-local function get_editor_context()
-    local p = rime_api.get_user_data_dir() .. "\\ime_context.txt"
-    local f = io.open(p, "r")
-    if not f then return nil end
-    local line = f:read("*l")
-    f:close()
-    if not line then return nil end
-    local ts_s, text = line:match("^(%d+)\t(.*)$")
-    if not ts_s then return nil end
-    local ts = tonumber(ts_s)
-    if not ts or os.time() * 1000 - ts > 30000 then return nil end
-    if text == "" then return nil end
-    return text
-end
-
 local function find_overlap(prev, curr)
     local np, nc = #prev, #curr
     for len = math.min(np, nc), 0, -1 do
@@ -75,8 +57,7 @@ end
 local function processor(key, env)
     if key:release() then return 2 end
 
-    -- 上文检查 + 预解码 (每次按键): 编辑器上文 (外挂) 或 commit_history 任一变化
-    -- → 立即异步预解码。覆盖: 光标移动/编辑后打第一键 (外挂文件已更新) 与上屏 (commit)
+    -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
     local backend = (sc:get_string("llm_rerank/backend") or "off")
     if backend == "off" then
@@ -114,18 +95,7 @@ local function processor(key, env)
         pending_code = prev_input
         last_full = ""  -- 已消费
     end
-    -- 第 1 码 (输入从空到非空): 移动光标/退格/回车后开始打新词,
-    -- 请求外挂立即更新光标上文 (不等轮询间隔——慢窗口已自适应降频到 2-5s)。
-    -- 外挂主循环 20ms 粒度检测请求文件 → 立即读取 → 第 2-4 码重排用新上文。
-    local started = (prev_input == "" and ctx.input ~= "")
     prev_input = ctx.input
-    if started then
-        local req = io.open(rime_api.get_user_data_dir() .. "\\ime_context_req.txt", "w")
-        if req then
-            req:write(tostring(os.time()))
-            req:close()
-        end
-    end
 
     -- 退格 / Delete / 导航键 (composition 为空时): 编辑位置变化
     --   rime 来源上文重置为空 (会话上屏词序列不再代表光标前上文), 立即重新预解码
@@ -221,10 +191,7 @@ local function processor(key, env)
 end
 
 local function get_context()
-    -- 编辑器上文优先 (外挂提供的光标前文本), 无效回退 commit_history
-    -- 返回 (文本, 来源): "editor" = 光标上文服务, "rime" = commit_history
-    local ctx = get_editor_context()
-    if ctx then return ctx, "editor" end
+    -- 上文 = 上屏历史 (commit_history)。返回 (文本, 来源)
     return table.concat(history, ""), "rime"
 end
 
