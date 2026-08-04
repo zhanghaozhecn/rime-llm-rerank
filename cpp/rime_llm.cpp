@@ -395,6 +395,8 @@ static int lua_prepare(lua_State * L) {
     }
     const char * context = luaL_checkstring(L, 1);
     auto ctx_ids = tokenize(context);
+    // 上文 token 数 < min_tokens (方案文件 llm_rerank/min_tokens, lua 传入)
+    // → 不预解码 (空 ctx 无推理是配置语义, 非 bug)
     if ((int)ctx_ids.size() < g_min_tokens) {
         lua_pushboolean(L, 0);
         return 1;
@@ -437,6 +439,8 @@ static int lua_score(lua_State * L) {
     if (cand_texts.size() < 2) { lua_pushnil(L); return 1; }
 
     std::vector<llama_token> ctx_ids = tokenize(context);
+    // 上文 token 数 < min_tokens (方案文件 llm_rerank/min_tokens, lua 传入)
+    // → 不推理 (空 ctx 无推理是配置语义, 非 bug)
     if ((int)ctx_ids.size() < g_min_tokens) { lua_pushnil(L); return 1; }
     if ((int)ctx_ids.size() > g_max_ctx_tokens)
         ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);

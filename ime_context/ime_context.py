@@ -143,6 +143,7 @@ class ReaderThread:
         self._req = threading.Event()   # 有新任务
         self._done = threading.Event()  # 任务完成
         self._result = [None]
+        self._had_error = [False]  # 读取线程异常 (COM 临时错误) → 主循环重试
         self._state = {"hwnd": 0, "max_chars": 200}
         self._cache = {}  # hwnd → (候选列表, ts) 仅本线程访问
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -156,13 +157,17 @@ class ReaderThread:
         self._state["hwnd"] = hwnd
         self._state["max_chars"] = max_chars
         self._result[0] = None
+        self._had_error[0] = False
         self._done.clear()
         self._req.set()
 
     def wait_result(self, timeout):
-        """返回: 读取结果 (含 ""/None) 或 _TIMEOUT 表示超时 (线程挂起)。"""
+        """返回: 读取结果 / _TIMEOUT (挂起) / _ERROR (读取线程异常, 可重试)。"""
         if not self._done.wait(timeout):
             return _TIMEOUT
+        if self._had_error[0]:
+            self._had_error[0] = False
+            return _ERROR
         return self._result[0]
 
     def _collect(self, hwnd, cuia):
@@ -236,12 +241,14 @@ class ReaderThread:
                 except Exception as e:
                     sys.stderr.write(f"[read-thread] {e}\n")
                     self._result[0] = None
+                    self._had_error[0] = True
                 self._done.set()
         finally:
             CoUninitialize()
 
 
-_TIMEOUT = object()  # wait_result 超时哨兵
+_TIMEOUT = object()  # wait_result 超时哨兵 (线程挂起)
+_ERROR = object()    # wait_result 异常哨兵 (读取线程 COM 临时错误, 可重试)
 
 
 # ── 单实例互斥 (防止重复启动) ──
@@ -432,6 +439,7 @@ def main():
     print(f"请求驱动模式, 光标前 {args.max_chars} 字符")
     reader = ReaderThread()
     hang = {}      # hwnd → 挂起跳过截止时间 (time.time)
+    retry = {}     # hwnd → 连续异常次数 (≥2 → hang 60s)
     last_text = None
     last_write = 0.0
     last_changed_write = 0.0  # 变化写入限流 (打字连续变化合并)
@@ -466,9 +474,24 @@ def main():
                     sys.stderr.write(f"[hang] hwnd={hwnd} COM 挂起, 重建读取线程\n")
                     reader = ReaderThread()
                     hang[hwnd] = now + 60
+                    retry.pop(hwnd, None)
                     text = None
+                elif res is _ERROR:
+                    # 读取线程 COM 临时错误 (RPC_E_SERVERFAULT 等): 重试一次;
+                    # 连续 2 次异常 → 该窗口 60s 跳过 (请求驱动下一次失败=请求丢失)
+                    n = retry.get(hwnd, 0) + 1
+                    if n >= 2:
+                        retry.pop(hwnd, None)
+                        hang[hwnd] = now + 60
+                        sys.stderr.write(f"[hang] hwnd={hwnd} 连续读取异常, 60s 跳过\n")
+                        text = None
+                    else:
+                        retry[hwnd] = n
+                        pending = True
+                        continue
                 else:
                     text = res
+                    retry.pop(hwnd, None)
             read_ms = (time.time() - t_read) * 1000
             # 快速连打 (一码字 "a 空格 a"): 读取完成瞬间若已有新请求
             # → 本次结果作废 (旧光标位置上文已无用), 不写文件, 立即接续读取。
@@ -500,7 +523,20 @@ def main():
                     tmp.write_text(f"{int(now * 1000)}\t{text}", encoding="utf-8")
                     tmp.replace(OUT)
                 except OSError as e:
-                    sys.stderr.write(f"[write] {e}\n")
+                    # Defender 实时扫描竞争等: 重试 3 次 (间隔 50ms)。
+                    # 请求驱动下一次写失败 = 该次请求的上文丢失 → 必须重试成功
+                    ok_write = False
+                    for _ in range(3):
+                        time.sleep(0.05)
+                        try:
+                            tmp.write_text(f"{int(now * 1000)}\t{text}", encoding="utf-8")
+                            tmp.replace(OUT)
+                            ok_write = True
+                            break
+                        except OSError:
+                            continue
+                    if not ok_write:
+                        sys.stderr.write(f"[write] {e}\n")
                 # 诊断日志: 窗口名 | 耗时ms | 结果长度 | 类型 | 摘要 (仅变化时写)
                 if changed:
                     wname = ""
