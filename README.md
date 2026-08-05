@@ -32,7 +32,9 @@ rime-llm-rerank\
 └── README.md
 ```
 
+---
 
+# 用户说明
 
 ## 效果与延迟
 
