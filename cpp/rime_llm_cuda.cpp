@@ -272,8 +272,17 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         ms3 = std::chrono::duration<double, std::milli>(t3_1 - t3_0).count();
     }
 
-    for (int i = 0; i < n_cands; i++)
-        scores_out[i] = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
+    // 4+ token 候选只算了前 3 项 CE: 截断让长词免掉尾部 (负的) CE → 长词被高估。
+    // 按平均 CE 外推缺失尾部 (λ=0.5, 语料模拟调参, 与 CPU 版一致):
+    //   score = -ce_sum - (ce_sum/3) * (n_tokens-3) * 0.5
+    for (int i = 0; i < n_cands; i++) {
+        double score = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
+        if (score > -1e9 && (int)cands[i].size() > 3) {
+            double avg_ce = ce_sum[i] / 3.0;
+            score = -ce_sum[i] - avg_ce * ((int)cands[i].size() - 3) * 0.5;
+        }
+        scores_out[i] = score;
+    }
 
     // 注意: prep 状态不消耗——同一 ctx 期间可重复命中
     // (代次机制保证 seq0 被覆盖后自动失效, 无需主动清除)
