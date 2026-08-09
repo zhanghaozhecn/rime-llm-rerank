@@ -197,7 +197,7 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |
-| `cpu_cores` | auto | CPU 线程数。不设置=7（实测多台饱和）：`max(4, ceil(总线程数/3))`，如 20 线程→7 |
+| `cpu_cores` | auto | CPU 线程数。不设置=7（实测多台饱和）：`max(4, ceil(总线程数/3))`，如 20 线程→7。**设备实测**：编译运行 `cpp/bench_threads.cpp`（`build_bench_threads.bat`，需本机 llama.cpp 构建）即可扫描 1..逻辑核数的推理耗时并输出建议值 |
 | `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
 | `backend` | cpu | `cpu` 或 `gpu`，需对应 DLL 已部署到小狼毫目录 |
 
