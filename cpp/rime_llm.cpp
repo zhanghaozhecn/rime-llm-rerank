@@ -123,11 +123,11 @@ static void sampler_loop() {
 }
 
 // 打分形状的微基准 (与 bench_threads.exe 相同): ctx decode + 并行候选 decode + CE
-static void scan_once(llama_context * ctx,
-                      const std::vector<llama_token> & ctx_ids,
-                      const std::vector<std::vector<llama_token>> & cands, int vs) {
+// S1 (ctx decode) 被生产环境 prepare 预计算吸收, 不计时;
+// 扫描只计 S2+S3 (真实按键感知延迟)
+static void scan_ctx_once(llama_context * ctx,
+                          const std::vector<llama_token> & ctx_ids) {
     int ctx_len = (int)ctx_ids.size();
-    int n = (int)cands.size();
     llama_memory_clear(llama_get_memory(ctx), false);
     llama_batch b1 = llama_batch_init(ctx_len, 0, 1);
     for (int j = 0; j < ctx_len; j++) {
@@ -135,11 +135,14 @@ static void scan_once(llama_context * ctx,
         b1.n_seq_id[j] = 1; b1.seq_id[j][0] = 0;
     }
     b1.logits[ctx_len - 1] = 1; b1.n_tokens = ctx_len;
-    if (llama_decode(ctx, b1) == 0) {
-        float * cl = llama_get_logits_ith(ctx, ctx_len - 1);
-        if (cl) cross_entropy(cl, vs, cands[0][0]);
-    }
+    llama_decode(ctx, b1);
     llama_batch_free(b1);
+}
+
+static void scan_cand_once(llama_context * ctx,
+                           const std::vector<std::vector<llama_token>> & cands,
+                           int ctx_len, int vs) {
+    int n = (int)cands.size();
     for (int s = 0; s < n; s++)
         llama_memory_seq_cp(llama_get_memory(ctx), 0, s + 1, 0, -1);
     llama_batch b2 = llama_batch_init(n, 0, n);
@@ -155,6 +158,27 @@ static void scan_once(llama_context * ctx,
         }
     }
     llama_batch_free(b2);
+    // S3: 3-token 候选继续 decode
+    std::vector<int> idx3;
+    for (int s = 0; s < n; s++)
+        if ((int)cands[s].size() >= 3)
+            idx3.push_back(s);
+    if (!idx3.empty()) {
+        llama_batch b3 = llama_batch_init((int)idx3.size(), 0, (int)idx3.size());
+        for (size_t k = 0; k < idx3.size(); k++) {
+            int s = idx3[k];
+            b3.token[k] = cands[s][1]; b3.pos[k] = ctx_len + 1;
+            b3.n_seq_id[k] = 1; b3.seq_id[k][0] = s + 1; b3.logits[k] = 1;
+        }
+        b3.n_tokens = (int)idx3.size();
+        if (llama_decode(ctx, b3) == 0) {
+            for (size_t k = 0; k < idx3.size(); k++) {
+                float * l = llama_get_logits_ith(ctx, (int)k);
+                if (l) cross_entropy(l, vs, cands[idx3[k]][2]);
+            }
+        }
+        llama_batch_free(b3);
+    }
 }
 
 // 模型加载后运行一次 (加载线程内, g_loaded 前): 扫 {4,6,..,16},
@@ -167,27 +191,39 @@ static void thread_scan(llama_context * ctx) {
     std::vector<int> sweep;
     for (int t = 4; t <= cores && t <= 16; t += 2) sweep.push_back(t);
     if (sweep.empty()) return;
-    const char * ctx_text = "今天天气不错我们去公园散步聊聊天";
+    const char * ctx_text = "今天天气不错我们去公园散步聊聊天然后回家吃晚饭";
     std::vector<llama_token> ctx_ids = tokenize(ctx_text);
     if ((int)ctx_ids.size() > 10) ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - 10);
-    const char * words[5] = {"公园", "散步", "聊天", "天气", "不错"};
+    // 最大推理量: 3 x 2-token + 2 x 3-token 候选 (触发 S3 decode)
+    // 常用词是单 token, 从生僻词池中选取并运行时验证 token 数 (2/3)
+    const char * cand_pool[] = {
+        "错事", "侧式", "测速", "仄声", "佚名", "怅惘", "缱绻", "龌龊",
+        "邂逅", "蹉跎", "饕餮", "犄角", "旮旯", "囫囵", "氤氲", "黢黑",
+        "计算机", "图书馆", "摄像头", "咖啡机", "高跟鞋", "潜台词", "老字号",
+        "双刃剑", "里程碑", "橄榄枝", "绊脚石", "遮羞布", "紧箍咒", "试金石"};
     std::vector<std::vector<llama_token>> cands;
-    for (auto * w : words) {
+    int got2 = 0, got3 = 0;
+    for (auto * w : cand_pool) {
         auto ids = tokenize(w);
-        if (ids.empty()) ids.push_back(0);
-        cands.push_back(ids);
+        if (ids.size() == 2 && got2 < 3) { cands.push_back(ids); got2++; }
+        else if (ids.size() == 3 && got3 < 2) { cands.push_back(ids); got3++; }
     }
+    if (cands.size() < 5) return;  // 池失败, 保持配置兑底
     int vs = llama_n_vocab(g_vocab);
     LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
     double best_ms = 1e18; int best_t = sweep[0];
     std::vector<double> ms_of(sweep.size());
+    int ctx_len = (int)ctx_ids.size();
     for (size_t i = 0; i < sweep.size(); i++) {
         llama_set_n_threads(ctx, sweep[i], sweep[i]);
-        scan_once(ctx, ctx_ids, cands, vs);  // warmup (graph build)
+        scan_ctx_once(ctx, ctx_ids);  // S1 不计时 (prepare 吸收)
+        scan_cand_once(ctx, cands, ctx_len, vs);  // warmup (graph build)
         double best = 1e18;
         for (int k = 0; k < 3; k++) {
-            LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
-            scan_once(ctx, ctx_ids, cands, vs);
+            LARGE_INTEGER t0, t1;
+            scan_ctx_once(ctx, ctx_ids);  // S1: 计时窗外
+            QueryPerformanceCounter(&t0);
+            scan_cand_once(ctx, cands, ctx_len, vs);  // S2+S3: 计时
             QueryPerformanceCounter(&t1);
             double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
             if (ms < best) best = ms;
