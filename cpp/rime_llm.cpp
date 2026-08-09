@@ -33,7 +33,7 @@ extern "C" {
 static std::string  g_model_path      = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static int          g_min_tokens      = 1;
 static int          g_max_ctx_tokens  = 10; // tok=10 准确率 93.4%，10→17 收益仅 +1.1pp 但延迟翻倍
-static int          g_n_threads       = 5;  // 默认; 可用 bench_threads 实测后配置
+static int          g_n_threads       = 4;  // 默认=GGML 默认; 可用 bench_threads 实测后配置
 static int          g_n_ctx           = 64;
 static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker seq
 

@@ -188,7 +188,7 @@ llm_rerank:
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 10       # 截取的上文 token 数（1-20），10 为性价比最优点
   max_candidates: 5    # 并行评分候选数（2-9），5 为延迟/准确率最佳平衡
-  # cpu_cores: 0      # 可选。CPU 线程数，不设置=5（默认）。bench_threads.exe 实测后自行调整
+  # cpu_cores: 0      # 可选。CPU 线程数，不设置=4（默认=GGML 默认）。bench_threads.exe 实测后自行调整
   # model_path: ""     # 可选。模型路径，不设置=内置默认 Qwen3.5-0.8B Q4_K_M。换模型只需改此处
   backend: cpu         # "cpu" 或 "gpu"（需对应 DLL 已部署）
 ```
@@ -199,7 +199,7 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |
-| `cpu_cores` | 5 | CPU 线程数。不设置=5（默认）。**设备实测**：运行 `bin/bench_threads.exe` 查看各线程数延迟表后自行填入（线程数固定，无运行时动态调整） |
+| `cpu_cores` | 4 | CPU 线程数。不设置=4（默认=GGML 默认，适用旧设备）。**设备实测**：运行 `bin/bench_threads.exe` 查看各线程数延迟表后自行填入（线程数固定，无运行时动态调整） |
 | `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
 | `backend` | cpu | `cpu` 或 `gpu`，需对应 DLL 已部署到小狼毫目录 |
 
@@ -227,7 +227,7 @@ bin/bench_threads.exe [模型路径]
    工具**不做推荐**——自行权衡"延迟 vs 线程占用"，把选定的数字填入方案 schema 的 `llm_rerank.cpu_cores`（通常选曲线拐点附近的最小线程数即可）
 3. 托盘右键 → 重新部署 → 生效
 
-不跑本工具也可用默认值 5（线程数固定，无运行时动态调整）。自行编译源码：`cpp/build_bench_threads.bat`（需本机 llama.cpp 构建）。
+不跑本工具也可用默认值 4（=GGML 默认，线程数固定，无运行时动态调整）。自行编译源码：`cpp/build_bench_threads.bat`（需本机 llama.cpp 构建）。
 
 ---
 

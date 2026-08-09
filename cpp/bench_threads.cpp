@@ -311,7 +311,7 @@ int main(int argc, char **argv) {
   out("      downloads, games) flattens the curve.\n");
   out("Pick the thread count with the best latency/thread trade-off and set it\n");
   out("in your schema: llm_rerank.cpu_cores = N, then re-deploy. The code\n");
-  out("default is 5 if the option is left unset.\n");
+  out("default is 4 if the option is left unset.\n");
 
   llama_model_free(g_model);
   llama_backend_free();
