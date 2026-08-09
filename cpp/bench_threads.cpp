@@ -54,8 +54,8 @@ static void out(const char *fmt, ...) {
 static const char *kDefaultModel = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static const int kCtxTokens = 10;   // typical TSF caret context
 static const int kNCands = 5;       // max_candidates default
-static const int kNTrials = 25;     // timing trials per thread count (~1 min total
-                                    // with the 80ms inter-trial pause, averaged)
+static const int kNTrials = 25;     // timing trials per thread count; median +
+                                    // mid-50% range reported (robust to noise)
 
 static llama_model *g_model;
 static const llama_vocab *g_vocab;
@@ -261,12 +261,6 @@ int main(int argc, char **argv) {
     out(" %d", (int)c.size());
   out(", incl. S3 decode)\n");
 
-  struct Result {
-    int thr;
-    double ms;
-  };
-  std::vector<Result> results;
-
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
 
@@ -288,9 +282,10 @@ int main(int argc, char **argv) {
     cand_score_once(ctx, cands, (int)ctx_ids.size(), vs);
     cand_score_once(ctx, cands, (int)ctx_ids.size(), vs);
 
-    // interleaved repeated trials, averaged (pause between trials to
-    // break cache-warmth effects; total budget ~1 min for all counts)
-    double sum = 0;
+    // interleaved repeated trials; median + mid-50% (25-75th percentile)
+    // range are robust to background noise even when the system looks idle
+    // (pause between trials to break cache-warmth effects; ~1 min total)
+    std::vector<double> samples;
     int ctx_len = (int)ctx_ids.size();
     for (int t = 0; t < kNTrials; t++) {
       LARGE_INTEGER t0, t1;
@@ -299,12 +294,15 @@ int main(int argc, char **argv) {
       cand_score_once(ctx, cands, ctx_len, vs);  // S2+S3: timed
       QueryPerformanceCounter(&t1);
       double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
-      sum += ms;
+      samples.push_back(ms);
       Sleep(80);  // inter-trial pause
     }
-    double avg = sum / kNTrials;
-    results.push_back({thr, avg});
-    out("  thr=%2d: %6.1f ms/pass\n", thr, avg);
+    std::sort(samples.begin(), samples.end());
+    double med = samples[kNTrials / 2];      // median
+    double p25 = samples[kNTrials / 4];      // 25th percentile
+    double p75 = samples[3 * kNTrials / 4];  // 75th percentile
+    out("  thr=%2d: median %6.1f ms/pass (mid50 %5.1f-%5.1f)\n",
+        thr, med, p25, p75);
     llama_free(ctx);
   }
 
