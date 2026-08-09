@@ -346,14 +346,15 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     // ---- 输出分数 ----
     auto ts_sc_0 = std::chrono::high_resolution_clock::now();
     // 4+ token 候选只算了前 3 项 CE: 截断让长词免掉尾部 (负的) CE → 长词被高估。
-    // 按平均 CE 外推缺失尾部 (λ=0.5, 语料模拟调参: 与完整评分首选一致率
-    // 90.29% → 94.45%, long-up/long-down 方向平衡; 无额外 decode):
-    //   score = -ce_sum - (ce_sum/3) * (n_tokens-3) * 0.5
+    // 按平均 CE 外推缺失尾部 (λ=0.6, eval_long_cand 细扫 0.3-0.7:
+    // 真实尾部 CE/头部 CE 实测 mean 0.58(len4)/0.62(len5+), 0.5-0.7 平台
+    // ~94% 首选一致率, 0.6 方向平衡 up5/down5; 无额外 decode):
+    //   score = -ce_sum - (ce_sum/3) * (n_tokens-3) * 0.6
     for (int i = 0; i < n_cands; i++) {
         double score = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
         if (score > -1e9 && (int)cands[i].size() > 3) {
             double avg_ce = ce_sum[i] / 3.0;
-            score = -ce_sum[i] - avg_ce * ((int)cands[i].size() - 3) * 0.5;
+            score = -ce_sum[i] - avg_ce * ((int)cands[i].size() - 3) * 0.6;
         }
         scores_out[i] = score;
     }
