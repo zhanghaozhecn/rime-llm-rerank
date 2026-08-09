@@ -10,6 +10,9 @@
  * usage: bench_threads.exe [model_path]
  *   model_path default: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
  *
+ * Results are printed to the console AND written to bench_threads_result.txt
+ * in the same directory as the exe (overwritten on each run).
+ *
  * Build (MT, same as the LLM components):
  *   cl /O2 /std:c++17 /EHsc /DNDEBUG /MT bench_threads.cpp
  *      /I D:\llama.cpp-mirror\include /I D:\llama.cpp-mirror\ggml\include
@@ -23,12 +26,30 @@
 #include <windows.h>
 #include "llama.h"
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <fstream>
 #include <io.h>
+
+static FILE *g_out = nullptr;  // result file handle (same dir as exe)
+
+// Print to the console AND to the result file (flushed per line).
+static void out(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+  if (g_out) {
+    va_start(ap, fmt);
+    vfprintf(g_out, fmt, ap);
+    va_end(ap);
+    fflush(g_out);
+  }
+  fflush(stdout);
+}
 
 static const char *kDefaultModel = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static const int kCtxTokens = 10;   // typical TSF caret context
@@ -161,12 +182,26 @@ int main(int argc, char **argv) {
   const char *model_path = kDefaultModel;
   if (argc > 1 && argv[1][0] != '-')
     model_path = argv[1];
+
+  // result file: same directory as the exe, overwritten on each run
+  char exe_path[MAX_PATH];
+  GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+  std::string out_path = exe_path;
+  size_t slash = out_path.find_last_of("\\/");
+  if (slash != std::string::npos)
+    out_path = out_path.substr(0, slash + 1);
+  out_path += "bench_threads_result.txt";
+  g_out = fopen(out_path.c_str(), "w");
+  if (g_out)
+    fprintf(stderr, "results written to: %s\n", out_path.c_str());
+  else
+    fprintf(stderr, "WARNING: cannot open %s - console only\n", out_path.c_str());
+
   int cores = logical_cores();
   int max_thr = std::min(cores, 10);
-  printf("== bench_threads: per-thread latency ==\n");
-  printf("model: %s\n", model_path);
-  printf("logical cores: %d (scanning 1..%d)\n", cores, max_thr);
-  fflush(stdout);
+  out("== bench_threads: per-thread latency ==\n");
+  out("model: %s\n", model_path);
+  out("logical cores: %d (scanning 1..%d)\n", cores, max_thr);
   if (max_thr < 1) {
     fprintf(stderr, "ERROR: no logical processors detected (cores=%d)\n", cores);
     wait_exit();
@@ -220,12 +255,11 @@ int main(int argc, char **argv) {
     wait_exit();
     return 1;
   }
-  printf("workload: ctx_tok=%d cand=%d (tokens:", (int)ctx_ids.size(),
-         (int)cands.size());
+  out("workload: ctx_tok=%d cand=%d (tokens:", (int)ctx_ids.size(),
+      (int)cands.size());
   for (auto &c : cands)
-    printf(" %d", (int)c.size());
-  printf(", incl. S3 decode)\n");
-  fflush(stdout);
+    out(" %d", (int)c.size());
+  out(", incl. S3 decode)\n");
 
   struct Result {
     int thr;
@@ -244,7 +278,7 @@ int main(int argc, char **argv) {
     cp.n_seq_max = 12;
     llama_context *ctx = llama_new_context_with_model(g_model, cp);
     if (!ctx) {
-      printf("  thr=%2d: ctx create FAILED\n", thr);
+      out("  thr=%2d: ctx create FAILED\n", thr);
       continue;
     }
     // warmup (graph build, memory alloc, etc.); ctx decode is the
@@ -270,21 +304,21 @@ int main(int argc, char **argv) {
     }
     double avg = sum / kNTrials;
     results.push_back({thr, avg});
-    printf("  thr=%2d: %6.1f ms/pass\n", thr, avg);
-    fflush(stdout);
+    out("  thr=%2d: %6.1f ms/pass\n", thr, avg);
     llama_free(ctx);
   }
 
-  fflush(stdout);
-  printf("\n== summary ==\n");
-  printf("NOTE: run while the system is idle - heavy background load (builds,\n");
-  printf("      downloads, games) flattens the curve.\n");
-  printf("Pick the thread count with the best latency/thread trade-off and set it\n");
-  printf("in your schema: llm_rerank.cpu_cores = N, then re-deploy. The code\n");
-  printf("default is 5 if the option is left unset.\n");
+  out("\n== summary ==\n");
+  out("NOTE: run while the system is idle - heavy background load (builds,\n");
+  out("      downloads, games) flattens the curve.\n");
+  out("Pick the thread count with the best latency/thread trade-off and set it\n");
+  out("in your schema: llm_rerank.cpu_cores = N, then re-deploy. The code\n");
+  out("default is 5 if the option is left unset.\n");
 
   llama_model_free(g_model);
   llama_backend_free();
+  if (g_out)
+    fclose(g_out);
   wait_exit();
   return 0;
 }
