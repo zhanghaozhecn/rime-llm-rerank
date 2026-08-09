@@ -20,13 +20,15 @@ rime-llm-rerank\
 │   ├── rime_llm.dll           #   预编译 CPU 插件
 │   ├── rime_llm_cuda.dll      #   预编译 GPU 插件（可选）
 │   └── *.dll                  #   llama.cpp + CUDA 依赖 DLL
+├── bin\                       # 预编译工具
+│   └── bench_threads.exe      #   线程数测定（本机实测，输出建议值）
 ├── cpp\                       # 源码
 │   ├── rime_llm.cpp           #   CPU 插件
 │   ├── rime_llm_cuda.cpp      #   GPU 插件
 │   ├── test_core.cpp          #   回归测试
 │   ├── bench_sweep2.cpp       #   准确率扫参
-│   ├── bench_thr.cpp          #   线程数扫参
 │   ├── bench_single_char.cpp  #   单字首选率评测
+│   ├── bench_threads.cpp      #   线程数测定工具源码（build_bench_threads.bat 编译）
 │   ├── CMakeLists.txt         #   CMake 配置
 │   └── lua/                   #   Lua 5.4 嵌入 (59个源文件)
 └── README.md
@@ -204,18 +206,12 @@ llm_rerank:
 
 ### 线程数优化（可选）
 
-`cpp/bench_threads.cpp` 在**本机实测**推理性能，给出针对这台设备的线程数建议（评估负载 = 10-token 上文 + 3×2-token + 2×3-token 候选，S1 预解码排除，只计真实按键延迟 S2+S3）。
-
-**编译**（需本机已构建 llama.cpp，参考开发者说明）：
-
-```
-build_bench_threads.bat      # 产出 bench_threads.exe（VS Build Tools 环境）
-```
+`bin/bench_threads.exe`（预编译，与源码版同款工具）在**本机实测**推理性能，给出针对这台设备的线程数建议（评估负载 = 10-token 上文 + 3×2-token + 2×3-token 候选，S1 预解码排除，只计真实按键延迟 S2+S3）。
 
 **运行**：
 
 ```
-bench_threads.exe [--apply] [模型路径]
+bin/bench_threads.exe [模型路径]
 ```
 
 1. **建议在系统空闲时运行**（有编译/下载/游戏在跑会压平曲线、建议值失真）
@@ -229,12 +225,10 @@ bench_threads.exe [--apply] [模型路径]
    ```
    - `optimal`：该设备理论最快的线程数（全速档）
    - `suggested default`：达到最优 90% 性能的**最小**线程数（推荐日常使用）
-3. 两种方式采纳建议：
-   - **自动**：加 `--apply` 参数运行，自动改写 RIME 用户目录里含 `llm_rerank` 节的 schema（`cpu_cores` 行）
-   - **手动**：把 `suggested default` 填入方案 schema 的 `llm_rerank.cpu_cores`
+3. 把 `suggested default` 的数字**手动填入**方案 schema 的 `llm_rerank.cpu_cores`
 4. 托盘右键 → 重新部署 → 生效
 
-`auto_adapt`（默认开启）运行时兜底：系统负载 >85% 自动切到 4 线程让路，<60% 恢复。不跑本工具也可用默认值。
+`auto_adapt`（默认开启）运行时兜底：系统负载 >85% 自动切到 4 线程让路，<60% 恢复。不跑本工具也可用默认值。自行编译源码：`cpp/build_bench_threads.bat`（需本机 llama.cpp 构建）。
 
 ---
 
