@@ -27,11 +27,13 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <fstream>
 
 static const char *kDefaultModel = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static const int kCtxTokens = 10;   // typical TSF caret context
 static const int kNCands = 5;       // max_candidates default
-static const int kNTrials = 15;     // timing trials per thread count
+static const int kNTrials = 25;     // timing trials per thread count (~1 min total
+                                    // with the 80ms inter-trial pause, averaged)
 
 static llama_model *g_model;
 static const llama_vocab *g_vocab;
@@ -108,8 +110,56 @@ static int logical_cores() {
   return (int)si.dwNumberOfProcessors;
 }
 
+static bool g_apply = false;
+
+// Locate the user schema(s) containing an llm_rerank section and rewrite
+// the cpu_cores line to the measured optimum. Returns number of files
+// patched.
+static int apply_config(int best_thr) {
+  const char *env = getenv("APPDATA");
+  std::string base = env ? std::string(env) + "/Rime"
+                         : "C:/Users/Administrator/AppData/Roaming/Rime";
+  int patched = 0;
+  WIN32_FIND_DATAA fd;
+  std::string pattern = base + "/*.schema.yaml";
+  HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE)
+    return 0;
+  do {
+    std::string path = base + "/" + fd.cFileName;
+    std::ifstream in(path);
+    std::string text((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    in.close();
+    if (text.find("llm_rerank") == std::string::npos)
+      continue;
+    size_t pos = text.find("cpu_cores");
+    if (pos == std::string::npos)
+      continue;
+    size_t colon = text.find(':', pos);
+    size_t eol = text.find('\n', colon);
+    if (colon == std::string::npos || eol == std::string::npos)
+      continue;
+    text = text.substr(0, colon + 1) + " " + std::to_string(best_thr) +
+           text.substr(eol);
+    std::ofstream out(path, std::ios::trunc);
+    out << text;
+    out.close();
+    printf("  + updated: %s (cpu_cores: %d)\n", fd.cFileName, best_thr);
+    patched++;
+  } while (FindNextFileA(h, &fd) != 0);
+  FindClose(h);
+  return patched;
+}
+
 int main(int argc, char **argv) {
-  const char *model_path = argc > 1 ? argv[1] : kDefaultModel;
+  const char *model_path = kDefaultModel;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--apply") == 0)
+      g_apply = true;
+    else if (argv[i][0] != '-')
+      model_path = argv[i];
+  }
   printf("== bench_threads: find optimal thread count ==\n");
   printf("model: %s\n", model_path);
   printf("logical cores: %d\n", logical_cores());
@@ -166,17 +216,21 @@ int main(int argc, char **argv) {
     score_once(ctx, ctx_ids, cands, vs);
     score_once(ctx, ctx_ids, cands, vs);
 
-    double best = 1e18;
+    // interleaved repeated trials, averaged (pause between trials to
+    // break cache-warmth effects; total budget ~1 min for all counts)
+    double sum = 0;
     for (int t = 0; t < kNTrials; t++) {
       LARGE_INTEGER t0, t1;
       QueryPerformanceCounter(&t0);
       score_once(ctx, ctx_ids, cands, vs);
       QueryPerformanceCounter(&t1);
       double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
-      best = std::min(best, ms);
+      sum += ms;
+      Sleep(80);  // inter-trial pause
     }
-    results.push_back({thr, best});
-    printf("  thr=%2d: %6.1f ms/pass\n", thr, best);
+    double avg = sum / kNTrials;
+    results.push_back({thr, avg});
+    printf("  thr=%2d: %6.1f ms/pass\n", thr, avg);
     llama_free(ctx);
   }
 
@@ -188,11 +242,35 @@ int main(int argc, char **argv) {
       best_thr = r.thr;
     }
 
+  // suggested default: the SMALLEST thread count whose latency is within
+  // 90% of the optimum (latency <= best_ms / 0.90). Fewer threads for
+  // nearly the same speed; the user types this into the config.
+  int sug_thr = results[0].thr;
+  double sug_ms = results[0].ms;
+  for (auto &r : results) {
+    if (r.ms <= best_ms / 0.90) {
+      sug_thr = r.thr;
+      sug_ms = r.ms;
+      break;
+    }
+  }
+
   printf("\n== result ==\n");
+  printf("NOTE: run while the system is idle - heavy background load (builds,\n");
+  printf("      downloads, games) flattens the curve and skews the suggestion.\n");
   printf("optimal thread count: %d (%.1f ms/pass)\n", best_thr, best_ms);
+  printf("suggested default (90%%): %d (%.1f ms/pass)\n", sug_thr, sug_ms);
   printf("config suggestion:\n");
   printf("  llm_rerank:\n");
-  printf("    cpu_cores: %d\n", best_thr);
+  printf("    cpu_cores: %d\n", sug_thr);
+  if (g_apply) {
+    int n = apply_config(sug_thr);
+    if (n > 0) {
+      printf("applied to %d schema file(s). Restart the input method (re-deploy) to take effect.\n", n);
+    } else {
+      printf("no schema with llm_rerank section found under %%APPDATA%%/Rime - patch manually.\n");
+    }
+  }
 
   llama_model_free(g_model);
   llama_backend_free();
