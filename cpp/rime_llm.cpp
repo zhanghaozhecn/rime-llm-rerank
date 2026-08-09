@@ -218,18 +218,20 @@ static void thread_scan(llama_context * ctx) {
         llama_set_n_threads(ctx, sweep[i], sweep[i]);
         scan_ctx_once(ctx, ctx_ids);  // S1 不计时 (prepare 吸收)
         scan_cand_once(ctx, cands, ctx_len, vs);  // warmup (graph build)
-        double best = 1e18;
-        for (int k = 0; k < 3; k++) {
+        // 平均口径 (与 bench_threads.exe 一致): 5 次取均值
+        double sum = 0;
+        for (int k = 0; k < 5; k++) {
             LARGE_INTEGER t0, t1;
             scan_ctx_once(ctx, ctx_ids);  // S1: 计时窗外
             QueryPerformanceCounter(&t0);
             scan_cand_once(ctx, cands, ctx_len, vs);  // S2+S3: 计时
             QueryPerformanceCounter(&t1);
             double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
-            if (ms < best) best = ms;
+            sum += ms;
         }
-        ms_of[i] = best;
-        if (best < best_ms) { best_ms = best; best_t = sweep[i]; }
+        double avg = sum / 5.0;
+        ms_of[i] = avg;
+        if (avg < best_ms) { best_ms = avg; best_t = sweep[i]; }
     }
     int max_t = sweep[0];
     for (size_t i = 0; i < sweep.size(); i++)
