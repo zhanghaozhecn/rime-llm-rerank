@@ -54,7 +54,7 @@ static void out(const char *fmt, ...) {
 static const char *kDefaultModel = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static const int kCtxTokens = 10;   // typical TSF caret context
 static const int kNCands = 5;       // max_candidates default
-static const int kNTrials = 25;     // timing trials per thread count; median +
+static const int kNTrials = 99;     // timing trials per thread count; median +
                                     // mid-50% range reported (robust to noise)
 
 static llama_model *g_model;
@@ -284,7 +284,7 @@ int main(int argc, char **argv) {
 
     // interleaved repeated trials; median + mid-50% (25-75th percentile)
     // range are robust to background noise even when the system looks idle
-    // (pause between trials to break cache-warmth effects; ~1 min total)
+    // (pause between trials to break cache-warmth effects; ~2.5 min total)
     std::vector<double> samples;
     int ctx_len = (int)ctx_ids.size();
     for (int t = 0; t < kNTrials; t++) {
