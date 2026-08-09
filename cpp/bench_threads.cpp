@@ -147,7 +147,17 @@ static void wait_exit() {
   }
 }
 
+// Suppress llama.cpp verbose logs (model dump, graph_reserve, KV copy spam)
+// that flood the console and bury the per-thread results; keep errors only.
+// NOTE: this ggml version: NONE=0 DEBUG=1 INFO=2 WARN=3 ERROR=4 CONT=5.
+static void quiet_log(enum ggml_log_level level, const char *text,
+                      void *user_data) {
+  if (level >= GGML_LOG_LEVEL_ERROR)  // ERROR + CONT continuation
+    fputs(text, stderr);
+}
+
 int main(int argc, char **argv) {
+  llama_log_set(quiet_log, nullptr);  // must be called before backend init
   const char *model_path = kDefaultModel;
   if (argc > 1 && argv[1][0] != '-')
     model_path = argv[1];
