@@ -86,180 +86,6 @@ static void log_msg(const char * fmt, ...) {
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
 }
 
-// ── 负载自适应线程数 (简化两档) ──────────────────────
-// llama_set_n_threads 下次 decode 即时生效, 无需重建 context:
-//   高档 g_max_threads: 启动时一次扫描决定 (复用已加载 context,
-//     扫 {4,6,..,16} 取性能 >= 最优 95% 的最小线程数, 加载线程内 ~3s)
-//   低档 4: 固定下限。系统重负载 (busy>85%) 直接切到 4;
-//     busy<60% 恢复高档。
-//   采样线程: 每 2.5s GetSystemTimes 差量算 CPU 占用; 10s 节流防抖。
-static bool          g_auto_adapt = true;
-static double        g_cpu_busy = 0.0;
-static int           g_cur_threads = 0;
-static int           g_max_threads = 0;  // 95% 档, thread_scan 决定
-static long long     g_last_adapt_ms = 0;
-
-static std::vector<llama_token> tokenize(const char * text);   // fwd
-static double cross_entropy(float * logits, int vs, int target_id);  // fwd
-
-static void sampler_loop() {
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-        FILETIME idle0, kern0, user0, idle1, kern1, user1;
-        if (!GetSystemTimes(&idle0, &kern0, &user0)) continue;
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        if (!GetSystemTimes(&idle1, &kern1, &user1)) continue;
-        auto sub = [](ULONGLONG a, ULONGLONG b) { return a > b ? a - b : 0ULL; };
-        ULONGLONG idl = sub((((ULONGLONG)idle1.dwHighDateTime) << 32) | idle1.dwLowDateTime,
-                            (((ULONGLONG)idle0.dwHighDateTime) << 32) | idle0.dwLowDateTime);
-        ULONGLONG ker = sub((((ULONGLONG)kern1.dwHighDateTime) << 32) | kern1.dwLowDateTime,
-                            (((ULONGLONG)kern0.dwHighDateTime) << 32) | kern0.dwLowDateTime);
-        ULONGLONG usr = sub((((ULONGLONG)user1.dwHighDateTime) << 32) | user1.dwLowDateTime,
-                            (((ULONGLONG)user0.dwHighDateTime) << 32) | user0.dwLowDateTime);
-        ULONGLONG total = ker + usr;
-        if (total > 0)
-            g_cpu_busy = (double)(total - idl) / (double)total;
-    }
-}
-
-// 打分形状的微基准 (与 bench_threads.exe 相同): ctx decode + 并行候选 decode + CE
-// S1 (ctx decode) 被生产环境 prepare 预计算吸收, 不计时;
-// 扫描只计 S2+S3 (真实按键感知延迟)
-static void scan_ctx_once(llama_context * ctx,
-                          const std::vector<llama_token> & ctx_ids) {
-    int ctx_len = (int)ctx_ids.size();
-    llama_memory_clear(llama_get_memory(ctx), false);
-    llama_batch b1 = llama_batch_init(ctx_len, 0, 1);
-    for (int j = 0; j < ctx_len; j++) {
-        b1.token[j] = ctx_ids[j]; b1.pos[j] = j;
-        b1.n_seq_id[j] = 1; b1.seq_id[j][0] = 0;
-    }
-    b1.logits[ctx_len - 1] = 1; b1.n_tokens = ctx_len;
-    llama_decode(ctx, b1);
-    llama_batch_free(b1);
-}
-
-static void scan_cand_once(llama_context * ctx,
-                           const std::vector<std::vector<llama_token>> & cands,
-                           int ctx_len, int vs) {
-    int n = (int)cands.size();
-    for (int s = 0; s < n; s++)
-        llama_memory_seq_cp(llama_get_memory(ctx), 0, s + 1, 0, -1);
-    llama_batch b2 = llama_batch_init(n, 0, n);
-    for (int s = 0; s < n; s++) {
-        b2.token[s] = cands[s][0]; b2.pos[s] = ctx_len;
-        b2.n_seq_id[s] = 1; b2.seq_id[s][0] = s + 1; b2.logits[s] = 1;
-    }
-    b2.n_tokens = n;
-    if (llama_decode(ctx, b2) == 0) {
-        for (int s = 0; s < n; s++) {
-            float * l = llama_get_logits_ith(ctx, s);
-            if (l) cross_entropy(l, vs, cands[s][1]);
-        }
-    }
-    llama_batch_free(b2);
-    // S3: 3-token 候选继续 decode
-    std::vector<int> idx3;
-    for (int s = 0; s < n; s++)
-        if ((int)cands[s].size() >= 3)
-            idx3.push_back(s);
-    if (!idx3.empty()) {
-        llama_batch b3 = llama_batch_init((int)idx3.size(), 0, (int)idx3.size());
-        for (size_t k = 0; k < idx3.size(); k++) {
-            int s = idx3[k];
-            b3.token[k] = cands[s][1]; b3.pos[k] = ctx_len + 1;
-            b3.n_seq_id[k] = 1; b3.seq_id[k][0] = s + 1; b3.logits[k] = 1;
-        }
-        b3.n_tokens = (int)idx3.size();
-        if (llama_decode(ctx, b3) == 0) {
-            for (size_t k = 0; k < idx3.size(); k++) {
-                float * l = llama_get_logits_ith(ctx, (int)k);
-                if (l) cross_entropy(l, vs, cands[idx3[k]][2]);
-            }
-        }
-        llama_batch_free(b3);
-    }
-}
-
-// 模型加载后运行一次 (加载线程内, g_loaded 前): 扫 {4,6,..,16},
-// g_max_threads = 性能达到最优 95% 的最小线程数; 失败回退配置值。
-static void thread_scan(llama_context * ctx) {
-    g_max_threads = g_n_threads;  // 配置兜底
-    if (!ctx) return;
-    SYSTEM_INFO si; GetSystemInfo(&si);
-    int cores = (int)si.dwNumberOfProcessors;
-    std::vector<int> sweep;
-    for (int t = 4; t <= cores && t <= 16; t += 2) sweep.push_back(t);
-    if (sweep.empty()) return;
-    const char * ctx_text = "今天天气不错我们去公园散步聊聊天然后回家吃晚饭";
-    std::vector<llama_token> ctx_ids = tokenize(ctx_text);
-    if ((int)ctx_ids.size() > 10) ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - 10);
-    // 最大推理量: 3 x 2-token + 2 x 3-token 候选 (触发 S3 decode)
-    // 常用词是单 token, 从生僻词池中选取并运行时验证 token 数 (2/3)
-    const char * cand_pool[] = {
-        "错事", "侧式", "测速", "仄声", "佚名", "怅惘", "缱绻", "龌龊",
-        "邂逅", "蹉跎", "饕餮", "犄角", "旮旯", "囫囵", "氤氲", "黢黑",
-        "计算机", "图书馆", "摄像头", "咖啡机", "高跟鞋", "潜台词", "老字号",
-        "双刃剑", "里程碑", "橄榄枝", "绊脚石", "遮羞布", "紧箍咒", "试金石"};
-    std::vector<std::vector<llama_token>> cands;
-    int got2 = 0, got3 = 0;
-    for (auto * w : cand_pool) {
-        auto ids = tokenize(w);
-        if (ids.size() == 2 && got2 < 3) { cands.push_back(ids); got2++; }
-        else if (ids.size() == 3 && got3 < 2) { cands.push_back(ids); got3++; }
-    }
-    if (cands.size() < 5) return;  // 池失败, 保持配置兑底
-    int vs = llama_n_vocab(g_vocab);
-    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
-    double best_ms = 1e18; int best_t = sweep[0];
-    std::vector<double> ms_of(sweep.size());
-    int ctx_len = (int)ctx_ids.size();
-    for (size_t i = 0; i < sweep.size(); i++) {
-        llama_set_n_threads(ctx, sweep[i], sweep[i]);
-        scan_ctx_once(ctx, ctx_ids);  // S1 不计时 (prepare 吸收)
-        scan_cand_once(ctx, cands, ctx_len, vs);  // warmup (graph build)
-        // 平均口径 (与 bench_threads.exe 一致): 5 次取均值
-        double sum = 0;
-        for (int k = 0; k < 5; k++) {
-            LARGE_INTEGER t0, t1;
-            scan_ctx_once(ctx, ctx_ids);  // S1: 计时窗外
-            QueryPerformanceCounter(&t0);
-            scan_cand_once(ctx, cands, ctx_len, vs);  // S2+S3: 计时
-            QueryPerformanceCounter(&t1);
-            double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
-            sum += ms;
-        }
-        double avg = sum / 5.0;
-        ms_of[i] = avg;
-        if (avg < best_ms) { best_ms = avg; best_t = sweep[i]; }
-    }
-    int max_t = sweep[0];
-    for (size_t i = 0; i < sweep.size(); i++)
-        if (ms_of[i] <= best_ms / 0.90) { max_t = sweep[i]; break; }
-    g_max_threads = max_t;
-    llama_set_n_threads(ctx, g_max_threads, g_max_threads);
-    log_msg("scan: opt thr=%d (%.0fms) 90%%tier thr=%d", best_t, best_ms, g_max_threads);
-}
-
-static void adapt_threads(llama_context * ctx) {
-    if (!g_auto_adapt || !ctx) return;
-    long long now = (long long)GetTickCount64();
-    if (now - g_last_adapt_ms < 10000) return;  // 10s 内最多变一次
-    double busy = g_cpu_busy;
-    int high = g_max_threads > 0 ? g_max_threads : g_n_threads;
-    int cur = g_cur_threads;
-    int target = cur;
-    if (busy > 0.85 && cur != 4)
-        target = 4;               // 系统重负载: 切到下限
-    else if (busy < 0.60 && cur != high)
-        target = high;            // 系统空闲: 恢复 95% 档
-    if (target != cur) {
-        llama_set_n_threads(ctx, target, target);
-        g_cur_threads = target;
-        g_last_adapt_ms = now;
-        log_msg("adapt: cpu=%.0f%% threads %d->%d", busy * 100.0, cur, target);
-    }
-}
 
 // ============================================================
 // 异步模型加载
@@ -315,15 +141,9 @@ static void load_model_async() {
             }
         }
 
-        if (g_auto_adapt)
-            thread_scan(g_ctx);  // ~3s: 决定 95% 高档
-        g_cur_threads = g_max_threads > 0 ? g_max_threads : g_n_threads;
         g_loaded.store(true);
         g_loading.store(false);
-        if (g_auto_adapt)
-            std::thread(sampler_loop).detach();
-        log_msg("model ready (n_ctx=%d threads=%d auto_adapt=%d)",
-                g_n_ctx, g_cur_threads, g_auto_adapt ? 1 : 0);
+        log_msg("model ready (n_ctx=%d threads=%d)", g_n_ctx, n_thr);
     }).detach();
 }
 
@@ -392,8 +212,6 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     auto t1 = std::chrono::high_resolution_clock::now();
     double wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // 负载自适应线程数 (读缓存, 10s 节流)
-    adapt_threads(g_ctx);
 
     int ctx_len = (int)ctx_ids.size();
     int vs = llama_n_vocab(g_vocab);
@@ -745,7 +563,6 @@ static int lua_newindex(lua_State * L) {
     else if (strcmp(key, "max_ctx") == 0)    g_max_ctx_tokens = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "min_tokens") == 0) g_min_tokens = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_threads") == 0)  g_n_threads = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "auto_adapt") == 0) g_auto_adapt = lua_toboolean(L, 3) != 0;
     else if (strcmp(key, "n_ctx") == 0)      g_n_ctx = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_seq_max") == 0)  g_n_seq_max = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "log_dir") == 0)    g_log_dir = luaL_checkstring(L, 3);  // RIME 用户目录
