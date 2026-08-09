@@ -197,10 +197,44 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |
-| `cpu_cores` | auto | CPU 线程数。不设置=7（实测多台饱和）：`max(4, ceil(总线程数/3))`，如 20 线程→7。**设备实测（一键）**：编译运行 `cpp/bench_threads.cpp`（`build_bench_threads.bat`，需本机 llama.cpp 构建）→ `bench_threads.exe --apply` 自动扫描 1..逻辑核数并**写入 schema 的 cpu_cores** |
-| `auto_adapt` | true | 运行时按系统 CPU 负载动态调线程数：`llama_set_n_threads` 即时生效（>85% 减半让路，<60% 恢复最优，10s 节流防抖）。重负载场景（编译/下载/游戏）自动让出 CPU |
+| `cpu_cores` | auto | CPU 线程数。不设置=6（默认）：`max(4, ceil(总线程数/3))`，如 20 线程→6。**设备实测（一键）**：编译运行 `cpp/bench_threads.cpp`（`build_bench_threads.bat`，需本机 llama.cpp 构建）→ `bench_threads.exe --apply` 自动扫描并**写入 schema 的 cpu_cores** |
+| `auto_adapt` | true | 运行时按系统 CPU 负载动态调线程数：`llama_set_n_threads` 即时生效（>85% 切到 4 让路，<60% 恢复默认，10s 节流防抖）。重负载场景（编译/下载/游戏）自动让出 CPU |
 | `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
 | `backend` | cpu | `cpu` 或 `gpu`，需对应 DLL 已部署到小狼毫目录 |
+
+### 线程数优化（可选）
+
+`cpp/bench_threads.cpp` 在**本机实测**推理性能，给出针对这台设备的线程数建议（评估负载 = 10-token 上文 + 3×2-token + 2×3-token 候选，S1 预解码排除，只计真实按键延迟 S2+S3）。
+
+**编译**（需本机已构建 llama.cpp，参考开发者说明）：
+
+```
+build_bench_threads.bat      # 产出 bench_threads.exe（VS Build Tools 环境）
+```
+
+**运行**：
+
+```
+bench_threads.exe [--apply] [模型路径]
+```
+
+1. **建议在系统空闲时运行**（有编译/下载/游戏在跑会压平曲线、建议值失真）
+2. 约 1 分钟后输出：
+   ```
+   optimal thread count: 12 (54 ms/pass)
+   suggested default (90%): 6 (57 ms/pass)
+   config suggestion:
+     llm_rerank:
+       cpu_cores: 6
+   ```
+   - `optimal`：该设备理论最快的线程数（全速档）
+   - `suggested default`：达到最优 90% 性能的**最小**线程数（推荐日常使用）
+3. 两种方式采纳建议：
+   - **自动**：加 `--apply` 参数运行，自动改写 RIME 用户目录里含 `llm_rerank` 节的 schema（`cpu_cores` 行）
+   - **手动**：把 `suggested default` 填入方案 schema 的 `llm_rerank.cpu_cores`
+4. 托盘右键 → 重新部署 → 生效
+
+`auto_adapt`（默认开启）运行时兜底：系统负载 >85% 自动切到 4 线程让路，<60% 恢复。不跑本工具也可用默认值。
 
 ---
 
