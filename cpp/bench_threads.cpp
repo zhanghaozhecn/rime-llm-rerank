@@ -1,11 +1,11 @@
 /*
- * bench_threads.cpp — find the optimal llama.cpp thread count for THIS
- * device, so the user can set llm_rerank.cpu_cores accordingly.
+ * bench_threads.cpp — measure llama.cpp inference latency per thread count
+ * for THIS device, so the user can pick llm_rerank.cpu_cores.
  *
- * Scans 1..logical-core-count (capped at 16) and measures the production
+ * Scans 1..min(10, logical-core-count) and measures the production
  * score-batch workload: Step 1 ctx decode + KV copy + parallel candidate
  * decode + CE (same shape as llm_filter / rime_llm.dll scoring). Prints a
- * per-thread table and the recommended config line.
+ * per-thread latency table — no recommendation, the user picks a value.
  *
  * usage: bench_threads.exe [model_path]
  *   model_path default: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
@@ -137,8 +137,6 @@ static int logical_cores() {
   return (int)si.dwNumberOfProcessors;
 }
 
-static bool g_apply = false;
-
 // Keep the console window open when launched by double-click; skip the
 // wait when stdin is piped/redirected (automation).
 static void wait_exit() {
@@ -149,55 +147,11 @@ static void wait_exit() {
   }
 }
 
-// Locate the user schema(s) containing an llm_rerank section and rewrite
-// the cpu_cores line to the measured optimum. Returns number of files
-// patched.
-static int apply_config(int best_thr) {
-  const char *env = getenv("APPDATA");
-  std::string base = env ? std::string(env) + "/Rime"
-                         : "C:/Users/Administrator/AppData/Roaming/Rime";
-  int patched = 0;
-  WIN32_FIND_DATAA fd;
-  std::string pattern = base + "/*.schema.yaml";
-  HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-  if (h == INVALID_HANDLE_VALUE)
-    return 0;
-  do {
-    std::string path = base + "/" + fd.cFileName;
-    std::ifstream in(path);
-    std::string text((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
-    in.close();
-    if (text.find("llm_rerank") == std::string::npos)
-      continue;
-    size_t pos = text.find("cpu_cores");
-    if (pos == std::string::npos)
-      continue;
-    size_t colon = text.find(':', pos);
-    size_t eol = text.find('\n', colon);
-    if (colon == std::string::npos || eol == std::string::npos)
-      continue;
-    text = text.substr(0, colon + 1) + " " + std::to_string(best_thr) +
-           text.substr(eol);
-    std::ofstream out(path, std::ios::trunc);
-    out << text;
-    out.close();
-    printf("  + updated: %s (cpu_cores: %d)\n", fd.cFileName, best_thr);
-    patched++;
-  } while (FindNextFileA(h, &fd) != 0);
-  FindClose(h);
-  return patched;
-}
-
 int main(int argc, char **argv) {
   const char *model_path = kDefaultModel;
-  for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--apply") == 0)
-      g_apply = true;
-    else if (argv[i][0] != '-')
-      model_path = argv[i];
-  }
-  printf("== bench_threads: find optimal thread count ==\n");
+  if (argc > 1 && argv[1][0] != '-')
+    model_path = argv[1];
+  printf("== bench_threads: per-thread latency ==\n");
   printf("model: %s\n", model_path);
   printf("logical cores: %d\n", logical_cores());
 
@@ -254,7 +208,7 @@ int main(int argc, char **argv) {
     printf(" %d", (int)c.size());
   printf(", incl. S3 decode)\n");
 
-  int max_thr = std::min(logical_cores(), 16);
+  int max_thr = std::min(logical_cores(), 10);
   struct Result {
     int thr;
     double ms;
@@ -302,43 +256,12 @@ int main(int argc, char **argv) {
     llama_free(ctx);
   }
 
-  int best_thr = results[0].thr;
-  double best_ms = results[0].ms;
-  for (auto &r : results)
-    if (r.ms < best_ms) {
-      best_ms = r.ms;
-      best_thr = r.thr;
-    }
-
-  // suggested default: the SMALLEST thread count whose latency is within
-  // 90% of the optimum (latency <= best_ms / 0.90). Fewer threads for
-  // nearly the same speed; the user types this into the config.
-  int sug_thr = results[0].thr;
-  double sug_ms = results[0].ms;
-  for (auto &r : results) {
-    if (r.ms <= best_ms / 0.90) {
-      sug_thr = r.thr;
-      sug_ms = r.ms;
-      break;
-    }
-  }
-
-  printf("\n== result ==\n");
+  printf("\n== summary ==\n");
   printf("NOTE: run while the system is idle - heavy background load (builds,\n");
-  printf("      downloads, games) flattens the curve and skews the suggestion.\n");
-  printf("optimal thread count: %d (%.1f ms/pass)\n", best_thr, best_ms);
-  printf("suggested default (90%%): %d (%.1f ms/pass)\n", sug_thr, sug_ms);
-  printf("config suggestion:\n");
-  printf("  llm_rerank:\n");
-  printf("    cpu_cores: %d\n", sug_thr);
-  if (g_apply) {
-    int n = apply_config(sug_thr);
-    if (n > 0) {
-      printf("applied to %d schema file(s). Restart the input method (re-deploy) to take effect.\n", n);
-    } else {
-      printf("no schema with llm_rerank section found under %%APPDATA%%/Rime - patch manually.\n");
-    }
-  }
+  printf("      downloads, games) flattens the curve.\n");
+  printf("Pick the thread count with the best latency/thread trade-off and set it\n");
+  printf("in your schema: llm_rerank.cpu_cores = N, then re-deploy. The code\n");
+  printf("default is 5 if the option is left unset.\n");
 
   llama_model_free(g_model);
   llama_backend_free();

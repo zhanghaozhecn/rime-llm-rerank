@@ -188,7 +188,7 @@ llm_rerank:
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 10       # 截取的上文 token 数（1-20），10 为性价比最优点
   max_candidates: 5    # 并行评分候选数（2-9），5 为延迟/准确率最佳平衡
-  # cpu_cores: 0      # 可选。CPU 线程数，不设置=7（实测多台饱和）（max(4,ceil(总线程/3))）
+  # cpu_cores: 0      # 可选。CPU 线程数，不设置=5（默认）。bench_threads.exe 实测后自行调整
   # model_path: ""     # 可选。模型路径，不设置=内置默认 Qwen3.5-0.8B Q4_K_M。换模型只需改此处
   backend: cpu         # "cpu" 或 "gpu"（需对应 DLL 已部署）
 ```
@@ -199,13 +199,13 @@ llm_rerank:
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |
-| `cpu_cores` | auto | CPU 线程数。不设置=6（默认）：`max(4, ceil(总线程数/3))`，如 20 线程→6。**设备实测（一键）**：运行 `bin/bench_threads.exe` 实测后把建议值填入此项（线程数固定，无运行时动态调整） |
+| `cpu_cores` | 5 | CPU 线程数。不设置=5（默认）。**设备实测**：运行 `bin/bench_threads.exe` 查看各线程数延迟表后自行填入（线程数固定，无运行时动态调整） |
 | `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
 | `backend` | cpu | `cpu` 或 `gpu`，需对应 DLL 已部署到小狼毫目录 |
 
-### 线程数优化（可选）
+### 线程数实测（可选）
 
-`bin/bench_threads.exe`（预编译，与源码版同款工具）在**本机实测**推理性能，给出针对这台设备的线程数建议（评估负载 = 10-token 上文 + 3×2-token + 2×3-token 候选，S1 预解码排除，只计真实按键延迟 S2+S3）。
+`bin/bench_threads.exe`（预编译，与源码版同款工具）在**本机实测**各线程数的推理延迟（评估负载 = 10-token 上文 + 3×2-token + 2×3-token 候选，S1 预解码排除，只计真实按键延迟 S2+S3）。
 
 **运行**：
 
@@ -213,21 +213,21 @@ llm_rerank:
 bin/bench_threads.exe [模型路径]
 ```
 
-1. **建议在系统空闲时运行**（有编译/下载/游戏在跑会压平曲线、建议值失真）
-2. 约 1 分钟后输出：
+1. **建议在系统空闲时运行**（有编译/下载/游戏在跑会压平曲线、延迟失真）
+2. 约 1 分钟后输出 1~10（或最大核数）各线程数延迟表：
    ```
-   optimal thread count: 12 (54 ms/pass)
-   suggested default (90%): 6 (57 ms/pass)
-   config suggestion:
-     llm_rerank:
-       cpu_cores: 6
+   == bench_threads: per-thread latency ==
+   ...
+     thr= 1:  95.2 ms/pass
+     thr= 2:  54.1 ms/pass
+     ...
+     thr= 6:  49.8 ms/pass
+     thr=10:  50.1 ms/pass
    ```
-   - `optimal`：该设备理论最快的线程数（全速档）
-   - `suggested default`：达到最优 90% 性能的**最小**线程数（推荐日常使用）
-3. 把 `suggested default` 的数字**手动填入**方案 schema 的 `llm_rerank.cpu_cores`
-4. 托盘右键 → 重新部署 → 生效
+   工具**不做推荐**——自行权衡"延迟 vs 线程占用"，把选定的数字填入方案 schema 的 `llm_rerank.cpu_cores`（通常选曲线拐点附近的最小线程数即可）
+3. 托盘右键 → 重新部署 → 生效
 
-不跑本工具也可用默认值 6（线程数固定，无运行时动态调整）。自行编译源码：`cpp/build_bench_threads.bat`（需本机 llama.cpp 构建）。
+不跑本工具也可用默认值 5（线程数固定，无运行时动态调整）。自行编译源码：`cpp/build_bench_threads.bat`（需本机 llama.cpp 构建）。
 
 ---
 
