@@ -151,9 +151,17 @@ int main(int argc, char **argv) {
   const char *model_path = kDefaultModel;
   if (argc > 1 && argv[1][0] != '-')
     model_path = argv[1];
+  int cores = logical_cores();
+  int max_thr = std::min(cores, 10);
   printf("== bench_threads: per-thread latency ==\n");
   printf("model: %s\n", model_path);
-  printf("logical cores: %d\n", logical_cores());
+  printf("logical cores: %d (scanning 1..%d)\n", cores, max_thr);
+  fflush(stdout);
+  if (max_thr < 1) {
+    fprintf(stderr, "ERROR: no logical processors detected (cores=%d)\n", cores);
+    wait_exit();
+    return 1;
+  }
 
   llama_backend_init();
   llama_model_params mp = llama_model_default_params();
@@ -207,8 +215,8 @@ int main(int argc, char **argv) {
   for (auto &c : cands)
     printf(" %d", (int)c.size());
   printf(", incl. S3 decode)\n");
+  fflush(stdout);
 
-  int max_thr = std::min(logical_cores(), 10);
   struct Result {
     int thr;
     double ms;
@@ -253,9 +261,11 @@ int main(int argc, char **argv) {
     double avg = sum / kNTrials;
     results.push_back({thr, avg});
     printf("  thr=%2d: %6.1f ms/pass\n", thr, avg);
+    fflush(stdout);
     llama_free(ctx);
   }
 
+  fflush(stdout);
   printf("\n== summary ==\n");
   printf("NOTE: run while the system is idle - heavy background load (builds,\n");
   printf("      downloads, games) flattens the curve.\n");
