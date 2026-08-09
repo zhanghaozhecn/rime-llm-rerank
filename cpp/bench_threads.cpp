@@ -28,6 +28,7 @@
 #include <vector>
 #include <algorithm>
 #include <fstream>
+#include <io.h>
 
 static const char *kDefaultModel = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
 static const int kCtxTokens = 10;   // typical TSF caret context
@@ -138,6 +139,16 @@ static int logical_cores() {
 
 static bool g_apply = false;
 
+// Keep the console window open when launched by double-click; skip the
+// wait when stdin is piped/redirected (automation).
+static void wait_exit() {
+  if (_isatty(_fileno(stdin))) {
+    printf("\nPress Enter to exit...\n");
+    fflush(stdout);
+    getchar();
+  }
+}
+
 // Locate the user schema(s) containing an llm_rerank section and rewrite
 // the cpu_cores line to the measured optimum. Returns number of files
 // patched.
@@ -195,7 +206,11 @@ int main(int argc, char **argv) {
   mp.use_mmap = 1;
   g_model = llama_model_load_from_file(model_path, mp);
   if (!g_model) {
-    fprintf(stderr, "model load failed\n");
+    // keep the console window open on double-click launch
+    fprintf(stderr, "model load failed: %s\n", model_path);
+    fprintf(stderr, "pass your model path as the first argument, e.g.:\n");
+    fprintf(stderr, "  bench_threads.exe d:/path/to/model.gguf\n");
+    wait_exit();
     return 1;
   }
   g_vocab = llama_model_get_vocab(g_model);
@@ -230,6 +245,7 @@ int main(int argc, char **argv) {
   if (cands.size() < 5) {
     fprintf(stderr, "ERROR: pool did not yield 3x2-token + 2x3-token "
                     "candidates (got %d)\n", (int)cands.size());
+    wait_exit();
     return 1;
   }
   printf("workload: ctx_tok=%d cand=%d (tokens:", (int)ctx_ids.size(),
@@ -326,5 +342,6 @@ int main(int argc, char **argv) {
 
   llama_model_free(g_model);
   llama_backend_free();
+  wait_exit();
   return 0;
 }
