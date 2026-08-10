@@ -362,3 +362,4 @@ GPU 待机 P8（210MHz/1.6W），推理时升到 P0（2250MHz/19W），转换耗
 # 许可证
 
 本项目采用[署名许可协议](./LICENSE)：可自由使用（含商业用途），**无需作者同意**；用于商业用途时须注明作者来源（zhanghaozhecn，仓库：https://github.com/zhanghaozhecn/rime-llm-rerank）。
+

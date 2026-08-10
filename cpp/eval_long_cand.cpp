@@ -383,8 +383,14 @@ int main(int argc, char **argv) {
   // Pass 2: full scoring on the 4+ samples only.
   // Extrapolation is computed in-memory for several lambdas (one scoring
   // pass; extrapolation is pure arithmetic on the 3 computed CEs).
-  const double kLambdas[] = {0.25, 0.5, 0.75, 1.0};
-  const int kNL = 4;
+  const double kLambdas[] = {0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7};
+  const int kNL = 7;
+  struct RatioStat {
+    long n = 0;
+    double sum = 0;
+    std::vector<double> vals;
+  };
+  RatioStat rs4, rs5;
   long lc_agree_trunc = 0, lc_full_first = 0, scored = 0;
   long lc_agree_ext[kNL] = {0};
   long lc_ext_overlong[kNL] = {0}, lc_ext_shortup[kNL] = {0};
@@ -407,6 +413,28 @@ int main(int argc, char **argv) {
     if (bt == bf)
       lc_agree_trunc++;
     auto is_long = [&](int i) { return (int)sp.cand_ids[i].size() > 3; };
+    // ideal-lambda statistics: real tail CE vs head CE, grouped by tail
+    // length (len=4 -> 1 tail token, len>=5 -> 2+ tail tokens). If the
+    // means differ, a per-length lambda beats the single 0.5.
+    for (int i = 0; i < sp.n; i++) {
+      int len = (int)sp.cand_ids[i].size();
+      if (len <= 3)
+        continue;
+      double head = ce_trunc[i] / 3.0;
+      double tail = (ce_full[i] - ce_trunc[i]) / (len - 3);
+      if (head <= 0 || tail < 0)
+        continue;
+      double ratio = tail / head;
+      if (len == 4) {
+        rs4.n++;
+        rs4.sum += ratio;
+        rs4.vals.push_back(ratio);
+      } else {
+        rs5.n++;
+        rs5.sum += ratio;
+        rs5.vals.push_back(ratio);
+      }
+    }
     if (bt != bf) {
       if (is_long(bt) && !is_long(bf))
         lc_trunc_overlong++;
@@ -449,6 +477,15 @@ int main(int argc, char **argv) {
              lc_ext_overlong[L], lc_ext_shortup[L]);
     }
     printf("  full first=1 rate: %.2f%%\n", 100.0 * lc_full_first / scored);
+    // ideal lambda = real tail CE / head CE (mean; robust median via sort)
+    for (auto *rs : {&rs4, &rs5}) {
+      if (rs->n == 0)
+        continue;
+      std::sort(rs->vals.begin(), rs->vals.end());
+      double med = rs->vals[rs->vals.size() / 2];
+      printf("  ideal-lam len=%s (n=%ld): mean=%.3f median=%.3f\n",
+             rs == &rs4 ? "4" : "5+", rs->n, rs->sum / rs->n, med);
+    }
     long trunc_diff = scored - lc_agree_trunc;
     if (trunc_diff > 0)
       printf("  trunc disagreement (n=%ld): long-up %ld (%.1f%%) long-down "
