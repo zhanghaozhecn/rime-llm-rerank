@@ -5,7 +5,7 @@ REM  Run on the target machine (double-click)
 REM  Auto-elevates to admin, then runs deploy_llm_plugin.ps1
 REM  Copies plugin DLLs to Rime install dir, lua to Rime user dir,
 REM  patches schema (idempotent), then you redeploy from tray.
-REM  Optional args: -Gpu  -ModelPath <path>  -InstallDir <path>
+REM  Optional args: -ModelPath <path>  -InstallDir <path>
 REM                 -SchemaName pdsp.schema.yaml  -Force
 REM ============================================
 

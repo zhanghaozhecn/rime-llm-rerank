@@ -17,14 +17,12 @@ rime-llm-rerank\
 ├── user\                      # 用户安装文件（复制到 RIME）
 │   ├── llm_filter.lua          #   候选重排 filter
 │   ├── llm_processor.lua       #   上屏文字收集 + 预解码 processor
-│   ├── rime_llm.dll           #   预编译 CPU 插件
-│   ├── rime_llm_cuda.dll      #   预编译 GPU 插件（可选）
-│   └── *.dll                  #   llama.cpp + CUDA 依赖 DLL
+│   ├── rime_llm.dll           #   预编译插件
+│   └── *.dll                  #   llama.cpp 依赖 DLL（CPU 版；GPU 版仅本地留存）
 ├── bin\                       # 预编译工具
 │   └── bench_threads.exe      #   线程数测定（本机实测，输出建议值）
 ├── cpp\                       # 源码
-│   ├── rime_llm.cpp           #   CPU 插件
-│   ├── rime_llm_cuda.cpp      #   GPU 插件
+│   ├── rime_llm.cpp           #   插件源码（GPU 版 rime_llm_cuda.cpp 仅本地留存）
 │   ├── test_core.cpp          #   回归测试
 │   ├── bench_sweep2.cpp       #   准确率扫参
 │   ├── bench_single_char.cpp  #   单字首选率评测
@@ -42,17 +40,16 @@ rime-llm-rerank\
 
 ### 延迟
 
-| 指标 | CPU (thr=7) | GPU (P0) |
-|------|:---:|:---:|
-| 延迟 (10tok/5cand) | **~43ms** | **~23ms** |
-| 其中 ctx decode (S1) | 0ms（预解码） | 0ms（预解码） |
-| 候选 decode (S2) | ~36ms | ~16ms |
-| 内存/VRAM | ~497MB | ~1.2GB |
-| 依赖 | 零 | NVIDIA GPU + CUDA 12 |
+| 指标 | CPU (thr=7) |
+|------|:---:|
+| 延迟 (10tok/5cand) | **~43ms** |
+| 其中 ctx decode (S1) | 0ms（预解码） |
+| 候选 decode (S2) | ~36ms |
+| 内存 | ~497MB |
+| 依赖 | 零（CPU 版；GPU 版仅本地留存，不发布） |
 
-> ⚠️ **延迟为相对值**，受 CPU/GPU 型号和线程数影响，不同机器差异显著。
+> ⚠️ **延迟为相对值**，受 CPU 型号和线程数影响，不同机器差异显著。
 > CPU 版经两台电脑测试7线程时延迟性能饱和。
-> GPU 版需在 NVIDIA 控制面板中将 `WeaselServer.exe` 设为「最高性能优先」，否则 P8→P0 降频导致延迟剧烈波动。
 
 ### 首选率（20000 样本，拼读双拼40万词）
 
@@ -121,7 +118,7 @@ Qwen3.5-2B Q4_K_M (1.3GB) vs 0.8B (508MB)，10tok/5cand：
 
 将 `deploy_llm_plugin.bat` + `deploy_llm_plugin.ps1` + `user\` 三件放到同一目录，复制到目标电脑，**双击 `deploy_llm_plugin.bat`**（自动请求管理员）：
 
-1. **程序文件夹**：复制插件 DLL（CPU：`rime_llm.dll` + `llama.dll` + `ggml*.dll`；GPU 加 `-Gpu` 参数：另含 `rime_llm_cuda.dll` + `ggml-cuda.dll` + CUDA 12.8 runtime 3 个）→ 小狼毫安装目录
+1. **程序文件夹**：复制插件 DLL（`rime_llm.dll` + `llama.dll` + `ggml*.dll`）→ 小狼毫安装目录
 2. **用户文件夹**：复制 `llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\`
 3. **schema 修改**（幂等，可重复运行）：方案 yaml（默认 `pdsp.schema.yaml`，其他方案用 `-SchemaName` 指定）：
    - `engine.processors` **最前**插入 `lua_processor@*llm_processor`（上屏历史收集 + 预解码触发）
@@ -131,7 +128,7 @@ Qwen3.5-2B Q4_K_M (1.3GB) vs 0.8B (508MB)，10tok/5cand：
 
 **冲突检测**：若安装目录的 `rime.dll` 是源码版 LLM 组件（含内置 llm_filter），脚本警告并中止——插件版需官方 rime.dll，源码版与插件版二选一（恢复官方：重装 weasel 0.17.4 官方包）。`-Force` 可跳过检测（风险自负）。
 
-可选参数：`-Gpu`（GPU 部署）、`-ModelPath <路径>`（模型在其他位置）、`-InstallDir`、`-SchemaName`、`-Force`。
+可选参数：`-ModelPath <路径>`（模型在其他位置）、`-InstallDir`、`-SchemaName`、`-Force`。
 
 ### 安装（三步）
 
@@ -151,25 +148,9 @@ Qwen3.5-2B Q4_K_M (1.3GB) vs 0.8B (508MB)，10tok/5cand：
 user\rime_llm.dll  →  C:\Program Files\Rime\weasel-0.17.4\
 ```
 
-**GPU（需 NVIDIA 显卡 + CUDA Toolkit 12.8，更快更稳定）：**
+> GPU 版（rime_llm_cuda）仅本地留存，不发布。
 
-1. 安装 [CUDA Toolkit 12.8](https://developer.nvidia.com/cuda-12-8-0-download-archive)
-2. 复制 `user\` 下所有 DLL 到小狼毫目录
-3. 从 CUDA Toolkit 安装目录（如 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\`）复制以下文件到小狼毫目录，CUDA 版本必须为 12.8，其他版本未经测试：
-   - `cudart64_12.dll`
-   - `cublas64_12.dll`
-   - `cublasLt64_12.dll`
-
-```
-user\rime_llm_cuda.dll  →  C:\Program Files\Rime\weasel-0.17.4\
-user\ggml*.dll          →  ...（llama.cpp 依赖）
-user\llama.dll          →  ...
-<CUDA>\bin\cudart64_12.dll   →  ...（CUDA runtime）
-<CUDA>\bin\cublas64_12.dll   →  ...（cuBLAS）
-<CUDA>\bin\cublasLt64_12.dll →  ...
-```
-
-**Q: 如何关闭？** 将 `rime_llm*.dll` 重命名为其他后缀（如 `.dll.bak`），重新部署即恢复字典序。LLM 插件仅占约 497 MB 内存（GPU 版约 1.2GB 显存），对现代电脑影响不大，建议常驻。
+**Q: 如何关闭？** 将 `rime_llm*.dll` 重命名为其他后缀（如 `.dll.bak`），重新部署即恢复字典序。LLM 插件仅占约 497 MB 内存，对现代电脑影响不大，建议常驻。
 
 #### 第三步：配置 RIME
 
@@ -206,7 +187,7 @@ llm_rerank:
   max_candidates: 5    # 并行评分候选数（2-9），5 为延迟/准确率最佳平衡
   # cpu_cores: 0      # 可选。CPU 线程数，不设置=4（默认=GGML 默认）。bench_threads.exe 实测后自行调整
   # model_path: ""     # 可选。模型路径，不设置=内置默认 Qwen3.5-0.8B Q4_K_M。换模型只需改此处
-  backend: cpu         # "cpu" 或 "gpu"（需对应 DLL 已部署）
+  backend: cpu         # "cpu" 或 "off"（off 不加载 DLL 不推理）
 ```
 
 | 参数 | 默认 | 说明 |
@@ -217,7 +198,7 @@ llm_rerank:
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |
 | `cpu_cores` | 4 | CPU 线程数。不设置=4（默认=GGML 默认，适用旧设备）。**设备实测**：运行 `bin/bench_threads.exe` 查看各线程数延迟表后自行填入（线程数固定，无运行时动态调整） |
 | `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
-| `backend` | cpu | `cpu` 或 `gpu`，需对应 DLL 已部署到小狼毫目录 |
+| `backend` | cpu | `cpu` 或 `off`（off 不加载 DLL 不推理） |
 
 ### 线程数实测（可选）
 
@@ -253,8 +234,8 @@ bin/bench_threads.exe [模型路径]
 
 打字时，上文在 commit 后即已确定，而候选需要等编码打完才知道。利用这个时间差：
 
-1. **commit 时**：异步执行 ctx decode + 缓存 logits（~50ms CPU / ~10ms GPU）
-2. **编码打完**：skip ctx decode，直接 KV copy + 候选 decode（~36ms CPU / ~16ms GPU）
+1. **commit 时**：异步执行 ctx decode + 缓存 logits（~50ms CPU）
+2. **编码打完**：skip ctx decode，直接 KV copy + 候选 decode（~36ms CPU）
 3. **感知延迟**：从「ctx+候选」降到「仅候选」，约减半
 
 **KV 代次与可重复命中**：prepare 完成后保存 `(ctx, logits, 代次)`；score 命中条件 = ctx 完全匹配且 seq0 未被其他 decode 覆盖（`g_seq0_gen == g_prep_gen`）。代次防止完整流程覆盖 seq0 后旧 logits 被误用（退格删词→重打同词的编辑流）。**完整流程 score 会自我刷新 prep 状态**——刚解码的 `(ctx, logits)` 代次同步写回，同 ctx 的翻页/候选窗重建全部命中，避免"一次未命中 → 代次永久失配 → 连锁全部重解码"（曾占 30% 的 score 请求）。
@@ -273,15 +254,7 @@ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B build_cpu
 ninja -C build_cpu rime_llm
 ```
 
-**GPU（需 CUDA 12.8 + llama.cpp CUDA build）：**
-
-```powershell
-# 先编译 llama.cpp CUDA 版: cmake -G Ninja -DGGML_CUDA=ON -S . -B build-cuda
-cd cpp
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B build_gpu ^
-  -DLLAMA_CUDA_ROOT="D:/llama.cpp-mirror/build-cuda"
-ninja -C build_gpu rime_llm_cuda
-```
+> GPU 版（rime_llm_cuda）源码与构建仅本地留存，不发布。
 
 编译得到的 DLL 需复制到小狼毫程序目录。部署前需先**退出小狼毫**（右键托盘图标 → 退出），复制 DLL 及其依赖，再重新启动。
 
@@ -352,22 +325,15 @@ static void score_batch(ctx_ids, cands, scores_out) {
 
 Qwen3.5 是 Attention + SSM 混合架构。Mamba 层的隐状态在 `llama_decode` 的多序列 batch 中会跨序列耦合——全量 ctx 多序列时，各序列的正确词 logits 被其他序列的 token 污染，准确率仅 71%。
 
-分层算法将每序列的增量限制为 1 个 token，SSM 干扰降至 ~0.5%，准确率恢复到 98.5%。不要试图在 GPU 扫参中做跨样本超大 batch——`bench_gpu2` 已证实 250+ seq 时准确率掉到 74%。
+分层算法将每序列的增量限制为 1 个 token，SSM 干扰降至 ~0.5%，准确率恢复到 98.5%。超大 batch（250+ seq）准确率掉到 74%（跨样本 batch 上限约束，`bench_gpu2` 实测）。
 
-### 4. GPU P0 锁频
+### 4. `llama_memory_clear` 的第二个参数
 
-GPU 待机 P8（210MHz/1.6W），推理时升到 P0（2250MHz/19W），转换耗时 50-200ms。打字间隔秒级时每次推理都触发升降频，延迟在 46-234ms 剧烈波动。**必须 NVIDIA 控制面板锁定 P0 或用 `nvidia-smi -lgc 2250`。** 锁定后延迟稳定 ~33ms（σ≈3ms）。
-
-### 5. `llama_memory_clear` 的第二个参数
-
-`true` = 零化整个 KV cache。生产 DLL 每击键一次无所谓，但 benchmark 做 40 万次 decode 时，归零操作会让 GPU 持续满载、笔记本散热崩溃。统一使用 `false`（仅重置元数据标记为"未使用"）。新序列的因果注意力掩码天然隔离旧数据，无需显式归零。
+`true` = 零化整个 KV cache。生产 DLL 每击键一次无所谓，但 benchmark 做 40 万次 decode 时零化会拖慢整体吞吐。统一使用 `false`（仅重置元数据标记为"未使用"）。新序列的因果注意力掩码天然隔离旧数据，无需显式归零。
 
 ### 6. 大规模扫参的稳定性
 
-`bench_sweep2`（20000 样本 × 20 tok × 9 cand）曾两次系统死机：
-- 第一次：3.2M 次独立 `layered_score` 调用 + `memory_clear(true)`，GPU 过载
-- 第二次：优化到 400K 次 decode + `false`，但未节流，笔记本 RTX 4060 连续 P0 超 1 小时触发过热保护
-- 最终方案：400K decode + `false` + 每 10 样本 `Sleep(100ms)` + 每 500 样本 checkpoint，稳定跑完 ~2 小时
+`bench_sweep2`（20000 样本 × 20 tok × 9 cand）曾两次系统死机。最终方案：400K decode + `memory_clear(false)` + 每 10 样本 `Sleep(100ms)` + 每 500 样本 checkpoint，稳定跑完 ~2 小时。
 
 ### 7. 语料采集：码分配时机
 

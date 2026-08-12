@@ -1,10 +1,9 @@
 # deploy_llm_plugin.ps1 — rime-llm-rerank 插件版一键部署
 # 用法（管理员，由 deploy_llm_plugin.bat 提权调用）：
-#   powershell -ExecutionPolicy Bypass -File deploy_llm_plugin.ps1 [-Gpu] [-ModelPath <路径>] [-InstallDir <路径>] [-SchemaName pdsp.schema.yaml] [-Force]
+#   powershell -ExecutionPolicy Bypass -File deploy_llm_plugin.ps1 [-ModelPath <路径>] [-InstallDir <路径>] [-SchemaName pdsp.schema.yaml] [-Force]
 #
 # 部署内容：
-#   1. 程序文件夹（小狼毫安装目录）: rime_llm.dll + llama.dll + ggml*.dll（CPU）
-#      GPU (-Gpu): + rime_llm_cuda.dll + ggml-cuda.dll + CUDA runtime 3 个
+#   1. 程序文件夹（小狼毫安装目录）: rime_llm.dll + llama.dll + ggml*.dll（CPU 版）
 #   2. 用户文件夹（%APPDATA%\Rime）:
 #      lua\llm_filter.lua + lua\llm_processor.lua
 #      <SchemaName> 插入 engine 组件（幂等，可重复运行）:
@@ -19,7 +18,6 @@
 # （rime.dll 含 llm_filter），脚本会警告并要求先恢复官方（见 RESTORE 提示）。
 
 param(
-  [switch]$Gpu,
   [string]$ModelPath = "",
   [string]$InstallDir = "",
   [string]$SchemaName = "pdsp.schema.yaml",
@@ -91,26 +89,14 @@ if (-not (Test-Path $ModelPath)) {
   if (-not $Force) { exit 3 }
 }
 
-# ── 3. 复制插件 DLL → 安装目录 ─────────────────────
+# ── 3. 复制插件 DLL → 安装目录（CPU 版；GPU 版仅本地留存，不发布） ──
 $dlls = @("rime_llm.dll", "llama.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll")
-if ($Gpu) {
-  $dlls += @("rime_llm_cuda.dll", "ggml-cuda.dll")
-}
 Write-Host ""; Write-Host "[1/4] 复制插件 DLL → 安装目录" -ForegroundColor Cyan
 foreach ($d in $dlls) {
   $s = Join-Path $SRC_USER $d
   if (-not (Test-Path $s)) { Write-Host "  [跳过] 缺失: $d" -ForegroundColor DarkGray; continue }
   Copy-Item $s $InstallDir -Force
   Write-Host "  + $d"
-}
-if ($Gpu) {
-  # CUDA runtime: 从 CUDA Toolkit 12.8 bin 复制
-  $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
-  foreach ($c in @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")) {
-    $s = Join-Path $cudaBin $c
-    if (Test-Path $s) { Copy-Item $s $InstallDir -Force; Write-Host "  + $c (CUDA)" }
-    else { Write-Host "  [跳过] CUDA 12.8 runtime 缺失: $c — 请确认已装 CUDA Toolkit 12.8" -ForegroundColor Yellow }
-  }
 }
 
 # ── 4. 复制 lua → RIME 用户目录 ────────────────────
@@ -174,7 +160,7 @@ if (-not $hasCfg) {
   $cfgLines = @(
     "",
     "llm_rerank:",
-    "  backend: cpu",          # "cpu" 或 "gpu"（需 -Gpu 部署对应 DLL）
+    "  backend: cpu",          # "cpu" 或 "off"（GPU 版仅本地留存，不发布）
     "  min_code_len: 4",       # 编码达到此长度才触发 LLM（四码方案=满码）
     "  # min_tokens: 1",       # 最少上文 token 才重排
     "  # max_tokens: 10",      # 上文 token 上限（10 为性价比最优点）
