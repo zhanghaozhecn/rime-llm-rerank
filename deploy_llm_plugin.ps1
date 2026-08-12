@@ -79,14 +79,36 @@ if ($src_build) {
   }
 }
 
-# ── 2. 模型检查 ────────────────────────────────────
+# ── 2. 模型检查 + 可选下载 ─────────────────────────
 if (-not $ModelPath) { $ModelPath = "d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf" }
-if (-not (Test-Path $ModelPath)) {
+if (Test-Path $ModelPath) {
+  $sz = (Get-Item $ModelPath).Length
+  Write-Host ("  模型已存在（{0:N0} MB）：{1}" -f ($sz / 1MB), $ModelPath) -ForegroundColor Green
+} else {
   Write-Host "[警告] 模型未找到: $ModelPath" -ForegroundColor Yellow
-  Write-Host "  请先下载 Qwen3.5-0.8B-Q4_K_M.gguf（约 500MB）:" -ForegroundColor Yellow
-  Write-Host "  https://www.modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/files"
-  Write-Host "  放到 d:\gguf_models\ 或下载后重新运行本脚本加参数: -ModelPath <完整路径>"
-  if (-not $Force) { exit 3 }
+  Write-Host "  LLM 重排需要 Qwen3.5-0.8B-Q4_K_M.gguf（约 500MB）"
+  $ans = "y"
+  if (-not $Force) {
+    $ans = Read-Host "  是否现在下载？[y/N]"
+  }
+  if ($ans -match '^[yY]') {
+    $url = "https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf"
+    $dir = Split-Path $ModelPath -Parent
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $tmp = $ModelPath + ".download"
+    Write-Host "  下载中（断点续传，可中断后重跑继续）: $url" -ForegroundColor Cyan
+    curl.exe -L -C - --progress-bar -o $tmp $url
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $tmp) -and (Get-Item $tmp).Length -gt 100MB) {
+      Move-Item $tmp $ModelPath -Force
+      Write-Host ("  下载完成: {0:N0} MB → {1}" -f ((Get-Item $ModelPath).Length / 1MB), $ModelPath) -ForegroundColor Green
+    } else {
+      Write-Host "  [错误] 下载失败（可重跑续传）。手动下载：" -ForegroundColor Red
+      Write-Host "  $url" -ForegroundColor Yellow
+      Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+  } else {
+    Write-Host "  跳过下载 — LLM 重排不可用（输入法照常）。稍后可手动下载后重跑本脚本" -ForegroundColor Yellow
+  }
 }
 
 # ── 3. 复制插件 DLL → 安装目录（CPU 版；GPU 版仅本地留存，不发布） ──
