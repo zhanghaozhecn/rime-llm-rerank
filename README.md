@@ -117,6 +117,22 @@ Qwen3.5-2B Q4_K_M (1.3GB) vs 0.8B (508MB)，10tok/5cand：
 
 单字只取"单编码字"（无简码、前 2 码唯一、有 3 码形码），消除多音字编码歧义后评测，首选率从89.8%提升至96.8%。
 
+### 一键部署（推荐）
+
+将 `deploy_llm_plugin.bat` + `deploy_llm_plugin.ps1` + `user\` 三件放到同一目录，复制到目标电脑，**双击 `deploy_llm_plugin.bat`**（自动请求管理员）：
+
+1. **程序文件夹**：复制插件 DLL（CPU：`rime_llm.dll` + `llama.dll` + `ggml*.dll`；GPU 加 `-Gpu` 参数：另含 `rime_llm_cuda.dll` + `ggml-cuda.dll` + CUDA 12.8 runtime 3 个）→ 小狼毫安装目录
+2. **用户文件夹**：复制 `llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\`
+3. **schema 修改**（幂等，可重复运行）：方案 yaml（默认 `pdsp.schema.yaml`，其他方案用 `-SchemaName` 指定）：
+   - `engine.processors` **最前**插入 `lua_processor@*llm_processor`（上屏历史收集 + 预解码触发）
+   - `engine.filters` 的 `uniquifier` **之后**插入 `lua_filter@*llm_filter`——必须在固顶词 filter（pin_fix_filter）**之前**：先 LLM 重排、再固顶词提升，否则固顶词会被 LLM 顶掉
+   - 顶层追加 `llm_rerank:` 配置节（`backend: cpu`，其余参数注释列出）
+4. **完成后**：托盘小狼毫图标 → 重新部署 → 生效（首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`）
+
+**冲突检测**：若安装目录的 `rime.dll` 是源码版 LLM 组件（含内置 llm_filter），脚本警告并中止——插件版需官方 rime.dll，源码版与插件版二选一（恢复官方：重装 weasel 0.17.4 官方包）。`-Force` 可跳过检测（风险自负）。
+
+可选参数：`-Gpu`（GPU 部署）、`-ModelPath <路径>`（模型在其他位置）、`-InstallDir`、`-SchemaName`、`-Force`。
+
 ### 安装（三步）
 
 #### 第一步：下载模型
