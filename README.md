@@ -123,7 +123,7 @@ Qwen3.5-2B Q4_K_M (1.3GB) vs 0.8B (508MB)，10tok/5cand：
 3. **schema 修改**（幂等，可重复运行）：方案 yaml（默认 `pdsp.schema.yaml`，其他方案用 `-SchemaName` 指定）：
    - `engine.processors` **最前**插入 `lua_processor@*llm_processor`（上屏历史收集 + 预解码触发）
    - `engine.filters` 的 `uniquifier` **之后**插入 `lua_filter@*llm_filter`——必须在固顶词 filter（pin_fix_filter）**之前**：先 LLM 重排、再固顶词提升，否则固顶词会被 LLM 顶掉
-   - 顶层追加 `llm_rerank:` 配置节（`backend: cpu`，其余参数注释列出）
+   - 顶层追加 `llm_rerank:` 配置节（`enabled: true`，其余参数注释列出）
 4. **完成后**：托盘小狼毫图标 → 重新部署 → 生效（首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`）
 
 **冲突检测**：若安装目录的 `rime.dll` 是源码版 LLM 组件（含内置 llm_filter），脚本警告并中止——插件版需官方 rime.dll，源码版与插件版二选一（恢复官方：重装 weasel 0.17.4 官方包）。`-Force` 可跳过检测（风险自负）。
@@ -187,18 +187,18 @@ llm_rerank:
   max_candidates: 5    # 并行评分候选数（2-9），5 为延迟/准确率最佳平衡
   # cpu_cores: 0      # 可选。CPU 线程数，不设置=4（默认=GGML 默认）。bench_threads.exe 实测后自行调整
   # model_path: ""     # 可选。模型路径，不设置=内置默认 Qwen3.5-0.8B Q4_K_M。换模型只需改此处
-  backend: cpu         # "cpu" 或 "off"（off 不加载 DLL 不推理）
+  enabled: true        # true=启用 LLM 重排 | false=关闭（不加载 DLL 不推理）
 ```
 
 | 参数 | 默认 | 说明 |
 |------|:---:|------|
+| `enabled` | false | `true` 启用 LLM 重排 / `false` 关闭（不加载 DLL，候选原样透传） |
 | `min_code_len` | 4 | 编码达到此长度才触发 LLM |
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |
 | `cpu_cores` | 4 | CPU 线程数。不设置=4（默认=GGML 默认，适用旧设备）。**设备实测**：运行 `bin/bench_threads.exe` 查看各线程数延迟表后自行填入（线程数固定，无运行时动态调整） |
 | `model_path` | (内置默认) | 模型路径。不设置=Lua/C++ 双重默认。换模型只需在 schema 中设置此项 |
-| `backend` | cpu | `cpu` 或 `off`（off 不加载 DLL 不推理） |
 
 ### 线程数实测（可选）
 
@@ -339,7 +339,7 @@ Qwen3.5 是 Attention + SSM 混合架构。Mamba 层的隐状态在 `llama_decod
 
 `llm_processor.lua` 中 `pending_code`（手动选词码）和 `last_full`（4 码顶屏码）在**输入变空的瞬间**捕获。但一次上屏事件可能包含多个条目（词+标点+空格），码只应分配给含中文的条目，纯英文/标点应跳过，否则"d, c, lua"等会拿到前一个中文词的码。单字 3 码截为前 2 码——第 3 码是形码，由字本身决定，对训练无额外信息。
 
-**真实候选窗快照（2026-08-02）**：`llm_filter.lua` 每次调用时（含 backend off/未评分路径）把 `(input, 前 max_candidates 候选)` 存入全局 `llm_last_window`；`llm_processor.lua` 上屏时用截断前完整码匹配窗口，训练语料行变为 `词\t码\t候选1,候选2,...`。`prep_training.py` 优先使用真实候选窗——位置/候选/总数取自用户实际看到的候选窗，编码用用户实际打的码；无快照时回退字典反推。此前从字典反推同码候选（字典序 vs 词频序）导致训练分布与真实使用不一致。
+**真实候选窗快照（2026-08-02）**：`llm_filter.lua` 每次调用时（含 enabled=false/未评分路径）把 `(input, 前 max_candidates 候选)` 存入全局 `llm_last_window`；`llm_processor.lua` 上屏时用截断前完整码匹配窗口，训练语料行变为 `词\t码\t候选1,候选2,...`。`prep_training.py` 优先使用真实候选窗——位置/候选/总数取自用户实际看到的候选窗，编码用用户实际打的码；无快照时回退字典反推。此前从字典反推同码候选（字典序 vs 词频序）导致训练分布与真实使用不一致。
 
 # 许可证
 

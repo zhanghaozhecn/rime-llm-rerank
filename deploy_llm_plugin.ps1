@@ -160,7 +160,7 @@ if (-not $hasCfg) {
   $cfgLines = @(
     "",
     "llm_rerank:",
-    "  backend: cpu",          # "cpu" 或 "off"（GPU 版仅本地留存，不发布）
+    "  enabled: true",         # true=启用 LLM 重排 | false=关闭（不加载 DLL 不推理）
     "  min_code_len: 4",       # 编码达到此长度才触发 LLM（四码方案=满码）
     "  # min_tokens: 1",       # 最少上文 token 才重排
     "  # max_tokens: 10",      # 上文 token 上限（10 为性价比最优点）
@@ -169,7 +169,7 @@ if (-not $hasCfg) {
     "  # model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"  # 模型路径（不设置=内置默认；换模型/路径取消注释并修改）
   )
   foreach ($cl in $cfgLines) { $out.Add($cl) }
-  Write-Host "  + llm_rerank: 配置节（backend: cpu）"; $changed = $true
+  Write-Host "  + llm_rerank: 配置节（enabled: true）"; $changed = $true
 }
 
 if ($changed) {
