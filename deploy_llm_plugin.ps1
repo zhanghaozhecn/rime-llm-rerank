@@ -120,11 +120,63 @@ $lines = [IO.File]::ReadAllLines($schema, [Text.Encoding]::UTF8)
 $changed = $false
 $out = New-Object System.Collections.Generic.List[string]
 
+# 冲突检测：源码版（原生 C++ llm_filter）组件存在 → 二选一，中止
+if (($lines | Where-Object { $_ -match '^\s+-\s+llm_filter(\s|$)' }).Count -gt 0) {
+  Write-Host "[ERROR] 检测到源码版组件（- llm_filter，C++ 编译进 rime.dll）——插件版与源码版二选一，" -ForegroundColor Red
+  Write-Host "  双重重排会导致行为混乱 + 双倍推理。请先从 schema 移除源码版行再运行。" -ForegroundColor Red
+  exit 5
+}
+
 # 5a. processors 最前插入 lua_processor@*llm_processor
 $hasProc = ($lines | Where-Object { $_ -match 'lua_processor@\*llm_processor' }).Count -gt 0
 # 5b. filters: uniquifier 后插入 lua_filter@*llm_filter
 $hasFilt = ($lines | Where-Object { $_ -match 'lua_filter@\*llm_filter' }).Count -gt 0
 $hasCfg  = ($lines | Where-Object { $_ -match '^llm_rerank:' }).Count -gt 0
+
+# 已存在时校验位置（processor 最前 / filter 在 uniquifier 后 pin_fix 前）
+if ($hasProc) {
+  $pBad = $false
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^\s+processors:') {
+      $first = -1
+      for ($j = $i + 1; $j -lt $lines.Count -and $lines[$j] -match '^\s+-\s'; $j++) {
+        if ($first -lt 0) { $first = $j }
+        if ($lines[$j] -match 'lua_processor@\*llm_processor') { $pBad = ($j -ne $first); break }
+      }
+      break
+    }
+  }
+  if ($pBad) {
+    Write-Host "[警告] lua_processor@*llm_processor 不在 processors 最前（编辑键可能先被其他处理器吞掉）" -ForegroundColor Yellow
+    if (-not $Force) { Write-Host "  中止（用 -Force 跳过位置检查）"; exit 6 }
+  }
+}
+if ($hasFilt) {
+  $fBegin = -1; $fEnd = $lines.Count
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^\s+filters:') { $fBegin = $i; continue }
+    if ($fBegin -ge 0 -and $lines[$i] -match '^\S' -and $i -gt $fBegin) { $fEnd = $i; break }
+  }
+  $pos = @{}  # lua_filter@* 前缀的组件也匹配
+  for ($i = $fBegin; $i -lt $fEnd; $i++) {
+    if ($lines[$i] -match '^\s+-\s+(?:lua_filter@\*)?(uniquifier|pin_fix_filter|hint_filter|no_match_placeholder)\s*$') {
+      $pos[$matches[1]] = $i
+    }
+  }
+  $lIdx = -1
+  for ($i = $fBegin; $i -lt $fEnd; $i++) { if ($lines[$i] -match 'lua_filter@\*llm_filter') { $lIdx = $i; break } }
+  $ok = $true
+  if ($pos.ContainsKey("uniquifier") -and $lIdx -lt $pos["uniquifier"]) {
+    Write-Host "[警告] lua_filter@*llm_filter 在 uniquifier 之前（去重顺序错误）" -ForegroundColor Yellow
+    $ok = $false
+  }
+  if ($pos.ContainsKey("pin_fix_filter") -and $lIdx -gt $pos["pin_fix_filter"]) {
+    Write-Host "[警告] lua_filter@*llm_filter 在 pin_fix_filter 之后（固顶词会被 LLM 重排顶掉）" -ForegroundColor Yellow
+    $ok = $false
+  }
+  if ($ok -and $hasProc -and -not $pBad) { Write-Host "  组件已存在且位置正确，跳过插入" }
+  if (-not $ok -and -not $Force) { Write-Host "  中止（用 -Force 跳过位置检查）"; exit 7 }
+}
 
 if (-not $hasProc) {
   $inEngine = $false; $inProc = $false; $inserted = $false
