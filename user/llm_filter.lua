@@ -1,9 +1,9 @@
 -- llm_filter.lua — LLM candidate rerank filter
--- 由 schema llm_rerank.backend 控制：cpu | gpu | off
--- off 时不加载 DLL，不推理，候选原样透传
+-- 由 schema llm_rerank.enabled 控制：true | false
+-- false 时不加载 DLL，不推理，候选原样透传
 
 local llm = nil
-local llm_loaded_for = nil  -- backend value when llm was loaded
+local llm_loaded_for = nil  -- enabled value when llm was loaded
 
 local cfg = {
     min_code_len   = 4,
@@ -22,9 +22,8 @@ local lat_count = 0
 -- 翻页/候选窗重建 (无编辑) 缓存保留命中。
 _G.llm_filter_cache = _G.llm_filter_cache or nil
 
-local function load_llm(env, backend)
-    local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
-    local ok, cpp = pcall(require, modname)
+local function load_llm(env)
+    local ok, cpp = pcall(require, "rime_llm")
     if ok and cpp then
         local sc = env.engine.schema.config
         local mp = sc:get_string("llm_rerank/model_path")
@@ -36,7 +35,7 @@ local function load_llm(env, backend)
         local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
         if okd and ud and ud ~= "" then cpp.log_dir = ud end
         llm = cpp
-        llm_loaded_for = backend
+        llm_loaded_for = true
     end
 end
 
@@ -56,9 +55,9 @@ end
 
 -- === Filter ===
 return function(translation, env)
-    -- 每次调用都从 schema 读取 backend，确保重新部署后立即生效
+    -- 每次调用都从 schema 读取 enabled，确保重新部署后立即生效
     local sc = env.engine.schema.config
-    local backend = (sc:get_string("llm_rerank/backend") or "off")
+    local enabled = sc:get_bool("llm_rerank/enabled") or false
 
     -- Init config once (non-DLL config doesn't invalidate on redeploy)
     if not cfg._inited then
@@ -83,15 +82,14 @@ return function(translation, env)
     end
     _G.llm_last_window = { input = input, cands = win }
 
-    -- backend off → 原样透传，不推理
-    if backend == "off" then
+    -- enabled false → 原样透传，不推理
+    if not enabled then
         for _, c in ipairs(all) do yield(c) end; return
     end
 
-    -- Lazy load DLL on first use for this backend
-    if llm_loaded_for ~= backend then
-        llm = nil; llm_loaded_for = nil
-        load_llm(env, backend)
+    -- Lazy load DLL on first use (enabled 变化时重载, 重新部署立即生效)
+    if not llm_loaded_for then
+        load_llm(env)
     end
 
     if not llm then

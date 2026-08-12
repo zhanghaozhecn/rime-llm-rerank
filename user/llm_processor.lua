@@ -59,12 +59,11 @@ local function processor(key, env)
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
-    local backend = (sc:get_string("llm_rerank/backend") or "off")
-    if backend == "off" then
+    local enabled = sc:get_bool("llm_rerank/enabled") or false
+    if not enabled then
         llm_prep = nil  -- 释放已加载的 DLL 引用
     elseif not llm_prep then
-        local modname = (backend == "gpu" or backend == "cuda") and "rime_llm_cuda" or "rime_llm"
-        local ok, result = pcall(require, modname)
+        local ok, result = pcall(require, "rime_llm")
         if ok then
             -- 日志目录: RIME 用户目录 (与 filter 共用同一模块实例)
             local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)

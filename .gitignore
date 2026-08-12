@@ -1,2 +1,21 @@
-# bench_threads 运行时生成的结果文件
+# 构建产物
+cpp/build/
+cpp/build_sim/
+cpp/*.exe
+cpp/*.obj
+cpp/bench_threads_result.txt
 bench_threads_result.txt
+
+# 本地私有（不发布）
+CLAUDE.md
+docs/
+eval_samples.tsv
+train_samples.tsv
+pdsp_dict.yaml
+评测文本/
+cpp/build_eval_s3.bat
+
+# GPU 版（仅本地留存）
+cpp/rime_llm_cuda.cpp
+user/rime_llm_cuda.dll
+user/ggml-cuda.dll
