@@ -1,4 +1,4 @@
-# deploy_llm_plugin.ps1 — rime-llm-rerank 插件版一键部署
+﻿# deploy_llm_plugin.ps1 — rime-llm-rerank 插件版一键部署
 # 用法（管理员，由 deploy_llm_plugin.bat 提权调用）：
 #   powershell -ExecutionPolicy Bypass -File deploy_llm_plugin.ps1 [-ModelPath <路径>] [-InstallDir <路径>] [-SchemaName pdsp.schema.yaml] [-Force]
 #
