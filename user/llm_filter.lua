@@ -1,4 +1,4 @@
--- llm_filter.lua — LLM candidate rerank filter
+﻿-- llm_filter.lua — LLM candidate rerank filter
 -- 由 schema llm_rerank.enabled 控制：true | false
 -- false 时不加载 DLL，不推理，候选原样透传
 
@@ -6,11 +6,13 @@ local llm = nil
 local llm_loaded_for = nil  -- enabled value when llm was loaded
 
 local cfg = {
-    min_code_len   = 4,
-    min_tokens     = 1,
-    max_tokens     = 6,
-    max_candidates = 5,
-    cpu_cores      = nil,  -- nil = auto-detect in C++
+    min_code_len     = 4,
+    max_code_len     = 0,   -- 0 = 不限制（编码长度上限，超出不推理）
+    min_tokens       = 1,
+    max_tokens       = 6,
+    max_candidates   = 5,
+    cpu_cores        = nil,  -- nil = auto-detect in C++
+    multi_char_first = false,  -- true = 重排后多字词优先、单字词靠后（组内按 LLM 评分）
 }
 
 local lat_max   = 0
@@ -43,6 +45,10 @@ local function init_config(env)
     local sc = env.engine.schema.config
     local v = sc:get_int("llm_rerank/min_code_len")
     if v then cfg.min_code_len = v end
+    v = sc:get_int("llm_rerank/max_code_len")
+    if v then cfg.max_code_len = v end
+    v = sc:get_bool("llm_rerank/multi_char_first")
+    if v ~= nil then cfg.multi_char_first = v end
     v = sc:get_int("llm_rerank/max_tokens")
     if v then cfg.max_tokens = v end
     v = sc:get_int("llm_rerank/max_candidates")
@@ -97,6 +103,9 @@ return function(translation, env)
     end
 
     if #input < cfg.min_code_len then
+        for _, c in ipairs(all) do yield(c) end; return
+    end
+    if cfg.max_code_len > 0 and #input > cfg.max_code_len then
         for _, c in ipairs(all) do yield(c) end; return
     end
 
@@ -164,6 +173,17 @@ return function(translation, env)
                     break
                 end
             end
+        end
+        -- 多字词优先: 重排后按"多字词(≥2字) → 单字"分组, 组内保持 LLM 评分序
+        if cfg.multi_char_first and #ordered > 1 then
+            local multi, single = {}, {}
+            for _, c in ipairs(ordered) do
+                local len = utf8.len(c.text or "") or 0
+                if len >= 2 then table.insert(multi, c) else table.insert(single, c) end
+            end
+            ordered = {}
+            for _, c in ipairs(multi) do table.insert(ordered, c) end
+            for _, c in ipairs(single) do table.insert(ordered, c) end
         end
         for i, c in ipairs(ordered) do
             if i == 1 then

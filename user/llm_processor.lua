@@ -1,4 +1,4 @@
--- llm_processor.lua — 上屏文字收集 + 预解码触发
+﻿-- llm_processor.lua — 上屏文字收集 + 预解码触发
 -- 输出格式（一个场景一行）：
 --   词1\t码1|词2\t码2|←|词3\t码3
 --   | 分隔条目，\t 分隔词和码，← 退格，无码时码为空串
@@ -20,10 +20,17 @@ local NAV_KEYS = { Left=true, Right=true, Up=true, Down=true,
 -- 编辑位置变化键: 退格/删除 (删词) + 导航键 (光标移动/滚动) + 回车 (换行)
 -- 这些键使会话上屏词序列不再代表光标前上文 → 上屏历史上文重置为空
 local function is_edit_key(k)
-    return k == "BackSpace" or k == "Delete"
+    if k == "BackSpace" or k == "Delete"
         or k == "Control+BackSpace" or k == "Control+Delete"
         or NAV_KEYS[k]
-        or k == "Return" or k == "KP_Enter"  -- 回车换行: 新段落, 上屏词序列断开
+        or k == "Return" or k == "KP_Enter" then  -- 回车换行: 新段落, 上屏词序列断开
+        return true
+    end
+    -- 组合导航 (Control+Left / Shift+Home 等): 以导航键名结尾的 repr 均视为编辑位置变化
+    for name in pairs(NAV_KEYS) do
+        if #k > #name and k:sub(-#name) == name then return true end
+    end
+    return false
 end
 
 local function reset_history()
@@ -98,11 +105,13 @@ local function processor(key, env)
 
     -- 退格 / Delete / 导航键 (composition 为空时): 编辑位置变化
     --   rime 来源上文重置为空 (会话上屏词序列不再代表光标前上文), 立即重新预解码
-    --   return 2 跳过 commit_history 同步 (引擎 Pop 会重建 history, 覆盖重置;
-    --   且退格后剩余词不应作为新词重新记录训练数据)
+    --   return 0 放行按键 (导航键/退格由后续 processor 正常处理, 光标移动),
+    --   本分支已提前返回, 后续 commit_history 同步不会执行 (不覆盖重置;
+    --   退格后剩余词不会作为新词重新记录训练数据)
     if ctx.input == "" and is_edit_key(key:repr()) then
         local k = key:repr()
-        if NAV_KEYS[k] or k == "Return" or k == "KP_Enter" then
+        if NAV_KEYS[k] or k == "Return" or k == "KP_Enter" or
+           k:match("(Left|Right|Up|Down|Home|End|Page_Up|Page_Down)$") then
             if #history > 0 then
                 append_raw("\n")
             end
@@ -118,7 +127,7 @@ local function processor(key, env)
             last_prep_ctx = cur_ctx
             llm_prep.prepare(cur_ctx)
         end
-        return 2
+        return 0
     end
 
     -- 同步 commit_history

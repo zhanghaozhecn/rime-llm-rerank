@@ -193,7 +193,9 @@ llm_rerank:
 | 参数 | 默认 | 说明 |
 |------|:---:|------|
 | `enabled` | false | `true` 启用 LLM 重排 / `false` 关闭（不加载 DLL，候选原样透传） |
-| `min_code_len` | 4 | 编码达到此长度才触发 LLM |
+| `min_code_len` | 4 | 编码达到此长度才触发 LLM（与 `max_code_len` 组成触发区间） |
+| `max_code_len` | 0 | 编码长度上限（0=不限制）；超出此长度不推理（与 `min_code_len` 组成区间） |
+| `multi_char_first` | false | `true` 时重排后多字词（≥2 字）优先、单字词靠后，组内按 LLM 评分排序 |
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5pp 但延迟翻倍，5 为最佳平衡） |

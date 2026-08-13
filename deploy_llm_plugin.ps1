@@ -236,6 +236,8 @@ if (-not $hasCfg) {
     "llm_rerank:",
     "  enabled: true",         # true=启用 LLM 重排 | false=关闭（不加载 DLL 不推理）
     "  min_code_len: 4",       # 编码达到此长度才触发 LLM（四码方案=满码）
+    "  # max_code_len: 0",     # 编码长度上限（0=不限制）；与 min_code_len 组成触发区间
+    "  # multi_char_first: false",  # true=重排后多字词优先、单字词靠后（组内按 LLM 评分）
     "  # min_tokens: 1",       # 最少上文 token 才重排
     "  # max_tokens: 10",      # 上文 token 上限（10 为性价比最优点）
     "  # max_candidates: 5",   # 参与评分的候选数
