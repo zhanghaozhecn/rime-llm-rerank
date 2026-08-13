@@ -5,6 +5,8 @@
 
 local prev_hist = {}     -- 上次 history 快照
 local history = {}       -- 当前上屏词序列
+local commit_base = 0    -- 上文基座: 只认 commit_history 中 base 之后的新词
+                         -- (编辑键后旧词永久忽略——librime 无法清 commit_history)
 local SPLIT = "|"
 local TAB = "\t"
 local BSP = "←"
@@ -63,20 +65,6 @@ end
 
 local function processor(key, env)
     if key:release() then return 2 end
-    -- 诊断 (临时): 记录编辑键 repr 与 input 状态 (编辑键不重置排查)
-    do
-        local kr = key:repr()
-        if kr == "BackSpace" or kr == "Delete" or NAV_KEYS[kr] or
-           kr:match("(Left|Right|Up|Down|Home|End|Page_Up|Page_Down)$") then
-            local f = io.open(rime_api.get_user_data_dir() .. "\\rime_llm_editlog.txt", "a")
-            if f then
-                local ci = env.engine.context.input or ""
-                f:write(string.format("%s key=[%s] input=[%s] len=%d\n",
-                    os.date("%H:%M:%S"), kr, ci, #ci))
-                f:close()
-            end
-        end
-    end
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
@@ -133,6 +121,10 @@ local function processor(key, env)
             append_raw(SPLIT .. BSP)
         end
         reset_history()
+        -- 编辑键: 当前 commit_history 位置记为基座——旧词永久忽略
+        -- (librime lua 无法清 commit_history, 旧词留在引擎里;
+        -- 退格会被引擎清空 commit_history → 同步段检测缩短自动重置基座)
+        commit_base = #ch:to_table()
         -- 编辑后重打相同词 (ctx+input 相同) 必须重新推理: 清空 filter 结果缓存
         _G.llm_filter_cache = nil
         -- 上文已重置 → 立即异步预解码 (空上文)
@@ -146,9 +138,13 @@ local function processor(key, env)
 
     -- 同步 commit_history
     local all = ch:to_table()
-    if all and #all > 0 then
+    -- 引擎清空 commit_history（退格等）→ 基座重置重新计数
+    if all and #all < commit_base then
+        commit_base = 0
+    end
+    if all and #all > commit_base then
         history = {}
-        for i = 1, #all do
+        for i = commit_base + 1, #all do
             local entry = all[i]
             if entry and entry.text and #entry.text >= 1 then
                 table.insert(history, entry.text)
