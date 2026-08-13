@@ -63,6 +63,20 @@ end
 
 local function processor(key, env)
     if key:release() then return 2 end
+    -- 诊断 (临时): 记录编辑键 repr 与 input 状态 (编辑键不重置排查)
+    do
+        local kr = key:repr()
+        if kr == "BackSpace" or kr == "Delete" or NAV_KEYS[kr] or
+           kr:match("(Left|Right|Up|Down|Home|End|Page_Up|Page_Down)$") then
+            local f = io.open(rime_api.get_user_data_dir() .. "\\rime_llm_editlog.txt", "a")
+            if f then
+                local ci = env.engine.context.input or ""
+                f:write(string.format("%s key=[%s] input=[%s] len=%d\n",
+                    os.date("%H:%M:%S"), kr, ci, #ci))
+                f:close()
+            end
+        end
+    end
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
