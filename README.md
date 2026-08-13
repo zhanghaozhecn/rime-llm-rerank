@@ -327,7 +327,7 @@ static void score_batch(ctx_ids, cands, scores_out) {
 
 Qwen3.5 是 Attention + SSM 混合架构。Mamba 层的隐状态在 `llama_decode` 的多序列 batch 中会跨序列耦合——全量 ctx 多序列时，各序列的正确词 logits 被其他序列的 token 污染，准确率仅 71%。
 
-分层算法将每序列的增量限制为 1 个 token，SSM 干扰降至 ~0.5%，准确率恢复到 98.5%。超大 batch（250+ seq）准确率掉到 74%（跨样本 batch 上限约束，`bench_gpu2` 实测）。
+分层算法将每序列的增量限制为 1 个 token，SSM 干扰降至 ~0.5%，准确率恢复到 98.5%。超大 batch（250+ seq）准确率掉到 74%（跨样本 batch 上限约束，bench 实测）。
 
 ### 4. `llama_memory_clear` 的第二个参数
 
