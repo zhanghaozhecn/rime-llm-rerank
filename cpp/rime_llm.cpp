@@ -154,6 +154,8 @@ static std::vector<llama_token> tokenize(const char * text) {
     std::vector<llama_token> toks(128);
     int n = llama_tokenize(g_vocab, text, (int)strlen(text),
                             toks.data(), (int)toks.size(), true, true);
+    // llama_tokenize API 约定：buffer 不足时返回负值，-n 为所需 token 数。
+    // 首次调用带 128 上限，超长文本（如整段上文）会返回负 → resize 后重试。
     if (n < 0) {
         toks.resize(-n);
         n = llama_tokenize(g_vocab, text, (int)strlen(text),
@@ -235,6 +237,9 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     if (!use_prep) {
         // ---- 完整流程：Step 1 ctx decode ----
         auto ts1_0 = std::chrono::high_resolution_clock::now();
+        // memory_clear 第 2 参：true=零化整个 KV cache（40 万次 decode 的
+        // benchmark 会拖慢吞吐）；false=仅重置元数据。新序列的因果注意力
+        // 掩码天然隔离旧 KV，无需显式归零。
         llama_memory_clear(llama_get_memory(g_ctx), false);
         llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
         for (int j = 0; j < ctx_len; j++) {
@@ -402,6 +407,7 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     g_prep_logits.clear();
 
     // Step 1: decode ctx → seq 0
+    // 同 score_batch：memory_clear 第 2 参 false = 不零化 KV，仅重置元数据
     llama_memory_clear(mem, false);
     llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
     for (int j = 0; j < ctx_len; j++) {

@@ -13,7 +13,7 @@ from collections import defaultdict, OrderedDict
 import tempfile, shutil, concurrent.futures
 
 DIR = Path(__file__).resolve().parent
-SIM_EXE = "D:/OneDrive/typing/llm_rerank/cpp/build_sim/Release/sim_rerank.exe"
+SIM_EXE = DIR / "cpp/build_sim/Release/sim_rerank.exe"
 MODEL   = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
 SEG_CACHE = Path("D:/OneDrive/typing/bert_seg/data/batch_eval/segments_10000.jsonl")
 SEED   = 42; MAX_CAND = 5

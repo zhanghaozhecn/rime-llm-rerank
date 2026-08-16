@@ -23,7 +23,7 @@ from collections import defaultdict, OrderedDict
 ROOT       = Path(__file__).resolve().parent
 DICT_PATH  = Path("d:/OneDrive/typing/拼读双拼/配置文件/pdsp.dict.yaml")
 MODEL_DIR  = ROOT / "model" / "v2"
-SIM_EXE    = "D:/OneDrive/typing/llm_rerank/cpp/build_sim/Release/sim_rerank.exe"
+SIM_EXE    = ROOT / "cpp/build_sim/Release/sim_rerank.exe"
 
 # ── CLI ──
 parser = argparse.ArgumentParser(description="字典序 vs LLM 重排 对比评测")
@@ -57,6 +57,8 @@ print(f"{C['D']}输入: {len(text)} 字{C['W']}")
 # 1. Load dict
 # ═══════════════════════════════════════════
 print(f"{C['D']}加载字典...{C['W']}", end=" ", flush=True)
+# OrderedDict 保持词库文件中的行序：评测基准是"字典序"，候选顺序敏感，
+# 丢序会让字典序基准失真（此前用 dict.fromkeys 丢过序）
 word_to_codes = defaultdict(list); code_to_words = defaultdict(OrderedDict)
 with open(DICT_PATH, encoding="utf-8") as f:
     in_body = False
@@ -107,7 +109,8 @@ for w in words:
 print(json.dumps(result, ensure_ascii=False))
 """],
         input=json.dumps(text, ensure_ascii=False),
-        capture_output=True, text=True, timeout=300,
+        capture_output=True, text=True,
+        timeout=300,  # HanLP 首次加载模型可超分钟级；曾因默认 60s 超时误报失败
         env={**os.environ, "HF_ENDPOINT": "https://hf-mirror.com"}
     )
     for line in result.stdout.strip().split("\n"):
