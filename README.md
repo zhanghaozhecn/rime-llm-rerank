@@ -373,7 +373,6 @@ rime-llm-rerank\
 │   ├── calibrate_css.py       #   CSS 校准（依赖 处理脚本/eval_css）
 │   ├── prep_samples.py        #   wiki 语料 → eval_samples.tsv（同码采样）
 │   ├── prep_training.py       #   打字语料 llm_training.txt → train_samples.tsv
-│   ├── analyze_corpus.py      #   打字语料质量分析
 │   └── run_tests.py           #   test_core 自动化测试驱动
 ├── bin\bench_threads.exe      # 预编译线程测定工具
 └── deploy_llm_plugin.bat/.ps1 # 一键部署（提权 bat + PS 逻辑）
@@ -411,6 +410,10 @@ python eval/calibrate_css.py
 # 语料准备（wiki → eval_samples.tsv；打字语料 → train_samples.tsv）
 python eval/prep_samples.py
 python eval/prep_training.py
+
+# 打字语料（llm_training.txt）的质量分析/清洗归 BERT 分词项目：
+#   D:/OneDrive/typing/bert_seg/analyze_corpus.py（质量分析）
+#   D:/OneDrive/typing/bert_seg/clean_data.py（清洗 → 分词训练数据）
 
 # C++ 回归测试（CE 正确性 + 准确率/延迟基线，在项目根运行）
 cmake --build build_cpu --config Release --target test_core && ./build_cpu/test_core.exe
