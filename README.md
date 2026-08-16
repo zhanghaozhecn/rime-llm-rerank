@@ -191,7 +191,7 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ### 4.6 选重率对比
 
-在真实打字场景（词典序 vs LLM 重排）下，LLM 重排的选重率可降至字典序的 **1/3**（`eval_rerank.py` 逐词对比评测，输出 LLM 修正/改错明细）。
+在真实打字场景（词典序 vs LLM 重排）下，LLM 重排的选重率可降至字典序的 **1/3**（`eval/eval_rerank.py` 逐词对比评测，输出 LLM 修正/改错明细）。
 
 ## 5 讨论与限制
 
@@ -359,27 +359,27 @@ rime-llm-rerank\
 │   ├── rime_llm.cpp           #   生产插件（评分核心，坑见注释）
 │   ├── sim_rerank.cpp         #   评测仿真器（stdin JSON → 排序结果）
 │   ├── test_core.cpp          #   回归测试（CE 正确性/准确率/延迟基线）
-│   ├── bench_sweep2.cpp       #   首选率扫参（tok×cand 网格，20000 样本）
+│   ├── bench_sweep2.cpp       #   CPU 首选率扫参（tok×cand 网格，20000 样本）
 │   ├── bench_single_char.cpp  #   单字首选率评测
 │   ├── eval_long_cand.cpp     #   λ 外推系数细扫
 │   ├── eval_s3_skip.cpp       #   跳过 Step 3 的效果评估
 │   ├── bench_threads.cpp      #   线程数测定（build_bench_threads.bat）
 │   └── lua/                   #   Lua 5.4 嵌入源码
-├── eval_rerank.py             # 单文本：字典序 vs LLM 选重率对比（规范源）
-├── eval_prefer.py             # 多方案首选率对比（合并候选集一次评分，规范源）
-├── eval\                      # 批量评测工具（python）
-│   ├── batch_rerank.py        #   多模型批量评测（语料缓存）
-│   ├── compare_dicts.py       #   多词库统一对比评测
-│   └── calibrate_css.py       #   CSS 校准（依赖 处理脚本/eval_css）
-├── python\                    # 语料工具
-│   ├── prep_training.py       #   llm_training.txt → train_samples.tsv
-│   ├── prep_samples.py        #   词典 → 评测样本（同码采样）
-│   └── analyze_corpus.py      #   语料分析
+├── eval\                      # 评估工具链（python）：评估/语料/测试
+│   ├── eval_rerank.py         #   单文本：字典序 vs LLM 选重率对比
+│   ├── eval_prefer.py         #   多方案首选率对比（同词跨方案合并候选，一次评分）
+│   ├── batch_rerank.py        #   多模型批量评测（--prepare/--run/--compare）
+│   ├── compare_dicts.py       #   多词库统一对比评测（各库独立候选）
+│   ├── calibrate_css.py       #   CSS 校准（依赖 处理脚本/eval_css）
+│   ├── prep_samples.py        #   wiki 语料 → eval_samples.tsv（同码采样）
+│   ├── prep_training.py       #   打字语料 llm_training.txt → train_samples.tsv
+│   ├── analyze_corpus.py      #   打字语料质量分析
+│   └── run_tests.py           #   test_core 自动化测试驱动
 ├── bin\bench_threads.exe      # 预编译线程测定工具
 └── deploy_llm_plugin.bat/.ps1 # 一键部署（提权 bat + PS 逻辑）
 ```
 
-> 根目录 `eval_prefer.py` / `eval_rerank.py` 为修复版规范源（timeout 300 s、`OrderedDict` 保持字典序，坑已写入脚本注释）；`eval/` 为批量评测工具。GPU 版（`rime_llm_cuda.cpp`/DLL）与语料（`train_samples.tsv` 等）仅本地留存，不进 GitHub。
+> 评估工具路径约定：**项目内资源**（词库 `pdsp_dict.yaml`、样本 `eval_samples.tsv`、`sim_rerank.exe`）相对脚本位置，cpp 程序数据文件相对 cwd（在项目根运行）；**本机/跨项目资源**（模型、语料、venv、处理脚本）用环境变量覆盖，默认值见下表。GPU 版（`rime_llm_cuda.cpp`/DLL）与语料（`train_samples.tsv` 等）仅本地留存，不进 GitHub。
 
 ## 核心算法要点
 
@@ -387,27 +387,50 @@ rime-llm-rerank\
 
 ## 评测工具用法
 
+全部工具在 `eval/` 下，在项目根运行：
+
 ```powershell
 # 单文本选重率对比（字典序 vs LLM）
-python eval_rerank.py --file 评测文本.txt          # --text "..." / --dict-only / --dict <词库>
+python eval/eval_rerank.py --file 评测文本.txt     # --text "..." / --dict-only / --dict <词库>
 
-# 多方案首选率对比（合并候选集）
-python eval_prefer.py --dict 拼读双拼.txt --dict 五笔.txt --n 20000
+# 多方案首选率对比（同词跨方案合并候选，一次评分）
+python eval/eval_prefer.py --dict 拼读双拼.txt --dict 五笔.txt --n 20000
 
-# 批量多模型评测（--prepare 生成语料 → --run 模型 → --compare）
-D:/OneDrive/typing/bert_seg/.venv/Scripts/python.exe eval/batch_rerank.py --run "模型.gguf"
+# 批量多模型评测（--prepare 生成测试数据 → --run 模型 → --compare 对比）
+python eval/batch_rerank.py --prepare
+python eval/batch_rerank.py --run "模型.gguf"
+python eval/batch_rerank.py --compare
 
-# 多词库统一对比
-D:/OneDrive/typing/bert_seg/.venv/Scripts/python.exe eval/compare_dicts.py --compare --dict ... --name ...
+# 多词库统一对比（--segment 生成分段缓存 → --compare）
+python eval/compare_dicts.py --segment
+python eval/compare_dicts.py --compare --dict ... --name ... --dict ... --name ...
 
-# CSS 校准
+# CSS 校准（依赖 处理脚本/eval_css）
 python eval/calibrate_css.py
 
-# C++ 回归测试（CE 正确性 + 准确率/延迟基线）
+# 语料准备（wiki → eval_samples.tsv；打字语料 → train_samples.tsv）
+python eval/prep_samples.py
+python eval/prep_training.py
+
+# C++ 回归测试（CE 正确性 + 准确率/延迟基线，在项目根运行）
 cmake --build build_cpu --config Release --target test_core && ./build_cpu/test_core.exe
+python eval/run_tests.py
 ```
 
-依赖：BERT 分词（`bert_seg` 的 HanLP/venv 与语料缓存）、拼读双拼词库、`cpp/build_sim/Release/sim_rerank.exe`（`cmake --build build_sim --config Release --target sim_rerank` 编译）。
+**外部依赖与覆盖**：项目内资源（词库 `pdsp_dict.yaml`、`eval_samples.tsv`）相对脚本位置；模型/语料/分词 venv 等本机资源默认使用以下约定路径，可用环境变量覆盖：
+
+| 环境变量 | 默认值 |
+|------|------|
+| `GGUF_MODEL` | `d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf` |
+| `RIME_LLM_VENV_PY` | `D:/OneDrive/typing/bert_seg/.venv/Scripts/python.exe`（HanLP 分词） |
+| `RIME_LLM_CORPUS` | `D:/OneDrive/typing/bert_seg/data/sentences_filtered.txt` |
+| `RIME_LLM_DATA_DIR` | `D:/OneDrive/typing/bert_seg/data/batch_eval`（缓存/结果） |
+| `RIME_LLM_SEG_CACHE` | `…/batch_eval/segments_10000.jsonl` |
+| `RIME_LLM_TOOLCHAIN` | `D:/OneDrive/typing/处理脚本` |
+| `RIME_LLM_WIKI` | `D:/分词注音工程/分读音词频统计/data/sentences_new.txt` |
+| `RIME_LLM_SENTENCES` | `D:/分词注音工程/…/sentences_clean_1pct.txt` |
+
+RIME 用户目录 = `%APPDATA%\Rime`。`sim_rerank.exe` 用 `cmake --build build_sim --config Release --target sim_rerank` 编译。
 
 ## 编译
 

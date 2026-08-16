@@ -2,11 +2,11 @@
 """
 预处理打字训练语料 → LLM 训练/评估样本
 
-输入: llm_training.txt（llm_processor.lua 收集）
+输入: llm_training.txt（llm_processor.lua 收集，RIME 用户目录）
 格式: 词1\t码1|词2\t码2|←|词3\t码3
       词\t码\t候选1,候选2,...（2026-08-02 起: llm_filter 快照的真实候选窗, 优先使用）
 
-输出: train_samples.tsv（与 eval_samples.tsv 相同格式）
+输出: 项目根 train_samples.tsv（与 eval_samples.tsv 相同格式）
       上文\t正确词\t编码\t候选位置\t候选列表\t同码总数
 
 处理:
@@ -16,13 +16,17 @@
   4. 单字只取单编码字（与 eval 一致）
 """
 
+import os
 import re
 from pathlib import Path
 from collections import defaultdict
 
-RIME_DIR  = Path("C:/Users/Administrator/AppData/Roaming/Rime")
-DICT_PATH = Path("d:/OneDrive/typing/拼读双拼/配置文件/pdsp.dict.yaml")
-OUT_PATH  = Path("d:/OneDrive/typing/llm_rerank/train_samples.tsv")
+ROOT = Path(__file__).resolve().parent   # eval/
+PROJ = ROOT.parent                        # 项目根
+# RIME 用户目录取系统环境变量 %APPDATA%\Rime（不硬编码用户名）
+RIME_DIR  = Path(os.environ.get("APPDATA", "")) / "Rime"
+DICT_PATH = PROJ / "pdsp_dict.yaml"   # 词库拷贝（从 OneDrive 规范源同步）
+OUT_PATH  = PROJ / "train_samples.tsv"
 
 # ── 1. Load dict ──
 print("Loading dict...")

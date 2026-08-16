@@ -3,15 +3,14 @@
 LLM 重排自动化测试
 
 用法:
-  python run_tests.py                   运行全部测试（CPU 后端）
-  python run_tests.py --baseline        生成/更新基线
-  python run_tests.py --samples 500     指定样本数（默认 200）
-  python run_tests.py --gpu             使用 GPU 后端测试（需 CUDA 环境）
-  python run_tests.py --quick           快速模式（仅 CE 正确性，跳过回归）
+  python eval/run_tests.py               运行全部测试（CPU 后端）
+  python eval/run_tests.py --baseline    生成/更新基线
+  python eval/run_tests.py --samples 500 指定样本数（默认 200）
+  python eval/run_tests.py --quick       快速模式（仅 CE 正确性，跳过回归）
 
 测试内容:
   1. CE 正确性 — 分层 vs gold，固定 6 个用例
-  2. 准确率回归 — wiki 语料采样，对比基线
+  2. 准确率回归 — wiki 语料采样（RIME_LLM_WIKI 可指定语料），对比基线
   3. 延迟回归 — p50 对比基线
 """
 

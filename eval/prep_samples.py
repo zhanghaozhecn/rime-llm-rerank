@@ -10,17 +10,24 @@
    - 候选 = 同码词列表前 9 个（排除正确词自身）
    - 后续任意 N 样本只需 head -N 即可
 
-用法: python prep_samples.py [--max-samples 100000] [--sentences 100000]
+输出: 项目根 eval_samples.tsv（与 cpp 评估程序一致，在项目根运行）
+
+本机/跨项目资源用环境变量覆盖（见 CLAUDE.md）：
+  RIME_LLM_WIKI    wiki 原始语料（默认 D:/分词注音工程/.../sentences_new.txt）
 """
 
 import random
 import sys
+import os
 from pathlib import Path
 from collections import defaultdict
 
-WIKI_PATH = "D:/分词注音工程/分读音词频统计/data/sentences_new.txt"
-DICT_PATH = "d:/OneDrive/typing/拼读双拼/配置文件/pdsp.dict.yaml"
-OUT_DIR   = Path("d:/OneDrive/typing/llm_rerank")
+ROOT = Path(__file__).resolve().parent   # eval/
+PROJ = ROOT.parent                        # 项目根
+WIKI_PATH = os.environ.get("RIME_LLM_WIKI",
+              "D:/分词注音工程/分读音词频统计/data/sentences_new.txt")
+DICT_PATH = PROJ / "pdsp_dict.yaml"   # 词库拷贝（从 OneDrive 规范源同步）
+OUT_DIR   = PROJ                       # 输出到项目根 eval_samples.tsv
 
 MAX_SAMPLES = 100000
 N_SENTENCES = 100000

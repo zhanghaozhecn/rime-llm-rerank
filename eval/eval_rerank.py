@@ -3,14 +3,14 @@
 拼读双拼 字典序 vs LLM 重排 对比评测工具
 
 用法:
-  python eval_rerank.py --text "测试文本"
-  python eval_rerank.py --file 测试文本.txt
-  python eval_rerank.py --file -          (从 stdin 读取)
-  python eval_rerank.py --text "测试" --dict-only    (仅字典序，不跑 LLM)
+  python eval/eval_rerank.py --text "测试文本"
+  python eval/eval_rerank.py --file 测试文本.txt
+  python eval/eval_rerank.py --file -          (从 stdin 读取)
+  python eval/eval_rerank.py --text "测试" --dict-only    (仅字典序，不跑 LLM)
 
 依赖:
-  - BERT 分词模型 (model/v2/)
-  - 拼读双拼字典 (pdsp.dict.yaml)
+  - BERT 分词模型 (bert_seg venv, 见 VENV_PY)
+  - 拼读双拼字典 (项目根 pdsp_dict.yaml，--dict 可指定其他)
   - C++ 仿真器 (sim_rerank.exe) — 仅 --llm 时需要
 
 输出: 逐词明细表 + 字典序/LLM 重排 选重率对比
@@ -20,10 +20,13 @@ from pathlib import Path
 from collections import defaultdict, OrderedDict
 
 # ── Paths ──
-ROOT       = Path(__file__).resolve().parent
-DICT_PATH  = Path("d:/OneDrive/typing/拼读双拼/配置文件/pdsp.dict.yaml")
-MODEL_DIR  = ROOT / "model" / "v2"
-SIM_EXE    = ROOT / "cpp/build_sim/Release/sim_rerank.exe"
+# 项目内资源一律相对脚本位置；本机/跨项目资源用环境变量可覆盖（见 CLAUDE.md）
+ROOT       = Path(__file__).resolve().parent   # eval/
+PROJ       = ROOT.parent                        # 项目根
+DICT_PATH  = PROJ / "pdsp_dict.yaml"   # 词库拷贝（从 OneDrive 规范源同步，--dict 覆盖）
+SIM_EXE    = PROJ / "cpp/build_sim/Release/sim_rerank.exe"
+VENV_PY    = os.environ.get("RIME_LLM_VENV_PY",
+              "D:/OneDrive/typing/bert_seg/.venv/Scripts/python.exe")
 
 # ── CLI ──
 parser = argparse.ArgumentParser(description="字典序 vs LLM 重排 对比评测")
@@ -82,8 +85,6 @@ print(f"{len(word_to_codes):,} 词 {len(code_to_words):,} 编码 [{dict_label}]"
 # ═══════════════════════════════════════════
 print(f"{C['D']}分词中 (HanLP)...{C['W']}", end=" ", flush=True)
 import subprocess as sp
-
-VENV_PY = "D:/OneDrive/typing/bert_seg/.venv/Scripts/python.exe"
 
 def is_cjk(ch): return '一' <= ch <= '鿿'
 

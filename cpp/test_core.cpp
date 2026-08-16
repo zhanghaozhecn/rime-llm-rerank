@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -35,7 +36,9 @@
 // 配置
 // ============================================================
 static const char* MODEL_PATH    = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
-static const char* WIKI_PATH     = "d:/OneDrive/typing/llm_rerank/wiki_corpus.txt";
+// wiki 句子语料（每行一句）相对 cwd：在项目根运行。缺文件则准确率回归 SKIP
+// （不中断 CE/延迟测试）；可用 RIME_LLM_WIKI 环境变量或从 bert_seg/data/sentences_filtered.txt 复制
+static const char* WIKI_PATH     = "./wiki_corpus.txt";
 static const char* BASELINE_FILE = "test_baseline.json";
 static const int   N_CTX         = 128;
 static const int   N_THREADS     = 6;
@@ -320,10 +323,11 @@ static void save_baseline(double acc, double p50, int nsamples) {
 static void run_accuracy_test(int n_samples, bool update_baseline) {
     log_msg("\n=== 2. 准确率回归测试 ===");
 
-    // 读取 wiki 语料
-    std::ifstream corpus(WIKI_PATH);
+    // 读取 wiki 语料（RIME_LLM_WIKI 环境变量可覆盖默认相对路径）
+    const char* wiki = getenv("RIME_LLM_WIKI");
+    std::ifstream corpus(wiki ? wiki : WIKI_PATH);
     if (!corpus.is_open()) {
-        log_msg("  SKIP: cannot open wiki corpus: %s", WIKI_PATH);
+        log_msg("  SKIP: cannot open wiki corpus: %s", wiki ? wiki : WIKI_PATH);
         return;
     }
 

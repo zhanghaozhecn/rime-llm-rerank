@@ -5,17 +5,20 @@
 策略：同词跨方案合并候选集 → LLM 一次评分 → 各方案分别统计
 
 用法:
-  python eval_prefer.py --dict 拼读双拼.txt --dict 小鹤双拼.txt --dict 五笔.txt
+  python eval/eval_prefer.py --dict 拼读双拼.txt --dict 小鹤双拼.txt --dict 五笔.txt
 """
-import argparse, json, subprocess, sys, time, random, re
+import argparse, json, subprocess, sys, os, time, random, re
 from pathlib import Path
 from collections import defaultdict, OrderedDict
 import tempfile, shutil, concurrent.futures
 
-DIR = Path(__file__).resolve().parent
-SIM_EXE = DIR / "cpp/build_sim/Release/sim_rerank.exe"
-MODEL   = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
-SEG_CACHE = Path("D:/OneDrive/typing/bert_seg/data/batch_eval/segments_10000.jsonl")
+DIR = Path(__file__).resolve().parent   # eval/
+PROJ = DIR.parent                        # 项目根
+SIM_EXE = PROJ / "cpp/build_sim/Release/sim_rerank.exe"
+# 本机/跨项目资源：环境变量可覆盖（见 CLAUDE.md）
+MODEL   = os.environ.get("GGUF_MODEL", "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf")
+SEG_CACHE = Path(os.environ.get("RIME_LLM_SEG_CACHE",
+              "D:/OneDrive/typing/bert_seg/data/batch_eval/segments_10000.jsonl"))
 SEED   = 42; MAX_CAND = 5
 
 parser = argparse.ArgumentParser(description="多方案词典 vs LLM 首选率对比")

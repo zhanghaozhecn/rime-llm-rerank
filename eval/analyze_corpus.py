@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """分析 llm_training.txt 打字语料质量"""
+import os
 import re
 from collections import Counter
 from pathlib import Path
 
-CORPUS = Path("C:/Users/Administrator/AppData/Roaming/Rime/llm_training.txt")
+# RIME 用户目录取系统环境变量 %APPDATA%\Rime（不硬编码用户名）
+CORPUS = Path(os.environ.get("APPDATA", "")) / "Rime" / "llm_training.txt"
 
 if not CORPUS.exists():
     print(f"File not found: {CORPUS}")

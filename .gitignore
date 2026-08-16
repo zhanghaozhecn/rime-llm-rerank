@@ -22,7 +22,3 @@ user/ggml-cuda.dll
 
 # Python 缓存
 __pycache__/
-eval/__pycache__/
-
-# 本机维护（评测工具，硬编码本机路径，不发布）
-eval/

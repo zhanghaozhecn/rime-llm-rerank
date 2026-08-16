@@ -1,10 +1,11 @@
 /*
- * bench_sweep2.cpp — GPU 双因素扫参：上文 token 数 × 候选数
+ * bench_sweep2.cpp — CPU 双因素扫参：上文 token 数 × 候选数
  *
  * 20000 样本词（多字词，不含单字），分层并行解码（与生产一致）。
  * 输出 tok=1..20 × cand=2..9 准确率表格。
  *
  * 优化：每样本每 ctx_len 一次 decode，同时评估所有 cand 子集。
+ * 数据文件相对 cwd（在项目根运行）：./eval_samples.tsv ./pdsp_dict.yaml
  */
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -30,8 +31,9 @@
 // Config
 // ============================================================
 static const char* MODEL_PATH    = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
-static const char* SAMPLES_PATH  = "d:/OneDrive/typing/llm_rerank/eval_samples.tsv";
-static const char* DICT_PATH     = "d:/OneDrive/typing/llm_rerank/pdsp_dict.yaml";
+// 数据文件相对 cwd：在项目根运行（数据在项目根，gitignore 本地留存）
+static const char* SAMPLES_PATH  = "./eval_samples.tsv";
+static const char* DICT_PATH     = "./pdsp_dict.yaml";
 static const char* CHECKPOINT    = "bench_sweep2_checkpoint.txt";
 static const int   N_CTX         = 512;
 static const int   N_THREADS     = 4;
@@ -296,7 +298,7 @@ static int load_checkpoint() {
 // Main sweep
 // ============================================================
 int main() {
-    log_msg("=== GPU Sweep: tok=1..%d x cand=2..%d, N=%d ===", MAX_CTX_TOK, MAX_CAND, N_SAMPLES);
+    log_msg("=== CPU Sweep: tok=1..%d x cand=2..%d, N=%d ===", MAX_CTX_TOK, MAX_CAND, N_SAMPLES);
 
     // Init model
     llama_backend_init();
@@ -314,7 +316,7 @@ int main() {
     cparams.n_seq_max = N_SEQ_MAX;
     g_ctx = llama_new_context_with_model(g_model, cparams);
     if (!g_ctx) { log_msg("FATAL: context create failed"); return 1; }
-    log_msg("Model loaded (GPU, n_ctx=%d threads=%d gpu_layers=%d)", N_CTX, N_THREADS, N_GPU_LAYERS);
+    log_msg("Model loaded (CPU, n_ctx=%d threads=%d gpu_layers=%d)", N_CTX, N_THREADS, N_GPU_LAYERS);
 
     // Load dict
     load_dict();
