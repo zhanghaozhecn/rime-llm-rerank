@@ -12,7 +12,7 @@ local cfg = {
     max_tokens       = 6,
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = auto-detect in C++
-    multi_char_first = false,  -- true = 重排后多字词优先、单字词靠后（组内按 LLM 评分）
+    long_word_first = false,  -- true = 重排后多字词优先、单字词靠后（组内按 LLM 评分）
 }
 
 local lat_max   = 0
@@ -47,8 +47,8 @@ local function init_config(env)
     if v then cfg.min_code_len = v end
     v = sc:get_int("llm_rerank/max_code_len")
     if v then cfg.max_code_len = v end
-    v = sc:get_bool("llm_rerank/multi_char_first")
-    if v ~= nil then cfg.multi_char_first = v end
+    v = sc:get_bool("llm_rerank/long_word_first")
+    if v ~= nil then cfg.long_word_first = v end
     v = sc:get_int("llm_rerank/max_tokens")
     if v then cfg.max_tokens = v end
     v = sc:get_int("llm_rerank/max_candidates")
@@ -174,10 +174,10 @@ return function(translation, env)
                 end
             end
         end
-        -- long-word-first (multi_char_first): 候选算完 CE 后按词长降序排序,
+        -- long-word-first (long_word_first): 候选算完 CE 后按词长降序排序,
         -- 同词长保持 CE 评分序 (不再只分"多字≥2字/单字"两组)。此时 ordered
         -- 已是 LLM 评分序 (result), 用 idx 做稳定排序, 同词长保持 CE 序。
-        if cfg.multi_char_first and #ordered > 1 then
+        if cfg.long_word_first and #ordered > 1 then
             local arr = {}
             for i, c in ipairs(ordered) do
                 arr[i] = { c = c, len = utf8.len(c.text or "") or 0, idx = i }
