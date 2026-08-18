@@ -174,16 +174,19 @@ return function(translation, env)
                 end
             end
         end
-        -- 多字词优先: 重排后按"多字词(≥2字) → 单字"分组, 组内保持 LLM 评分序
+        -- long-word-first (multi_char_first): 候选算完 CE 后按词长降序排序,
+        -- 同词长保持 CE 评分序 (不再只分"多字≥2字/单字"两组)。此时 ordered
+        -- 已是 LLM 评分序 (result), 用 idx 做稳定排序, 同词长保持 CE 序。
         if cfg.multi_char_first and #ordered > 1 then
-            local multi, single = {}, {}
-            for _, c in ipairs(ordered) do
-                local len = utf8.len(c.text or "") or 0
-                if len >= 2 then table.insert(multi, c) else table.insert(single, c) end
+            local arr = {}
+            for i, c in ipairs(ordered) do
+                arr[i] = { c = c, len = utf8.len(c.text or "") or 0, idx = i }
             end
-            ordered = {}
-            for _, c in ipairs(multi) do table.insert(ordered, c) end
-            for _, c in ipairs(single) do table.insert(ordered, c) end
+            table.sort(arr, function(a, b)
+                if a.len ~= b.len then return a.len > b.len end
+                return a.idx < b.idx  -- 同词长保持 LLM 评分序
+            end)
+            for i = 1, #arr do ordered[i] = arr[i].c end
         end
         for i, c in ipairs(ordered) do
             if i == 1 then

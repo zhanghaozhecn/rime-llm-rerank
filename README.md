@@ -111,7 +111,7 @@ score = -ce_sum - (ce_sum/3) · (n_tokens-3) · λ,   λ = 0.6
 - **触发区间**：编码长度达 `min_code_len`（默认 4）才触发；`max_code_len` 可选设上限，两值组成触发区间。
 - **上文来源**：仅上屏历史（`commit_history`）。lua 侧无法感知鼠标/光标位置；应用切换经 TSF session 重置间接感知；浏览器网页切换不可感知（能力边界见 §5）。
 - **编辑键重置**：退格/Delete/导航/回车视为编辑位置变化，上文基座重置（`commit_base`），并清空 filter 结果缓存——重打相同编码必须重新推理。
-- **multi_char_first**：重排后多字词（≥2 字）优先、单字靠后，组内按 LLM 评分——四码方案多字词重码率远高于单字，单字用户的选重频次更高。
+- **multi_char_first**：long-word-first——候选算完 CE 后按词长降序排序、同词长按 CE 评分序（四码方案长词重码率高的优先展示）。
 - **热开关**：每次 filter 调用重读 `llm_rerank.enabled`，重新部署即生效，无需重启。
 - **AI 标记**：LLM 首选候选以 ShadowCandidate 附加 "AI" 注释，肉眼可验证重排生效。
 
@@ -290,7 +290,7 @@ llm_rerank:
 | `enabled` | false | `true` 启用 LLM 重排 / `false` 关闭（不加载 DLL，候选原样透传） |
 | `min_code_len` | 4 | 编码达到此长度才触发 LLM（与 `max_code_len` 组成触发区间） |
 | `max_code_len` | 0 | 编码长度上限（0=不限制）；超出此长度不推理 |
-| `multi_char_first` | false | `true` 时重排后多字词（≥2 字）优先、单字词靠后，组内按 LLM 评分排序 |
+| `multi_char_first` | false | `true` 时 long-word-first：候选算完 CE 后按词长降序、同词长按 CE 评分序排列 |
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1 pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5 pp 但延迟翻倍，5 为最佳平衡） |
