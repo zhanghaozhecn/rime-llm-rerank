@@ -13,6 +13,7 @@ local cfg = {
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = auto-detect in C++
     long_word_first = false,  -- true = 重排后多字词优先、单字词靠后（组内按 LLM 评分）
+    expected_length_weight = 0,  -- > 0 = 两码一字方案的编码长度匹配加权
 }
 
 local lat_max   = 0
@@ -23,6 +24,36 @@ local lat_count = 0
 -- 编辑后重打相同词 (ctx+input 相同) 必须重新推理, 缓存会误命中导致无推理记录。
 -- 翻页/候选窗重建 (无编辑) 缓存保留命中。
 _G.llm_filter_cache = _G.llm_filter_cache or nil
+
+local function is_finite_number(v)
+    return type(v) == "number" and v == v
+        and v > -math.huge and v < math.huge
+end
+
+local function is_valid_llm_score(v)
+    return is_finite_number(v) and v > -1e9
+end
+
+local function get_config_number(sc, key)
+    local ok, v = pcall(function() return sc:get_double(key) end)
+    if ok and is_finite_number(v) then return v end
+    ok, v = pcall(function() return sc:get_string(key) end)
+    if ok then
+        v = tonumber(v)
+        if is_finite_number(v) then return v end
+    end
+    return nil
+end
+
+local function get_scores(cands)
+    if not llm or not llm.get_scores then return nil end
+    local ok, scores = pcall(function() return llm.get_scores() end)
+    if not ok or type(scores) ~= "table" then return nil end
+    for _, text in ipairs(cands) do
+        if not is_finite_number(scores[text]) then return nil end
+    end
+    return scores
+end
 
 local function load_llm(env)
     local ok, cpp = pcall(require, "rime_llm")
@@ -49,6 +80,8 @@ local function init_config(env)
     if v then cfg.max_code_len = v end
     v = sc:get_bool("llm_rerank/long_word_first")
     if v ~= nil then cfg.long_word_first = v end
+    v = get_config_number(sc, "llm_rerank/expected_length_weight")
+    if v ~= nil then cfg.expected_length_weight = math.max(0, v) end
     v = sc:get_int("llm_rerank/max_tokens")
     if v then cfg.max_tokens = v end
     v = sc:get_int("llm_rerank/max_candidates")
@@ -127,15 +160,18 @@ return function(translation, env)
     -- 编辑操作 (退格/导航/回车) 后 llm_processor 清空 _G.llm_filter_cache,
     -- 重打相同词重新推理 (同 ctx+input 的旧结果不适用于编辑后的新候选窗)
     local cache = _G.llm_filter_cache
-    local ok, result
+    local ok, result, scores
     if cache and cache.ctx == context and cache.input == input and cache.result then
-        ok, result = true, cache.result
+        ok, result, scores = true, cache.result, cache.scores
     else
         local t0 = os.clock()
         ok, result = pcall(function() return llm.score(context, cands) end)
         local elapsed_ms = (os.clock() - t0) * 1000
         if ok and type(result) == "table" then
-            _G.llm_filter_cache = { ctx = context, input = input, result = result }
+            scores = get_scores(cands)
+            _G.llm_filter_cache = {
+                ctx = context, input = input, result = result, scores = scores
+            }
         end
 
         -- Event log (仅真实推理时写; RIME 用户目录, 回退 %TEMP%)
@@ -174,17 +210,53 @@ return function(translation, env)
                 end
             end
         end
-        -- long-word-first (long_word_first): 候选算完 CE 后按词长降序排序,
-        -- 同词长保持 CE 评分序 (不再只分"多字≥2字/单字"两组)。此时 ordered
-        -- 已是 LLM 评分序 (result), 用 idx 做稳定排序, 同词长保持 CE 序。
-        if cfg.long_word_first and #ordered > 1 then
+        -- 两码一字方案: L 码对应 L/2 或 (L-1)/2 字。整数化后等价于 floor(L/2)。
+        -- 奖励使用本次 LLM 分数跨度，保留分数差明显时的语义排序。
+        if cfg.expected_length_weight > 0 and #ordered > 1 and scores then
+            local arr = {}
+            local min_score, max_score
+            for i, c in ipairs(ordered) do
+                local score = scores[c.text]
+                if not is_finite_number(score) then
+                    arr = nil
+                    break
+                end
+                local valid = is_valid_llm_score(score)
+                if valid then
+                    if not min_score or score < min_score then min_score = score end
+                    if not max_score or score > max_score then max_score = score end
+                end
+                arr[i] = { c = c, score = score, valid = valid, idx = i }
+            end
+            local expected_len = math.floor(#input / 2)
+            local span = (min_score and max_score) and (max_score - min_score) or 0
+            if arr and expected_len >= 1 and span > 0 then
+                for _, item in ipairs(arr) do
+                    local len = utf8.len(item.c.text or "") or 0
+                    item.matches_expected_length = item.valid and len == expected_len
+                    if item.matches_expected_length then
+                        item.score = item.score + cfg.expected_length_weight * span
+                    end
+                end
+                table.sort(arr, function(a, b)
+                    if a.score ~= b.score then return a.score > b.score end
+                    if a.matches_expected_length ~= b.matches_expected_length then
+                        return a.matches_expected_length
+                    end
+                    return a.idx < b.idx  -- 分数相同保持 LLM 评分序
+                end)
+                for i = 1, #arr do ordered[i] = arr[i].c end
+            end
+        -- long-word-first (long_word_first): 未启用新方案时按词长降序，
+        -- 同词长保持 LLM 评分序。
+        elseif cfg.expected_length_weight <= 0 and cfg.long_word_first and #ordered > 1 then
             local arr = {}
             for i, c in ipairs(ordered) do
                 arr[i] = { c = c, len = utf8.len(c.text or "") or 0, idx = i }
             end
             table.sort(arr, function(a, b)
                 if a.len ~= b.len then return a.len > b.len end
-                return a.idx < b.idx  -- 同词长保持 LLM 评分序
+                return a.idx < b.idx
             end)
             for i = 1, #arr do ordered[i] = arr[i].c end
         end
