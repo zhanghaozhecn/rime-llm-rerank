@@ -85,7 +85,7 @@ if(MSVC)
     target_compile_options(bench_single_char PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
     # Thread count sweep benchmark
-    add_executable(bench_thr bench_thr.cpp)
+    add_executable(bench_thr bench_threads.cpp)
     target_include_directories(bench_thr PRIVATE
         "${LLAMA_ROOT}/include"
         "${LLAMA_ROOT}/ggml/include"

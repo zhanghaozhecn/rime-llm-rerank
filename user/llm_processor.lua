@@ -48,6 +48,45 @@ local function append_raw(text)
     end
 end
 
+-- === 用户词频计数 (llm_filter 排序融合用, 2026-08-19) ===
+-- _G.user_word_freq: 词 → 次数。启动从 user_freq.tsv 加载, 每 20 个新词
+-- 重写落盘 (崩溃最多丢 19 次计数)。仅计含中文的词 (与训练语料同语义;
+-- 候选词均为中文词)。llm_filter 的 freq_weight 融合直接读此表。
+local FREQ_FLUSH = 20
+local freq_dirty = 0
+local function freq_file()
+    return rime_api.get_user_data_dir() .. "\\user_freq.tsv"
+end
+local function freq_load()
+    _G.user_word_freq = _G.user_word_freq or {}
+    local f = io.open(freq_file(), "r")
+    if f then
+        for line in f:lines() do
+            local w, n = line:match("^(.-)\t(%d+)$")
+            if w and n then _G.user_word_freq[w] = tonumber(n) end
+        end
+        f:close()
+    end
+end
+local function freq_save()
+    local f = io.open(freq_file(), "w")
+    if f then
+        for w, n in pairs(_G.user_word_freq) do
+            f:write(w .. "\t" .. n .. "\n")
+        end
+        f:close()
+    end
+end
+local function freq_bump(word)
+    if not _G.user_word_freq then freq_load() end
+    _G.user_word_freq[word] = (_G.user_word_freq[word] or 0) + 1
+    freq_dirty = freq_dirty + 1
+    if freq_dirty >= FREQ_FLUSH then
+        freq_save()
+        freq_dirty = 0
+    end
+end
+
 local function find_overlap(prev, curr)
     local np, nc = #prev, #curr
     for len = math.min(np, nc), 0, -1 do
@@ -176,6 +215,8 @@ local function processor(key, env)
                 end
                 pending_code = ""
                 last_full = ""
+                -- 词频计数: 仅含中文的词 (含英文/数字/标点不参与融合)
+                if has_chinese then freq_bump(w) end
                 -- 真实候选窗快照 (llm_filter 记录): 用截断前的完整码匹配
                 -- (filter 记录的是完整 input; 训练样本带真实候选窗 词\t码\t候选1,候选2,...,
                 -- LLM 重排目标 = 在窗内把正确词排第一; 无快照/不匹配回退旧格式 仅词+码)

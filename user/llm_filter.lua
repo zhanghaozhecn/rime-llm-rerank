@@ -14,6 +14,8 @@ local cfg = {
     cpu_cores        = nil,  -- nil = auto-detect in C++
     long_word_first = false,  -- true = 重排后多字词优先、单字词靠后（组内按 LLM 评分）
     expected_length_weight = 0,  -- > 0 = 两码一字方案的编码长度匹配加权
+    freq_weight = 0.25,  -- 用户词频融合权重 (0=关闭); total=(1-w)·LLM + w·词频
+    freq_k = 5,          -- 词频饱和常数: s_f = count/(count+k)
 }
 
 local lat_max   = 0
@@ -82,6 +84,10 @@ local function init_config(env)
     if v ~= nil then cfg.long_word_first = v end
     v = get_config_number(sc, "llm_rerank/expected_length_weight")
     if v ~= nil then cfg.expected_length_weight = math.max(0, v) end
+    v = get_config_number(sc, "llm_rerank/freq_weight")
+    if v ~= nil then cfg.freq_weight = math.max(0, v) end
+    v = get_config_number(sc, "llm_rerank/freq_k")
+    if v ~= nil and v >= 1 then cfg.freq_k = v end
     v = sc:get_int("llm_rerank/max_tokens")
     if v then cfg.max_tokens = v end
     v = sc:get_int("llm_rerank/max_candidates")
@@ -207,6 +213,45 @@ return function(translation, env)
                     seen[c.text] = true
                     table.insert(ordered, c)
                     break
+                end
+            end
+        end
+        -- 用户词频融合 (freq_weight, 2026-08-19): total = (1-w)·LLM_minmax
+        -- + w·count/(count+k)。实证 (17258 真实候选窗回放, 6000 抽样): 纯 LLM
+        -- 排错事件 87% 的选中词用户词频 ≥2 —— 个性化高频词正是纯 LLM 排序的
+        -- 盲区; w=0.25/k=5 首选率 97.08%→98.20% (+1.12pp)。曲线到 w=0.5 仍
+        -- 单调升但边际递减, 且评估标签自带高频偏好 (用户选择≈高频), 默认取
+        -- 膝点保留 75% LLM 权重, 照顾低频新词的语义泛化。计数源 =
+        -- llm_processor 维护的 _G.user_word_freq (user_freq.tsv)。
+        -- 应用在其他排序策略之前: 融合结果作为新的基础序, expected_length
+        -- / long_word_first 以同分 idx 的方式保留其影响。
+        if cfg.freq_weight > 0 and #ordered > 1 and scores then
+            local freq = _G.user_word_freq
+            if type(freq) == "table" then
+                local lo, hi
+                for _, c in ipairs(ordered) do
+                    local s = scores[c.text]
+                    if is_valid_llm_score(s) then
+                        if not lo or s < lo then lo = s end
+                        if not hi or s > hi then hi = s end
+                    end
+                end
+                local span = (lo and hi) and (hi - lo) or 0
+                if span > 0 then
+                    local w, k = cfg.freq_weight, cfg.freq_k
+                    local arr = {}
+                    for i, c in ipairs(ordered) do
+                        local s = scores[c.text]
+                        -- 失败哨兵/缺分 → s_l=0 (排尾部, 词频仍可救)
+                        local sl = is_valid_llm_score(s) and ((s - lo) / span) or 0
+                        local n = freq[c.text] or 0
+                        arr[i] = { c = c, t = (1 - w) * sl + w * (n / (n + k)), idx = i }
+                    end
+                    table.sort(arr, function(a, b)
+                        if a.t ~= b.t then return a.t > b.t end
+                        return a.idx < b.idx  -- 同分保持 LLM 评分序
+                    end)
+                    for i = 1, #arr do ordered[i] = arr[i].c end
                 end
             end
         end

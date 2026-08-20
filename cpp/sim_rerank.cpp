@@ -138,7 +138,12 @@ static std::vector<std::string> json_get_array(const std::string& json, const ch
 
 int main(int argc, char* argv[]) {
     const char* model_path = (argc > 1) ? argv[1] : DEFAULT_MODEL_PATH;
-    fprintf(stderr, "Model: %s\n", model_path);
+    // --scores: 输出 {"ranked":[...],"scores":{词:原始分,...}} (权重分析用;
+    // 默认仍输出纯 ranked 数组, eval_rerank.py 依赖不变)
+    bool emit_scores = false;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--scores") == 0) emit_scores = true;
+    fprintf(stderr, "Model: %s%s\n", model_path, emit_scores ? " (--scores)" : "");
 
     // Init model
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -194,18 +199,45 @@ int main(int argc, char* argv[]) {
             [&](int a, int b) { return scores[a] > scores[b]; });
 
         // Output
-        printf("[");
-        for (int i = 0; i < (int)order.size(); i++) {
-            if (i > 0) printf(",");
-            // Escape quotes in output
-            std::string escaped;
-            for (char c : cand_texts[order[i]]) {
-                if (c == '"' || c == '\\') escaped += '\\';
-                escaped += c;
+        if (emit_scores) {
+            printf("{\"ranked\":[");
+            for (int i = 0; i < (int)order.size(); i++) {
+                if (i > 0) printf(",");
+                std::string escaped;
+                for (char c : cand_texts[order[i]]) {
+                    if (c == '"' || c == '\\') escaped += '\\';
+                    escaped += c;
+                }
+                printf("\"%s\"", escaped.c_str());
             }
-            printf("\"%s\"", escaped.c_str());
+            printf("],\"scores\":{");
+            bool first = true;
+            for (int i = 0; i < (int)cand_texts.size(); i++) {
+                if (scores[i] <= -1e9) continue;  // 失败哨兵不输出
+                if (!first) printf(",");
+                first = false;
+                std::string escaped;
+                for (char c : cand_texts[i]) {
+                    if (c == '"' || c == '\\') escaped += '\\';
+                    escaped += c;
+                }
+                printf("\"%s\":%.6f", escaped.c_str(), scores[i]);
+            }
+            printf("}}\n");
+        } else {
+            printf("[");
+            for (int i = 0; i < (int)order.size(); i++) {
+                if (i > 0) printf(",");
+                // Escape quotes in output
+                std::string escaped;
+                for (char c : cand_texts[order[i]]) {
+                    if (c == '"' || c == '\\') escaped += '\\';
+                    escaped += c;
+                }
+                printf("\"%s\"", escaped.c_str());
+            }
+            printf("]\n");
         }
-        printf("]\n");
         fflush(stdout);
 
         count++;
