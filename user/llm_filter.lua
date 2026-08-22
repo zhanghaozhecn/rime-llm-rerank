@@ -15,7 +15,7 @@ local cfg = {
     long_word_first = false,  -- true = 重排后多字词优先、单字词靠后（组内按 LLM 评分）
     expected_length_weight = 0,  -- > 0 = 两码一字方案的编码长度匹配加权
     freq_weight = 0.25,  -- 用户词频融合权重 (0=关闭); total=(1-w)·LLM + w·词频
-    freq_k = 5,          -- 词频饱和常数: s_f = count/(count+k)
+    freq_k = 5,          -- 词频饱和常数: s_f = eff/(eff+k); eff = rime 时间衰减计数
 }
 
 local lat_max   = 0
@@ -216,18 +216,18 @@ return function(translation, env)
                 end
             end
         end
-        -- 用户词频融合 (freq_weight, 2026-08-19): total = (1-w)·LLM_minmax
-        -- + w·count/(count+k)。实证 (17258 真实候选窗回放, 6000 抽样): 纯 LLM
-        -- 排错事件 87% 的选中词用户词频 ≥2 —— 个性化高频词正是纯 LLM 排序的
-        -- 盲区; w=0.25/k=5 首选率 97.08%→98.20% (+1.12pp)。曲线到 w=0.5 仍
-        -- 单调升但边际递减, 且评估标签自带高频偏好 (用户选择≈高频), 默认取
-        -- 膝点保留 75% LLM 权重, 照顾低频新词的语义泛化。计数源 =
-        -- llm_processor 维护的 _G.user_word_freq (user_freq.tsv)。
-        -- 应用在其他排序策略之前: 融合结果作为新的基础序, expected_length
-        -- / long_word_first 以同分 idx 的方式保留其影响。
+        -- 用户词频融合 (freq_weight, 2026-08-19; 2026-08-21 词频改 Rime 时间衰减):
+        -- total = (1-w)·LLM_minmax + w·eff/(eff+k)。eff = librime algo::formula_d
+        -- 指数衰减计数 (τ=200 tick, tick=每词提交+1, 与引擎调频同源; 由
+        -- llm_processor 维护, _G.user_freq_eff 查询) — 近期常打的词权重高,
+        -- 久未使用的自动消退。实证 (17258 真实候选窗, 6000 抽样, 事前计数
+        -- 口径): 纯 LLM 97.08%, 衰减融合约 +0.4pp; 融合的意义在个性化高频
+        -- 词 (纯 LLM 排错事件 87% 选中词词频>=2)。同分稳定保序。
+        -- 应用于其他排序策略之前: expected_length / long_word_first 以同分
+        -- idx 的方式保留其影响。
         if cfg.freq_weight > 0 and #ordered > 1 and scores then
-            local freq = _G.user_word_freq
-            if type(freq) == "table" then
+            local freq_eff = _G.user_freq_eff
+            if freq_eff then
                 local lo, hi
                 for _, c in ipairs(ordered) do
                     local s = scores[c.text]
@@ -244,7 +244,7 @@ return function(translation, env)
                         local s = scores[c.text]
                         -- 失败哨兵/缺分 → s_l=0 (排尾部, 词频仍可救)
                         local sl = is_valid_llm_score(s) and ((s - lo) / span) or 0
-                        local n = freq[c.text] or 0
+                        local n = freq_eff(c.text)
                         arr[i] = { c = c, t = (1 - w) * sl + w * (n / (n + k)), idx = i }
                     end
                     table.sort(arr, function(a, b)

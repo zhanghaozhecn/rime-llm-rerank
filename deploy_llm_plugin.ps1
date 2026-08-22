@@ -239,8 +239,8 @@ if (-not $hasCfg) {
     "  # max_code_len: 0",     # 编码长度上限（0=不限制）；与 min_code_len 组成触发区间
     "  # long_word_first: false",  # true=long-word-first: 按词长降序、同词长按 CE 评分
     "  # expected_length_weight: 0.20",  # 两码一字方案：匹配预期字长加权；0=关闭
-    "  # freq_weight: 0.25",  # 用户词频融合权重 (0=关闭); 词频自动统计
-    "  # freq_k: 5",  # 词频饱和常数 count/(count+k)
+    "  # freq_weight: 0.25",  # 用户词频融合权重 (0=关闭); 词频为 rime formula_d 时间衰减计数
+    "  # freq_k: 5",  # 词频饱和常数 eff/(eff+k)
     "  # min_tokens: 1",       # 最少上文 token 才重排
     "  # max_tokens: 10",      # 上文 token 上限（10 为性价比最优点）
     "  # max_candidates: 5",   # 参与评分的候选数

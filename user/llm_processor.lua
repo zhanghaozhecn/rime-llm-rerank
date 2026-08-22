@@ -48,10 +48,16 @@ local function append_raw(text)
     end
 end
 
--- === 用户词频计数 (llm_filter 排序融合用, 2026-08-19) ===
--- _G.user_word_freq: 词 → 次数。启动从 user_freq.tsv 加载, 每 20 个新词
--- 重写落盘 (崩溃最多丢 19 次计数)。仅计含中文的词 (与训练语料同语义;
--- 候选词均为中文词)。llm_filter 的 freq_weight 融合直接读此表。
+-- === 用户词频计数 (llm_filter 排序融合用, 2026-08-19; 2026-08-21 改 Rime 时间衰减) ===
+-- _G.user_word_freq: 词 → {c=累计次数, d=衰减计数 dee, t=最后提交 tick}
+-- _G.user_freq_tick: 全局 tick (每词提交 +1, 同 rime userdb UpdateTickCount)
+-- 衰减算法 = librime algo::formula_d (user_dictionary.cc 调频同源):
+--   提交: dee = 1 + dee·exp((t_old - t_now)/200)   时间常数 τ=200 tick
+--   查询: eff = dee·exp((t_word - t_now)/200)      (未提交期间持续衰减)
+-- 每 20 个新词重写落盘 user_freq.tsv (崩溃最多丢 19 次计数)。仅计含中文的词。
+-- 格式: 首行 "#tick=N", 数据行 "词\t累计\tdee\ttick"; 兼容旧版 "词\t次数"
+-- (迁移为 dee=次数, tick=当前 — 视为刚提交过)。
+local FREQ_TAU = 200
 local FREQ_FLUSH = 20
 local freq_dirty = 0
 local function freq_file()
@@ -59,32 +65,64 @@ local function freq_file()
 end
 local function freq_load()
     _G.user_word_freq = _G.user_word_freq or {}
+    local tick, maxt, legacy = nil, 0, {}
     local f = io.open(freq_file(), "r")
     if f then
         for line in f:lines() do
-            local w, n = line:match("^(.-)\t(%d+)$")
-            if w and n then _G.user_word_freq[w] = tonumber(n) end
+            local t = line:match("^#tick=(%d+)$")
+            if t then
+                tick = tonumber(t)
+            else
+                local w, c, d, tk = line:match("^(.-)\t(%d+)\t([%d%.]+)\t(%d+)$")
+                if w and c and d and tk then
+                    _G.user_word_freq[w] = { c = tonumber(c), d = tonumber(d), t = tonumber(tk) }
+                    if tonumber(tk) > maxt then maxt = tonumber(tk) end
+                else
+                    local w2, n = line:match("^(.-)\t(%d+)$")
+                    if w2 and n then legacy[#legacy + 1] = { w2, tonumber(n) } end
+                end
+            end
         end
         f:close()
+    end
+    _G.user_freq_tick = tick or maxt
+    for _, e in ipairs(legacy) do
+        _G.user_word_freq[e[1]] = { c = e[2], d = e[2], t = _G.user_freq_tick }
     end
 end
 local function freq_save()
     local f = io.open(freq_file(), "w")
     if f then
-        for w, n in pairs(_G.user_word_freq) do
-            f:write(w .. "\t" .. n .. "\n")
+        f:write("#tick=" .. (_G.user_freq_tick or 0) .. "\n")
+        for w, e in pairs(_G.user_word_freq) do
+            f:write(string.format("%s\t%d\t%.3f\t%d\n", w, e.c, e.d, e.t))
         end
         f:close()
     end
 end
 local function freq_bump(word)
     if not _G.user_word_freq then freq_load() end
-    _G.user_word_freq[word] = (_G.user_word_freq[word] or 0) + 1
+    _G.user_freq_tick = (_G.user_freq_tick or 0) + 1
+    local e = _G.user_word_freq[word]
+    if not e then
+        e = { c = 0, d = 0, t = 0 }
+        _G.user_word_freq[word] = e
+    end
+    e.d = 1 + e.d * math.exp((e.t - _G.user_freq_tick) / FREQ_TAU)
+    e.c = e.c + 1
+    e.t = _G.user_freq_tick
     freq_dirty = freq_dirty + 1
     if freq_dirty >= FREQ_FLUSH then
         freq_save()
         freq_dirty = 0
     end
+end
+
+-- 衰减有效计数 (llm_filter 融合用): rime formula_d 查询式
+_G.user_freq_eff = function(w)
+    local e = _G.user_word_freq and _G.user_word_freq[w]
+    if not e or e.d <= 0 then return 0 end
+    return e.d * math.exp((e.t - (_G.user_freq_tick or e.t)) / FREQ_TAU)
 end
 
 local function find_overlap(prev, curr)
