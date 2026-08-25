@@ -269,23 +269,40 @@ function Invoke-Redeploy([string]$installDir, $Log) {
   }
 }
 
-# 替换安装目录二进制：WeaselServer.exe（算法服务）加载 rime.dll / rime_llm.dll
-# （及 ggml 系），必须停进程才能替换；且 TSF 客户端在击键时会自动把 server
-# 拉起，单次 taskkill+等待与复制存在竞态（曾致 rime.dll 替换失败）。
-# 策略：先直接试复制（未加载则零打扰）；失败 → 停算法服务 → 重试。
+# 5.1 陷阱: EAP=Stop 下原生命令写 stderr 会以该行内容抛终止错误（2>$null
+# 不豁免；taskkill "process not found" 这类正常 stderr 也会炸，2026-08-25
+# 实测 [1/4] 停 Deployer 误炸中止）。所有原生命令统一经本 helper 执行。
+function Invoke-Native([string]$exe, [string[]]$argList) {
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try { & $exe @argList 2>$null } catch { }
+  finally { $ErrorActionPreference = $prev }
+}
+
+# 替换安装目录二进制。核心问题：WeaselServer.exe（算法服务）加载 rime.dll
+# 等镜像，且 TSF 击键会毫秒级自动拉起被杀的 server —— taskkill 后赛跑复制
+# 必输（2s 窗口内 server 已复活，实测 6 连败）。
+# 解法：Windows 允许改名加载中的镜像 —— 旧文件改名 .llm_old 腾出目标名 →
+# 复制新文件；旧进程继续跑旧镜像，[4/4] 重启 server 后加载新文件。
 function Copy-BinaryRetry([string]$s, [string]$d, $Log) {
-  for ($i = 0; $i -le 6; $i++) {
+  for ($i = 0; $i -le 3; $i++) {
     try { Copy-Item $s $d -Force -ErrorAction Stop; return }
     catch {
-      if ($i -eq 6) {
-        throw ("无法替换 " + $d + "：请手动结束 WeaselServer.exe（任务管理器）或退出小狼毫后重试")
+      try {
+        Move-Item $d ($d + ".llm_old") -Force -ErrorAction Stop
+        Copy-Item $s $d -Force -ErrorAction Stop
+        & $Log ("  " + [IO.Path]::GetFileName($d) + " 被占用，改名替换（旧镜像留给运行中的进程）")
+        return
+      } catch {
+        Invoke-Native taskkill @("/f", "/im", "WeaselServer.exe") | Out-Null
+        Invoke-Native taskkill @("/f", "/im", "WeaselDeployer.exe") | Out-Null
+        & $Log ("  " + [IO.Path]::GetFileName($d) + " 被占用，停止服务重试（" + ($i + 1) + "/3）…")
+        Start-Sleep -Seconds 2
       }
-      taskkill /f /im WeaselServer.exe 2>$null | Out-Null
-      taskkill /f /im WeaselDeployer.exe 2>$null | Out-Null
-      & $Log ("  " + [IO.Path]::GetFileName($d) + " 被算法服务占用，已停止服务，重试（" + ($i + 1) + "/6）…")
-      Start-Sleep -Seconds 2
     }
   }
+  throw ("无法替换 " + $d + "：" + $_.Exception.Message +
+         "（若为拒绝访问：请用 install_llm_gui.bat 启动安装器以获得管理员权限）")
 }
 
 function Install-PluginAction([string]$schemaName, [string]$model, $Log) {
@@ -350,8 +367,11 @@ function Install-SourceAction([string]$schemaName, [string]$model, $Log) {
   if (-not (Ensure-Model $model $Log)) { throw "模型缺失，安装中止（文件未改动）" }
 
   & $Log "[1/4] 停止 WeaselServer（算法服务持有 rime.dll，必须停止才能替换）"
-  taskkill /f /im WeaselServer.exe 2>$null | Out-Null
-  taskkill /f /im WeaselDeployer.exe 2>$null | Out-Null
+  Invoke-Native taskkill @("/f", "/im", "WeaselServer.exe") | Out-Null
+  Invoke-Native taskkill @("/f", "/im", "WeaselDeployer.exe") | Out-Null
+  # 清理上次改名替换留下的旧镜像（未被加载时）
+  Get-ChildItem $installDir -Filter "*.llm_old" -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 2
 
   & $Log "[2/4] 复制 LLM 二进制（TSF 击键会自动重启服务，占用则自动停止重试）"
@@ -370,13 +390,14 @@ function Install-SourceAction([string]$schemaName, [string]$model, $Log) {
   }
 
   & $Log "[3/4] WeaselSetup 注册（TSF 组件部署）"
-  & (Join-Path $installDir "WeaselSetup.exe") /u 2>$null
-  & (Join-Path $installDir "WeaselSetup.exe") /i 2>$null
-  $reg = reg query "HKLM\SOFTWARE\Classes\WOW6432Node\CLSID\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}\InprocServer32" /ve 2>$null | Select-String -SimpleMatch "weasel"
+  Invoke-Native (Join-Path $installDir "WeaselSetup.exe") @("/u")
+  Invoke-Native (Join-Path $installDir "WeaselSetup.exe") @("/i")
+  $reg = Invoke-Native reg @("query", "HKLM\SOFTWARE\Classes\WOW6432Node\CLSID\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}\InprocServer32", "/ve") |
+         Select-String -SimpleMatch "weasel"
   if (-not $reg) {
     & $Log "  32 位视图注册缺失，注册中…"
     $env:TEXTSERVICE_PROFILE = "hans"
-    & "$env:WINDIR\SysWOW64\regsvr32.exe" /s "$env:WINDIR\SysWOW64\weasel.dll" 2>$null
+    Invoke-Native "$env:WINDIR\SysWOW64\regsvr32.exe" @("/s", "$env:WINDIR\SysWOW64\weasel.dll")
   }
 
   & $Log "[4/4] 启动 server + 修改方案 schema + 重新部署"
