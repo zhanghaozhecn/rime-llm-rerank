@@ -221,8 +221,8 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 使用 **GUI 安装器**（`installer\` 目录；插件版与源码版通用，含还原功能）：
 
-1. 复制 `installer\` 目录到目标电脑（或使用 `rime-llm-installer.zip` 发布包；在本仓库 clone 内直接运行时，插件版文件自动从 `user\` 读取）
-2. **双击 `install_llm_gui.bat`**（自动请求管理员权限）打开图形界面
+1. `git clone` 本仓库到目标电脑（或下载仓库 zip 解压——插件版文件在 `user\`、源码版二进制在 `installer\source\`，均已入库）
+2. **双击 `installer\install_llm_gui.bat`**（自动请求管理员权限）打开图形界面
 3. 界面操作：
    - **方案文件**：下拉选择 RIME 用户目录中的 `*.schema.yaml`（或"浏览"选外部 yaml，自动拷入用户目录）
    - **模型路径**：留空 = 默认 `D:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`；缺失时询问是否下载（约 500MB，ModelScope 断点续传，状态栏实时显示下载进度）
