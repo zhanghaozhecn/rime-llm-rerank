@@ -219,21 +219,20 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ## 一键部署（推荐）
 
-使用 **GUI 安装器**（`installer\` 目录；插件版与源码版通用，含还原功能）：
+使用 **GUI 安装器**（`installer\` 目录；插件版与源码版通用）。安装器**只做文件操作**——停止算法服务 → 复制/替换文件（被占用时自动改名腾位，极端情况延迟替换重启生效）。不修改方案配置、不碰注册表。
+
+**前提**：已安装官方小狼毫；方案配置已含 LLM 组件行（拼读双拼方案自带——`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`；其他方案参照"手动安装"第三步自行添加）。
 
 1. `git clone` 本仓库到目标电脑（或下载仓库 zip 解压——插件版文件在 `user\`、源码版二进制在 `installer\source\`，均已入库）
-2. **双击 `installer\install_llm_gui.bat`**（自动请求管理员权限）打开图形界面
-3. 界面操作：
-   - **方案文件**：下拉选择 RIME 用户目录中的 `*.schema.yaml`（或"浏览"选外部 yaml，自动拷入用户目录）
-   - **模型路径**：留空 = 默认 `D:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`；缺失时询问是否下载（约 500MB，ModelScope 断点续传，状态栏实时显示下载进度）
-   - 点击 **安装插件版**——预检（schema 冲突 / 文件完整性 / 模型）→ 复制 DLL 与 lua → schema 幂等插入（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`——固顶词 filter 之前，先 LLM 重排再固顶提升）→ 自动触发重新部署
-4. 验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`
+2. **双击 `installer\install_llm_gui.bat`**（自动请求管理员权限）
+3. 点击 **安装插件版**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → 重启算法服务
+4. **托盘小狼毫 → 右键 → 重新部署**。验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`
 
-**还原**：界面点击"还原插件版"——仅剥离 schema 的 LLM 组件行与 `llm_rerank` 节并自动重新部署（**不删任何文件**，避免误操作；被剥离的组件不再被引用即不生效）。残留 DLL/lua 可按界面列出的路径手动删除。
+**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 把原始（不含 LLM 组件行）的方案配置重新复制到 `%APPDATA%\Rime\` → 打开安装器点另一个按钮。**切换没有自动流程**，这是刻意设计——避免任何状态残留。
 
-**冲突检测**：安装目录 `rime.dll` 为源码版 LLM 组件（二进制含 `llm_filter` 特征）时中止——插件版需官方 rime.dll，两版二选一（先用安装器还原源码版并重装官方小狼毫）。
+**输入法图标消失时**：运行 `installer\repair_tsf.ps1`（右键"使用 PowerShell 运行"，自动提权；重注册 TSF 并挂回语言列表）。
 
-命令行部署（无界面 / 自动化）：`deploy_llm_plugin.bat` + `deploy_llm_plugin.ps1` + `user\` 三件同目录，参数 `-ModelPath` / `-InstallDir` / `-SchemaName` / `-Force`；GUI 亦支持 `install_llm_gui.ps1 -CliAction install-plugin|status|restore-plugin`。
+命令行模式：`install_llm_gui.ps1 -CliAction install-plugin|install-source|status`。
 
 ## 手动安装
 
