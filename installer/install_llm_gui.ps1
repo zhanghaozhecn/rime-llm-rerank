@@ -269,6 +269,25 @@ function Invoke-Redeploy([string]$installDir, $Log) {
   }
 }
 
+# 替换安装目录二进制：WeaselServer.exe（算法服务）加载 rime.dll / rime_llm.dll
+# （及 ggml 系），必须停进程才能替换；且 TSF 客户端在击键时会自动把 server
+# 拉起，单次 taskkill+等待与复制存在竞态（曾致 rime.dll 替换失败）。
+# 策略：先直接试复制（未加载则零打扰）；失败 → 停算法服务 → 重试。
+function Copy-BinaryRetry([string]$s, [string]$d, $Log) {
+  for ($i = 0; $i -le 6; $i++) {
+    try { Copy-Item $s $d -Force -ErrorAction Stop; return }
+    catch {
+      if ($i -eq 6) {
+        throw ("无法替换 " + $d + "：请手动结束 WeaselServer.exe（任务管理器）或退出小狼毫后重试")
+      }
+      taskkill /f /im WeaselServer.exe 2>$null | Out-Null
+      taskkill /f /im WeaselDeployer.exe 2>$null | Out-Null
+      & $Log ("  " + [IO.Path]::GetFileName($d) + " 被算法服务占用，已停止服务，重试（" + ($i + 1) + "/6）…")
+      Start-Sleep -Seconds 2
+    }
+  }
+}
+
 function Install-PluginAction([string]$schemaName, [string]$model, $Log) {
   & $Log "── 安装插件版 ──"
   $installDir = Find-WeaselDir
@@ -289,11 +308,11 @@ function Install-PluginAction([string]$schemaName, [string]$model, $Log) {
   }
   if (-not (Ensure-Model $model $Log)) { throw "模型缺失，安装中止（文件未改动）" }
 
-  & $Log "[1/3] 复制插件文件"
+  & $Log "[1/3] 复制插件文件（若被运行中的算法服务加载，自动停止后重试）"
   foreach ($d in @("rime_llm.dll", "llama.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll")) {
     $s = Join-Path $PluginSrc $d
     if (Test-Path $s) {
-      Copy-Item $s (Join-Path $installDir $d) -Force
+      Copy-BinaryRetry $s (Join-Path $installDir $d) $Log
       & $Log ("  + " + $d)
     }
   }
@@ -330,11 +349,12 @@ function Install-SourceAction([string]$schemaName, [string]$model, $Log) {
   }
   if (-not (Ensure-Model $model $Log)) { throw "模型缺失，安装中止（文件未改动）" }
 
-  & $Log "[1/4] 停止 WeaselServer"
+  & $Log "[1/4] 停止 WeaselServer（算法服务持有 rime.dll，必须停止才能替换）"
   taskkill /f /im WeaselServer.exe 2>$null | Out-Null
+  taskkill /f /im WeaselDeployer.exe 2>$null | Out-Null
   Start-Sleep -Seconds 2
 
-  & $Log "[2/4] 复制 LLM 二进制"
+  & $Log "[2/4] 复制 LLM 二进制（TSF 击键会自动重启服务，占用则自动停止重试）"
   foreach ($pair in @(
       @("rime.dll", "rime.dll"), @("WeaselServer.exe", "WeaselServer.exe"),
       @("WeaselDeployer.exe", "WeaselDeployer.exe"), @("opencc.dll", "opencc.dll"),
@@ -342,7 +362,7 @@ function Install-SourceAction([string]$schemaName, [string]$model, $Log) {
       @("weasel32.dll", "weasel.dll"))) {
     $s = Join-Path $SourceSrc $pair[0]
     if (Test-Path $s) {
-      Copy-Item $s (Join-Path $installDir $pair[1]) -Force
+      Copy-BinaryRetry $s (Join-Path $installDir $pair[1]) $Log
       & $Log ("  + " + $pair[1])
     } else {
       & $Log ("  [MISS] " + $pair[0] + "（跳过，保留安装目录现有文件）")
@@ -650,7 +670,18 @@ $timer.Add_Tick({
   # 必失败路径曾因此无限弹"操作失败"）
   Start-Sleep -Milliseconds 200   # 等缓冲落盘
   Read-WorkLog
-  $failed = ($script:WorkProc.ExitCode -ne 0)
+  # 失败判定多信号：子进程契约是失败必打 [ERROR] 行（catch → exit 1）；
+  # ExitCode 偶发不可读（还原成功却误报失败，2026-08-25 实测），故以
+  # [ERROR] 行为主、退出码为辅
+  $code = $null
+  try { $code = $script:WorkProc.ExitCode } catch { }
+  $failed = ($txtLog.Text -match '(?m)^\[ERROR\]') -or
+            ($null -ne $code -and $code -ne 0)
+  if ($null -eq $code) {
+    $txtLog.AppendText("[警告] 子进程退出码不可读，已按日志 [ERROR] 行判定`r`n")
+  } else {
+    $txtLog.AppendText(("[信息] 子进程退出码: " + $code + "`r`n"))
+  }
   $timer.Stop()
   $script:WorkDone = $true
   $script:WorkProc = $null
