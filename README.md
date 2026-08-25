@@ -385,7 +385,9 @@ rime-llm-rerank\
 │   ├── prep_training.py       #   打字语料 llm_training.txt → train_samples.tsv
 │   └── run_tests.py           #   test_core 自动化测试驱动
 ├── bin\bench_threads.exe      # 预编译线程测定工具
-└── deploy_llm_plugin.bat/.ps1 # 一键部署（提权 bat + PS 逻辑）
+└── installer\                 # 双安装器：install_plugin.bat / install_source.bat
+                                # + common.ps1 共享逻辑 + repair_tsf.ps1 应急修复
+                                # + source\ 源码版二进制（插件版载荷 = user\）
 ```
 
 > 评估工具路径约定：**项目内资源**（词库 `pdsp_dict.yaml`、样本 `eval_samples.tsv`、`sim_rerank.exe`）相对脚本位置，cpp 程序数据文件相对 cwd（在项目根运行）；**本机/跨项目资源**（模型、语料、venv、处理脚本）用环境变量覆盖，默认值见下表。GPU 版（`rime_llm_cuda.cpp`/DLL）与语料（`train_samples.tsv` 等）仅本地留存，不进 GitHub。
@@ -473,9 +475,9 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 - **`test_core.exe`**：CE 正确性（分层 vs gold 对比）+ 准确率/延迟回归基线（`test_baseline.json`），改评分逻辑后必跑。
 
-## 部署脚本原理
+## 安装器原理
 
-`deploy_llm_plugin.ps1`（`deploy_llm_plugin.bat` 提权调用）四步：① 定位安装目录（常见路径 → 注册表）；② 检测源码版 rime.dll 冲突（二进制含 `llm_filter` 特征即中止）；③ 复制 DLL/lua；④ schema 幂等修改（已存在时校验位置：processor 最前、filter 在 uniquifier 后固顶前，位置错则警告中止）。所有 schema 读写为 UTF-8 无 BOM。
+`installer\common.ps1`（`install_plugin.bat` / `install_source.bat` 提权启动对应入口）：停算法服务 → 复制/替换文件（被占用改名腾位，极端 MoveFileEx 延迟替换）→ schema 幂等插入 LLM 组件行（processor 最前 / uniquifier 后，检测到另一版组件即中止）→ 启服务 + 自动重新部署。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
 
 ---
 
