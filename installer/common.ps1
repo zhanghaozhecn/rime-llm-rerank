@@ -8,12 +8,9 @@ Add-Type -AssemblyName System.Drawing
 
 # ── 路径探测 ─────────────────────────────────────
 # 两版仓库平行放置：D:\rime-llm-rerank（插件版，本仓库）与 D:\rime-llm-ime
-# （源码版）。载荷优先取 installer\ 旁的发布目录，缺失时回退仓库树。
-$PluginSrc = Join-Path $PSScriptRoot "plugin"
-if (-not (Test-Path (Join-Path $PluginSrc "rime_llm.dll"))) {
-  $alt = Join-Path (Split-Path $PSScriptRoot -Parent) "user"   # 本仓库 user\
-  if (Test-Path (Join-Path $alt "rime_llm.dll")) { $PluginSrc = $alt }
-}
+# （源码版）。插件版载荷 = 本仓库 user\；源码版载荷 = installer\source\
+# （二进制入库），开发机缺失时回退平行的源码版仓库 bin\。
+$PluginSrc = Join-Path (Split-Path $PSScriptRoot -Parent) "user"   # 本仓库 user\
 $SourceSrc = Join-Path $PSScriptRoot "source"
 if (-not (Test-Path (Join-Path $SourceSrc "rime.dll"))) {
   # 平行的源码版仓库 bin\（开发机布局：..\..\ = 两仓库的共同父目录）
