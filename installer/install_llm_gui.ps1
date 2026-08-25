@@ -757,7 +757,7 @@ $timer.Add_Tick({
   $failed = ($txtLog.Text -match '(?m)^\[ERROR\]') -or
             ($null -ne $code -and $code -ne 0)
   if ($null -eq $code) {
-    $txtLog.AppendText("[警告] 子进程退出码不可读，已按日志 [ERROR] 行判定`r`n")
+    $txtLog.AppendText("[信息] 子进程退出码不可读（本环境常见），已按日志 [ERROR] 行判定`r`n")
   } else {
     $txtLog.AppendText(("[信息] 子进程退出码: " + $code + "`r`n"))
   }
