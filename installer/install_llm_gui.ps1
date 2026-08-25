@@ -392,13 +392,71 @@ function Install-SourceAction([string]$schemaName, [string]$model, $Log) {
   & $Log "[3/4] WeaselSetup 注册（TSF 组件部署）"
   Invoke-Native (Join-Path $installDir "WeaselSetup.exe") @("/u")
   Invoke-Native (Join-Path $installDir "WeaselSetup.exe") @("/i")
-  $reg = Invoke-Native reg @("query", "HKLM\SOFTWARE\Classes\WOW6432Node\CLSID\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}\InprocServer32", "/ve") |
-         Select-String -SimpleMatch "weasel"
-  if (-not $reg) {
-    & $Log "  32 位视图注册缺失，注册中…"
-    $env:TEXTSERVICE_PROFILE = "hans"
-    Invoke-Native "$env:WINDIR\SysWOW64\regsvr32.exe" @("/s", "$env:WINDIR\SysWOW64\weasel.dll")
+
+  # 注册自检 + 兜底：WeaselSetup /u 删除注册后 /i 偶发静默失败（本机 2026-08-25
+  # 实测：System32 旧 DLL 被 TSF 占用时复制失败 → 注册未写 → 输入法图标消失、
+  # 无法切中文）。regsvr32 兜底不可靠：其上下文中 MSFTF COM 调用失败会触发
+  # DllRegisterServer 整体回滚（连幸存的 CTF\TIP 树一起清掉）。
+  # 可靠兜底 = STA 宿主直接调 weasel.dll 的 DllRegisterServer（实测 hr=0）。
+  $clsid = "{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}"
+  function Test-TsfReg([string]$view) {
+    $path = "HKLM\SOFTWARE\Classes\${view}CLSID\$clsid\InprocServer32"
+    $r = Invoke-Native reg @("query", $path, "/ve")
+    return (($r | Out-String) -match "weasel")
   }
+  function Repair-TsfReg([string]$dll, [string]$bitnessHost) {
+    # $bitnessHost: 64 位 = pwsh/powershell (64); 32 位 = SysWOW64 powershell
+    $code = '
+$ErrorActionPreference = "Continue"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class RegSvrX {
+  [DllImport("kernel32", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern IntPtr LoadLibraryW(string path);
+  [DllImport("kernel32", CharSet=CharSet.Ansi, SetLastError=true)]
+  public static extern IntPtr GetProcAddress(IntPtr h, string name);
+  [DllImport("kernel32")]
+  public static extern bool FreeLibrary(IntPtr h);
+  public delegate int DRS();
+  public static int Call(string p) {
+    IntPtr h = LoadLibraryW(p);
+    if (h == IntPtr.Zero) return -1;
+    IntPtr fp = GetProcAddress(h, "DllRegisterServer");
+    if (fp == IntPtr.Zero) { FreeLibrary(h); return -2; }
+    int hr = Marshal.GetDelegateForFunctionPointer<DRS>(fp)();
+    FreeLibrary(h); return hr;
+  }
+}
+"@
+exit ([RegSvrX]::Call("REPLACEDLL") -band 0xFFFF) '
+    $code = $code.Replace("REPLACEDLL", $dll)
+    $tmp = Join-Path $env:TEMP ("llm_reg_" + [IO.Path]::GetFileName($dll) + ".ps1")
+    [IO.File]::WriteAllText($tmp, $code, [Text.Encoding]::UTF8)
+    Invoke-Native $bitnessHost @("-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", $tmp)
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+  }
+  # 确保两份 TSF DLL 存在（WeaselSetup /i 复制失败时补）
+  if (-not (Test-Path "C:\Windows\System32\weasel.dll")) {
+    Copy-Item (Join-Path $installDir "weaselx64.dll") "C:\Windows\System32\weasel.dll" -Force
+    & $Log "  补复制 System32\weasel.dll"
+  }
+  if (-not (Test-Path "C:\Windows\SysWOW64\weasel.dll")) {
+    Copy-Item (Join-Path $installDir "weasel.dll") "C:\Windows\SysWOW64\weasel.dll" -Force
+    & $Log "  补复制 SysWOW64\weasel.dll"
+  }
+  if (-not (Test-TsfReg "")) {
+    & $Log "  [警告] 64 位注册缺失，DllRegisterServer 兜底…"
+    Repair-TsfReg "C:\Windows\System32\weasel.dll" "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+  }
+  if (-not (Test-TsfReg "WOW6432Node\")) {
+    & $Log "  [警告] 32 位视图注册缺失，DllRegisterServer 兜底…"
+    Repair-TsfReg "C:\Windows\SysWOW64\weasel.dll" "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+  }
+  if (-not (Test-TsfReg "") -or -not (Test-TsfReg "WOW6432Node\")) {
+    throw "TSF 注册未完成（图标会消失、无法切中文）。请重启系统后重新运行一次安装；若仍失败请反馈日志"
+  }
+  & $Log "  TSF 注册自检通过（64/32 位视图均就位）"
 
   & $Log "[4/4] 启动 server + 修改方案 schema + 重新部署"
   Start-Process -FilePath (Join-Path $installDir "WeaselServer.exe") -WorkingDirectory $installDir
