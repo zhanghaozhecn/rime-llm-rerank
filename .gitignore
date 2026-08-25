@@ -10,6 +10,7 @@ bench_threads_result.txt
 CLAUDE.md
 AGENTS.md
 docs/
+memory/
 eval_samples.tsv
 train_samples.tsv
 pdsp_dict.yaml
@@ -23,3 +24,8 @@ user/ggml-cuda.dll
 
 # Python 缓存
 __pycache__/
+
+# installer 组装产物（make_installer.ps1 生成：plugin\ 从 user\、source\ 从源码版 bin）
+installer/plugin/
+installer/source/
+installer/*.zip

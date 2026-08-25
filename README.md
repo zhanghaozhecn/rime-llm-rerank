@@ -219,19 +219,21 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ## 一键部署（推荐）
 
-将 `deploy_llm_plugin.bat` + `deploy_llm_plugin.ps1` + `user\` 三件放到同一目录，复制到目标电脑，**双击 `deploy_llm_plugin.bat`**（自动请求管理员权限）：
+使用 **GUI 安装器**（`installer\` 目录；插件版与源码版通用，含还原功能）：
 
-1. **程序文件夹**：复制插件 DLL（`rime_llm.dll` + `llama.dll` + `ggml*.dll`）→ 小狼毫安装目录
-2. **用户文件夹**：复制 `llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\`
-3. **schema 修改**（幂等，可重复运行）：方案 yaml（默认 `pdsp.schema.yaml`，其他方案用 `-SchemaName` 指定）：
-   - `engine.processors` **最前**插入 `lua_processor@*llm_processor`（上屏历史收集 + 预解码触发）
-   - `engine.filters` 的 `uniquifier` **之后**插入 `lua_filter@*llm_filter`——必须在固顶词 filter（如 `pin_fix_filter`）**之前**：先 LLM 重排、再固顶词提升，否则固顶词会被 LLM 顶掉
-   - 顶层追加 `llm_rerank:` 配置节（`enabled: true`，其余参数注释列出）
-4. **生效**：托盘小狼毫图标 → 重新部署。首选候选 comment 出现 `AI` 标记即重排生效；日志 `%APPDATA%\Rime\rime_llm_events.txt`
+1. 复制 `installer\` 目录到目标电脑（或使用 `rime-llm-installer.zip` 发布包；在本仓库 clone 内直接运行时，插件版文件自动从 `user\` 读取）
+2. **双击 `install_llm_gui.bat`**（自动请求管理员权限）打开图形界面
+3. 界面操作：
+   - **方案文件**：下拉选择 RIME 用户目录中的 `*.schema.yaml`（或"浏览"选外部 yaml，自动拷入用户目录）
+   - **模型路径**：留空 = 默认 `D:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`；缺失时询问是否下载（约 500MB，ModelScope 断点续传，状态栏实时显示下载进度）
+   - 点击 **安装插件版**——预检（schema 冲突 / 文件完整性 / 模型）→ 复制 DLL 与 lua → schema 幂等插入（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`——固顶词 filter 之前，先 LLM 重排再固顶提升）→ 自动触发重新部署
+4. 验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`
 
-**冲突检测**：若安装目录的 `rime.dll` 是源码版 LLM 组件（含内置 llm_filter 特征），脚本警告并中止——插件版需官方 rime.dll，两版二选一（恢复官方：重装 weasel 官方包）。`-Force` 可跳过检测（风险自负）。
+**还原**：界面点击"还原插件版"——仅剥离 schema 的 LLM 组件行与 `llm_rerank` 节并自动重新部署（**不删任何文件**，避免误操作；被剥离的组件不再被引用即不生效）。残留 DLL/lua 可按界面列出的路径手动删除。
 
-可选参数：`-ModelPath <路径>`（模型在其他位置）、`-InstallDir <路径>`、`-SchemaName <文件名>`、`-Force`。模型缺失时脚本会询问是否从 ModelScope 下载（断点续传）。
+**冲突检测**：安装目录 `rime.dll` 为源码版 LLM 组件（二进制含 `llm_filter` 特征）时中止——插件版需官方 rime.dll，两版二选一（先用安装器还原源码版并重装官方小狼毫）。
+
+命令行部署（无界面 / 自动化）：`deploy_llm_plugin.bat` + `deploy_llm_plugin.ps1` + `user\` 三件同目录，参数 `-ModelPath` / `-InstallDir` / `-SchemaName` / `-Force`；GUI 亦支持 `install_llm_gui.ps1 -CliAction install-plugin|status|restore-plugin`。
 
 ## 手动安装
 
@@ -323,7 +325,7 @@ bin/bench_threads.exe [模型路径]
 ## 关闭与卸载
 
 - **临时关闭**：把安装目录 `rime_llm*.dll` 改后缀（如 `.dll.bak`），重新部署即恢复字典序；或 schema 中 `enabled: false`（不加载 DLL 不推理）。LLM 插件仅占 ~497 MB 内存，对现代电脑影响不大，建议常驻。
-- **完全卸载**：删掉安装目录 `rime_llm*.dll` + `llama.dll` + `ggml*.dll`，删掉 `%APPDATA%\Rime\lua\` 下两个 lua，从 schema 移除插入的组件行与 `llm_rerank:` 节，重新部署。
+- **完全卸载**：GUI 安装器"还原插件版"（自动剥离 schema 组件与配置节 + 重新部署，不删文件）；残留文件手动清理：安装目录 `rime_llm*.dll` + `llama.dll` + `ggml*.dll`、`%APPDATA%\Rime\lua\` 下两个 lua。
 
 ## 常见问题
 
