@@ -25,7 +25,8 @@ user/ggml-cuda.dll
 # Python 缓存
 __pycache__/
 
-# installer 组装产物（make_installer.ps1 生成：plugin\ 从 user\、source\ 从源码版 bin）
+# installer 产物：source\ 入库（2026-08-25 用户定案：部署走仓库 clone，
+# 不再发 Release——GCM 凭据抽风太烦）；plugin\ 是 user\ 的重复副本、
+# zip 为本地打包产物，仍忽略
 installer/plugin/
-installer/source/
 installer/*.zip
