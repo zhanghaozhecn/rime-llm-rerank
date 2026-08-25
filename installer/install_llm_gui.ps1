@@ -633,7 +633,8 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 250
 $timer.Add_Tick({
   Read-WorkLog
-  if ($script:WorkProc -and -not $script:WorkProc.HasExited) {
+  if (-not $script:WorkProc) { return }
+  if (-not $script:WorkProc.HasExited) {
     # 模型下载进度（.download 临时文件大小 → 状态栏，避免长时间静默被当成卡死）
     $dl = $script:WorkModel + ".download"
     if ($script:WorkModel -and (Test-Path $dl)) {
@@ -644,24 +645,28 @@ $timer.Add_Tick({
     }
     return
   }
-  if ($script:WorkProc -and $script:WorkProc.HasExited) {
-    Start-Sleep -Milliseconds 200   # 等缓冲落盘
-    Read-WorkLog
-    $failed = ($script:WorkProc.ExitCode -ne 0)
-    if ($failed) {
-      $txtLog.AppendText("[失败] 操作未完成，见上方 [ERROR] 行`r`n")
-      [System.Windows.Forms.MessageBox]::Show(
-        "操作失败，详见日志窗口中的 [ERROR] 行", "操作失败",
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-    } else {
-      $txtLog.AppendText("[完成]`r`n")
-    }
-    $timer.Stop()
-    $script:WorkDone = $true
-    $script:WorkProc = $null
-    $form.Cursor = [System.Windows.Forms.Cursors]::Default
-    Refresh-Status
+  # 完成处理：先停表并复位状态，最后才弹窗 —— MessageBox 的模态循环期间
+  # 定时器仍会触发，若不先清 WorkProc 会无限重入弹窗（源码版机器装插件版
+  # 必失败路径曾因此无限弹"操作失败"）
+  Start-Sleep -Milliseconds 200   # 等缓冲落盘
+  Read-WorkLog
+  $failed = ($script:WorkProc.ExitCode -ne 0)
+  $timer.Stop()
+  $script:WorkDone = $true
+  $script:WorkProc = $null
+  $form.Cursor = [System.Windows.Forms.Cursors]::Default
+  Refresh-Status
+  if ($failed) {
+    $txtLog.AppendText("[失败] 操作未完成，见上方 [ERROR] 行`r`n")
+    $errLine = ($txtLog.Text -split "`r`n" | Where-Object { $_ -match '^\[ERROR\]' } |
+                Select-Object -Last 1)
+    $msg = if ($errLine) { $errLine -replace '^\[ERROR\]\s*', '' } else { "详见日志窗口中的 [ERROR] 行" }
+    [System.Windows.Forms.MessageBox]::Show(
+      $msg, "操作失败",
+      [System.Windows.Forms.MessageBoxButtons]::OK,
+      [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+  } else {
+    $txtLog.AppendText("[完成]`r`n")
   }
 })
 
