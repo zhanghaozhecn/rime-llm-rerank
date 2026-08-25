@@ -219,20 +219,20 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ## 一键部署（推荐）
 
-使用 **GUI 安装器**（`installer\` 目录；插件版与源码版通用）。安装器**只做文件操作**——停止算法服务 → 复制/替换文件（被占用时自动改名腾位，极端情况延迟替换重启生效）。不修改方案配置、不碰注册表。
+**两个独立安装器**（`installer\` 目录）：`install_plugin.bat`（插件版）与 `install_source.bat`（源码版），各自独立运行。安装器做**文件操作 + 方案加入 LLM 组件行**（幂等，重复运行不重复插入）——停算法服务 → 复制/替换文件（被占用自动改名腾位，极端延迟替换重启生效）→ schema 插入组件行 → 启服务 + 自动重新部署。不碰注册表。
 
 **前提**：已安装官方小狼毫；方案配置已含 LLM 组件行（拼读双拼方案自带——`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`；其他方案参照"手动安装"第三步自行添加）。
 
 1. `git clone` 本仓库到目标电脑（或下载仓库 zip 解压——插件版文件在 `user\`、源码版二进制在 `installer\source\`，均已入库）
-2. **双击 `installer\install_llm_gui.bat`**（自动请求管理员权限）
-3. 点击 **安装插件版**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → 重启算法服务
+2. **双击 `installer\install_plugin.bat`**（自动请求管理员权限）
+3. 选择方案文件（下拉列出 `%APPDATA%\Rime\*.schema.yaml`，可浏览外部 yaml 自动拷入）→ 点击 **安装**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → schema 幂等插入 LLM 组件行 → 启服务 + 自动重新部署
 4. **托盘小狼毫 → 右键 → 重新部署**。验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`
 
-**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 把原始（不含 LLM 组件行）的方案配置重新复制到 `%APPDATA%\Rime\` → 打开安装器点另一个按钮。**切换没有自动流程**，这是刻意设计——避免任何状态残留。
+**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 把原始（不含 LLM 组件行）的方案配置重新复制到 `%APPDATA%\Rime\` → 运行另一安装器。**切换没有自动流程**，这是刻意设计——避免任何状态残留。
 
 **输入法图标消失时**：运行 `installer\repair_tsf.ps1`（右键"使用 PowerShell 运行"，自动提权；重注册 TSF 并挂回语言列表）。
 
-命令行模式：`install_llm_gui.ps1 -CliAction install-plugin|install-source|status`。
+命令行模式：`install_plugin.ps1 -CliAction install|status -SchemaName pdsp.schema.yaml`（源码版同）。
 
 ## 手动安装
 
