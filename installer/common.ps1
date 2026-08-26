@@ -1,5 +1,7 @@
-﻿# common.ps1 — 两版安装器共享逻辑（被 install_plugin.ps1 / install_source.ps1 点源）
-# 设计（2026-08-25 定稿）：安装器只做 文件操作 + schema 加 LLM 组件行（幂等）。
+﻿# common.ps1 — 安装器共享逻辑（两仓库各存一份、内容必须一致；同步工具 =
+# rime-llm-ime 仓库 installer\make_installer.ps1。各仓库只带自己版本的入口
+# install_*.ps1，本文件含两版动作属共用代码）
+# 设计（2026-08-25 定稿）：安装器只做 文件操作 + schema 加/去 LLM 组件行（幂等）。
 # 不碰注册表、不调 WeaselSetup、不做还原（切换 = 重装小狼毫 + 换原始方案配置）。
 
 $ErrorActionPreference = "Stop"
@@ -7,10 +9,11 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # ── 路径探测 ─────────────────────────────────────
-# 两版仓库平行放置：D:\rime-llm-rerank（插件版，本仓库）与 D:\rime-llm-ime
-# （源码版）。插件版载荷 = 本仓库 user\；源码版载荷 = installer\source\
-# （二进制入库），开发机缺失时回退平行的源码版仓库 bin\。
-$PluginSrc = Join-Path (Split-Path $PSScriptRoot -Parent) "user"   # 本仓库 user\
+# 分仓布局（2026-08-26）：插件版仓库（rime-llm-rerank，载荷 = 仓库 user\）与
+# 源码版仓库（rime-llm-ime，载荷 = installer\source\）各只带本版安装器；本文件
+# 两仓各一份，对面版本路径缺失时对应 *Ready=false（各版入口只用自己路径）。
+# 开发机两仓平行时，源码版载荷可回退平行仓库根 bin\（刚构建未同步场景）。
+$PluginSrc = Join-Path (Split-Path $PSScriptRoot -Parent) "user"   # 插件版仓库 user\
 $SourceSrc = Join-Path $PSScriptRoot "source"
 if (-not (Test-Path (Join-Path $SourceSrc "rime.dll"))) {
   # 平行的源码版仓库 bin\（开发机布局：..\..\ = 两仓库的共同父目录）
@@ -99,41 +102,66 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 function Read-Schema([string]$path) { [IO.File]::ReadAllLines($path, [Text.Encoding]::UTF8) }
 function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $lines, $Utf8NoBom) }
 
-$LLM_CFG_LINES = @(
-  "", "llm_rerank:", "  enabled: true", "  min_code_len: 4",
-  "  # max_code_len: 0", "  # long_word_first: false",
-  "  # expected_length_weight: 0.20", "  # freq_weight: 0.25", "  # freq_k: 5",
-  "  # min_tokens: 1", "  # max_tokens: 10", "  # max_candidates: 5",
-  "  # cpu_cores: 4",
-  "  # model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
-)
+# llm_rerank 配置节；modelPath 非空时写为生效行（反斜杠→正斜杠，含空格则加引号），
+# 留空则保持注释示例（运行时默认 d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf）
+function Get-LlmCfgLines([string]$modelPath) {
+  $l = @(
+    "", "llm_rerank:", "  enabled: true", "  min_code_len: 4",
+    "  # max_code_len: 0", "  # long_word_first: false",
+    "  # expected_length_weight: 0.20", "  # freq_weight: 0.25", "  # freq_k: 5",
+    "  # min_tokens: 1", "  # max_tokens: 10", "  # max_candidates: 5",
+    "  # cpu_cores: 4"
+  )
+  if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
+  else { $l += "  # model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf" }
+  return $l
+}
+function Convert-ToYamlPath([string]$p) {
+  $q = $p -replace '\\', '/'
+  if ($q -match '\s') { $q = '"' + $q + '"' }
+  return $q
+}
+# 方案已有 llm_rerank 节时补写 model_path（节内已有生效行则不动）
+function Add-ModelPathToExisting([System.Collections.Generic.List[string]]$out, [string]$modelPath, $Log) {
+  $idx = -1
+  for ($i = 0; $i -lt $out.Count; $i++) { if ($out[$i] -match '^llm_rerank:') { $idx = $i; break } }
+  if ($idx -lt 0) { return $false }
+  for ($i = $idx + 1; $i -lt $out.Count; $i++) {
+    if ($out[$i] -match '^\S') { break }
+    if ($out[$i] -match '^\s+model_path:\s*\S') { & $Log "  llm_rerank 已有生效 model_path，未改动"; return $false }
+  }
+  $out.Insert($idx + 1, "  model_path: " + (Convert-ToYamlPath $modelPath))
+  & $Log ("  + model_path: " + (Convert-ToYamlPath $modelPath))
+  return $true
+}
 
 # 插件版：processors 最前 lua_processor + uniquifier 后 lua_filter + llm_rerank 节
-function Edit-SchemaPlugin([string]$schemaPath, $Log) {
+function Edit-SchemaPlugin([string]$schemaPath, [string]$modelPath, $Log) {
   $lines = Read-Schema $schemaPath
   if (($lines | Where-Object { $_ -match '^\s*-\s+llm_filter\s*$' }).Count -gt 0) {
     throw "方案里已有源码版组件（- llm_filter）——插件版与源码版二选一，请先重装小狼毫并恢复原始方案配置"
   }
   $changed = $false
-  $out = New-Object System.Collections.Generic.List[string]
   $hasProc = ($lines | Where-Object { $_ -match 'lua_processor@\*llm_processor' }).Count -gt 0
   $hasFilt = ($lines | Where-Object { $_ -match 'lua_filter@\*llm_filter' }).Count -gt 0
   $hasCfg  = ($lines | Where-Object { $_ -match '^llm_rerank:' }).Count -gt 0
+  # $out 必须无条件填充（原实现只在插 processor 时填充——幂等重跑时为空表，
+  # 导致后续 filter/cfg 分支在空表上操作）
+  $out = New-Object System.Collections.Generic.List[string]
   if (-not $hasProc) {
     $inEngine = $false; $inProc = $false; $inserted = $false
     foreach ($ln in $lines) {
       if ($ln -match '^engine:') { $inEngine = $true }
       elseif ($inEngine -and $ln -match '^\S') { $inEngine = $false; $inProc = $false }
-      if ($inEngine -and $ln -match '^\s+processors:') { $inProc = $true; $out.Add($ln); continue }
+      if ($inEngine -and $ln -match '^\s+processors:') { $inProc = $true; [void]$out.Add($ln); continue }
       if ($inProc -and $ln -match '^\s+-\s') {
-        $out.Add("    - lua_processor@*llm_processor"); $inProc = $false; $inserted = $true
+        [void]$out.Add("    - lua_processor@*llm_processor"); $inProc = $false; $inserted = $true
       }
-      $out.Add($ln)
+      [void]$out.Add($ln)
     }
     if ($inserted) { & $Log "  + processors: lua_processor@*llm_processor（最前）"; $changed = $true }
     else { throw "未找到 processors 块，无法插入组件" }
-    $lines = @(); foreach ($l in $out) { $lines += $l }
-    $out = New-Object System.Collections.Generic.List[string]
+  } else {
     foreach ($l in $lines) { [void]$out.Add($l) }
   }
   if (-not $hasFilt) {
@@ -149,15 +177,17 @@ function Edit-SchemaPlugin([string]$schemaPath, $Log) {
     else { throw "未找到 filters 块或 uniquifier，无法插入组件" }
   }
   if (-not $hasCfg) {
-    $LLM_CFG_LINES | ForEach-Object { [void]$out.Add($_) }
+    Get-LlmCfgLines $modelPath | ForEach-Object { [void]$out.Add($_) }
     & $Log "  + llm_rerank: 配置节（enabled: true）"; $changed = $true
+  } elseif ($modelPath) {
+    if (Add-ModelPathToExisting $out $modelPath $Log) { $changed = $true }
   }
   if ($changed) { Write-Schema $schemaPath $out; & $Log "  schema 已更新（幂等，重复运行不重复插入）" }
   else { & $Log "  schema 组件已存在，无需修改" }
 }
 
 # 源码版：uniquifier 后 llm_filter + llm_rerank 节
-function Edit-SchemaSource([string]$schemaPath, $Log) {
+function Edit-SchemaSource([string]$schemaPath, [string]$modelPath, $Log) {
   $lines = Read-Schema $schemaPath
   if (($lines | Where-Object { $_ -match 'lua_filter@\*llm_filter' }).Count -gt 0) {
     throw "方案里已有插件版组件（lua_filter@*llm_filter）——插件版与源码版二选一，请先重装小狼毫并恢复原始方案配置"
@@ -180,11 +210,39 @@ function Edit-SchemaSource([string]$schemaPath, $Log) {
     else { throw "未找到 filters 块或 uniquifier，无法插入组件" }
   }
   if (-not $hasCfg) {
-    $LLM_CFG_LINES | ForEach-Object { [void]$out.Add($_) }
+    Get-LlmCfgLines $modelPath | ForEach-Object { [void]$out.Add($_) }
     & $Log "  + llm_rerank: 配置节（enabled: true）"; $changed = $true
+  } elseif ($modelPath) {
+    if (Add-ModelPathToExisting $out $modelPath $Log) { $changed = $true }
   }
   if ($changed) { Write-Schema $schemaPath $out; & $Log "  schema 已更新（幂等）" }
   else { & $Log "  schema 组件已存在，无需修改" }
+}
+
+# 去除 LLM 组件（两版通用）：processor/filter 组件行 + llm_rerank 整节（含前置空行）
+function Edit-SchemaRemove([string]$schemaPath, $Log) {
+  $lines = Read-Schema $schemaPath
+  $out = New-Object System.Collections.Generic.List[string]
+  $inCfg = $false; $removed = 0
+  foreach ($ln in $lines) {
+    if ($inCfg) {
+      if ($ln -match '^\S') { $inCfg = $false } else { $removed++; continue }
+    }
+    if ($ln -match '^\s*-\s+lua_processor@\*llm_processor\s*$' -or
+        $ln -match '^\s*-\s+lua_filter@\*llm_filter\s*$' -or
+        $ln -match '^\s*-\s+llm_filter\s*$') { $removed++; continue }
+    if ($ln -match '^llm_rerank:') {
+      $removed++
+      if ($out.Count -gt 0 -and $out[$out.Count - 1] -match '^\s*$') {
+        [void]$out.RemoveAt($out.Count - 1); $removed++
+      }
+      $inCfg = $true; continue
+    }
+    [void]$out.Add($ln)
+  }
+  if ($removed -eq 0) { & $Log "  未发现 LLM 组件，文件未改动"; return }
+  Write-Schema $schemaPath $out
+  & $Log ("  已移除 LLM 组件（含配置节）共 " + $removed + " 行")
 }
 
 function Get-SchemaPath([string]$schemaName) {
@@ -194,20 +252,19 @@ function Get-SchemaPath([string]$schemaName) {
 }
 
 # ── 安装动作（CLI 子进程执行）────────────────────
-function Install-PluginAction([string]$schemaName, $Log) {
-  & $Log "── 安装插件版 ──"
+function Copy-FilesPluginAction($Log) {
+  & $Log "── 复制插件版文件 ──"
   $installDir = Find-WeaselDir
   if (-not $installDir) { throw "未找到小狼毫安装目录。请先安装官方小狼毫 0.17.x" }
   & $Log "  安装目录: $installDir"
-  $schemaPath = Get-SchemaPath $schemaName
   foreach ($f in @("rime_llm.dll", "llm_filter.lua", "llm_processor.lua")) {
     if (-not (Test-Path (Join-Path $PluginSrc $f))) { throw "插件版文件不完整: 缺 $f" }
   }
 
-  & $Log "[1/4] 停止算法服务 + 清理上次安装的旧二进制"
+  & $Log "[1/3] 停止算法服务 + 清理上次安装的旧二进制"
   Stop-WeaselService
   Clean-OldBinaries $installDir $Log
-  & $Log "[2/4] 复制插件文件"
+  & $Log "[2/3] 复制插件文件"
   foreach ($d in @("rime_llm.dll", "llama.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll")) {
     $s = Join-Path $PluginSrc $d
     if (Test-Path $s) {
@@ -220,30 +277,26 @@ function Install-PluginAction([string]$schemaName, $Log) {
     Copy-Item (Join-Path $PluginSrc $l) (Join-Path $LUA_DIR $l) -Force
     & $Log ("  + lua\" + $l)
   }
-  & $Log "[3/4] 方案加入 LLM 组件"
-  Edit-SchemaPlugin $schemaPath $Log
-  & $Log "[4/4] 启动服务 + 重新部署"
+  & $Log "[3/3] 启动服务"
   Start-WeaselService $installDir $Log
-  Invoke-Redeploy $installDir $Log
-  & $Log "完成。验证：打满 4 码首选候选带 AI 标记；日志 %APPDATA%\Rime\rime_llm_events.txt"
+  & $Log "完成。"
 }
 
-function Install-SourceAction([string]$schemaName, $Log) {
-  & $Log "── 安装源码版 ──"
+function Copy-FilesSourceAction($Log) {
+  & $Log "── 复制源码版文件 ──"
   $installDir = Find-WeaselDir
   if (-not $installDir) { throw "未找到小狼毫安装目录。请先安装官方小狼毫 0.17.4" }
   & $Log "  安装目录: $installDir"
-  $schemaPath = Get-SchemaPath $schemaName
   foreach ($f in @("rime.dll", "WeaselServer.exe", "weaselx64.dll", "weasel32.dll")) {
     if (-not (Test-Path (Join-Path $SourceSrc $f))) { throw "源码版文件不完整: 缺 $f" }
   }
 
-  & $Log "[1/5] 停止算法服务 + 清理上次安装的旧二进制"
+  & $Log "[1/4] 停止算法服务 + 清理上次安装的旧二进制"
   Stop-WeaselService
   Clean-OldBinaries $installDir $Log
   Clean-OldBinaries "C:\Windows\System32" $Log
   Clean-OldBinaries "C:\Windows\SysWOW64" $Log
-  & $Log "[2/5] 复制安装目录二进制"
+  & $Log "[2/4] 复制安装目录二进制"
   foreach ($pair in @(
       @("rime.dll", "rime.dll"), @("WeaselServer.exe", "WeaselServer.exe"),
       @("WeaselDeployer.exe", "WeaselDeployer.exe"), @("opencc.dll", "opencc.dll"),
@@ -257,22 +310,53 @@ function Install-SourceAction([string]$schemaName, $Log) {
       & $Log ("  [MISS] " + $pair[0] + "（跳过，保留现有文件）")
     }
   }
-  & $Log "[3/5] 替换 System32 / SysWOW64 的 TSF DLL（不碰注册表）"
+  & $Log "[3/4] 替换 System32 / SysWOW64 的 TSF DLL（不碰注册表）"
   Copy-Binary (Join-Path $SourceSrc "weaselx64.dll") "C:\Windows\System32\weasel.dll" $Log
   & $Log "  + System32\weasel.dll"
   Copy-Binary (Join-Path $SourceSrc "weasel32.dll") "C:\Windows\SysWOW64\weasel.dll" $Log
   & $Log "  + SysWOW64\weasel.dll"
-
-  & $Log "[4/5] 方案加入 LLM 组件"
-  Edit-SchemaSource $schemaPath $Log
-  & $Log "[5/5] 启动服务 + 重新部署"
+  & $Log "[4/4] 启动服务 + 重新部署"
   Start-WeaselService $installDir $Log
   Invoke-Redeploy $installDir $Log
-  & $Log "完成。无需重启系统；重新部署后生效（存量 TSF 宿主退出后自动走新 DLL）。"
+  & $Log "完成。无需重启系统（存量 TSF 宿主退出后自动走新 DLL）。"
+}
+
+function Schema-AddAction([string]$edition, [string]$schemaName, [string]$modelPath, $Log) {
+  & $Log "── 方案配置加入 LLM 组件 ──"
+  $schemaPath = Get-SchemaPath $schemaName
+  & $Log ("  方案: " + $schemaPath)
+  if ($modelPath) { & $Log ("  模型: " + $modelPath) }
+  if ($edition -eq "plugin") { Edit-SchemaPlugin $schemaPath $modelPath $Log }
+  else { Edit-SchemaSource $schemaPath $modelPath $Log }
+  $installDir = Find-WeaselDir
+  if ($installDir) { Invoke-Redeploy $installDir $Log }
+  else { & $Log "  [警告] 未找到小狼毫目录，跳过自动重新部署（请托盘手动重新部署）" }
+  & $Log "完成。"
+}
+
+function Schema-RemoveAction([string]$schemaName, $Log) {
+  & $Log "── 方案配置去除 LLM 组件 ──"
+  $schemaPath = Get-SchemaPath $schemaName
+  & $Log ("  方案: " + $schemaPath)
+  Edit-SchemaRemove $schemaPath $Log
+  $installDir = Find-WeaselDir
+  if ($installDir) { Invoke-Redeploy $installDir $Log }
+  else { & $Log "  [警告] 未找到小狼毫目录，跳过自动重新部署" }
+  & $Log "完成。"
+}
+
+# 完整安装 = 复制文件 + 方案配置（CLI -CliAction install，自动化旧路径）
+function Install-PluginAction([string]$schemaName, $Log) {
+  Copy-FilesPluginAction $Log
+  Schema-AddAction "plugin" $schemaName "" $Log
+}
+function Install-SourceAction([string]$schemaName, $Log) {
+  Copy-FilesSourceAction $Log
+  Schema-AddAction "source" $schemaName "" $Log
 }
 
 # ── CLI / GUI 入口（由入口脚本调用）──────────────
-function Invoke-Installer([string]$edition, [string]$cliAction, [string]$schemaName) {
+function Invoke-Installer([string]$edition, [string]$cliAction, [string]$schemaName, [string]$modelPath) {
   if ($cliAction) {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
     $Log = { param($t) Write-Host $t }
@@ -290,7 +374,19 @@ function Invoke-Installer([string]$edition, [string]$cliAction, [string]$schemaN
           if ($edition -eq "plugin") { Install-PluginAction $schemaName $Log }
           else { Install-SourceAction $schemaName $Log }
         }
-        default { Write-Host "未知动作: $cliAction（status | install）"; exit 1 }
+        "copy-files" {
+          if ($edition -eq "plugin") { Copy-FilesPluginAction $Log }
+          else { Copy-FilesSourceAction $Log }
+        }
+        "schema-add" {
+          if (-not $schemaName) { throw "需要 -SchemaName 指定方案文件" }
+          Schema-AddAction $edition $schemaName $modelPath $Log
+        }
+        "schema-remove" {
+          if (-not $schemaName) { throw "需要 -SchemaName 指定方案文件" }
+          Schema-RemoveAction $schemaName $Log
+        }
+        default { Write-Host "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove）"; exit 1 }
       }
     } catch {
       Write-Host ("[ERROR] " + $_.Exception.Message)
@@ -306,55 +402,75 @@ function Run-InstallerGui([string]$edition) {
   $isPlugin = ($edition -eq "plugin")
   $title = if ($isPlugin) { "LLM 重排安装器 — 插件版" } else { "LLM 重排安装器 — 源码版" }
   $ready = if ($isPlugin) { $PluginReady } else { $SourceReady }
-  $btnText = if ($isPlugin) { "安装插件版" } else { "安装源码版" }
 
   $form = New-Object System.Windows.Forms.Form
   $form.Text = $title
-  $form.Size = New-Object System.Drawing.Size(700, 375)
+  $form.Size = New-Object System.Drawing.Size(700, 400)
   $form.StartPosition = "CenterScreen"
   $form.FormBorderStyle = "FixedDialog"
   $form.MaximizeBox = $false
 
   $lblIntro = New-Object System.Windows.Forms.Label
-  $lblIntro.Text = "前提：已安装官方小狼毫。切换版本：重装小狼毫 + 恢复原始（不含 LLM 行）方案配置后运行另一安装器。"
+  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务。『方案配置加/去 LLM』只改选中的方案文件并自动重新部署；模型路径留空 = 默认 d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf，填写则写入配置。切换版本：重装小狼毫 + 恢复原始方案配置。"
   $lblIntro.Location = New-Object System.Drawing.Point(15, 12)
-  $lblIntro.Size = New-Object System.Drawing.Size(660, 28)
+  $lblIntro.Size = New-Object System.Drawing.Size(660, 40)
   $lblIntro.ForeColor = [System.Drawing.Color]::DimGray
   $form.Controls.Add($lblIntro)
 
   $lblSchema = New-Object System.Windows.Forms.Label
-  $lblSchema.Text = "方案文件:"; $lblSchema.Location = New-Object System.Drawing.Point(15, 48)
+  $lblSchema.Text = "方案文件:"; $lblSchema.Location = New-Object System.Drawing.Point(15, 58)
   $lblSchema.Size = New-Object System.Drawing.Size(70, 20); $form.Controls.Add($lblSchema)
 
   $cmbSchema = New-Object System.Windows.Forms.ComboBox
-  $cmbSchema.Location = New-Object System.Drawing.Point(90, 45)
+  $cmbSchema.Location = New-Object System.Drawing.Point(90, 55)
   $cmbSchema.Size = New-Object System.Drawing.Size(400, 21)
   $cmbSchema.DropDownStyle = "DropDownList"
   $form.Controls.Add($cmbSchema)
 
   $btnRefresh = New-Object System.Windows.Forms.Button
-  $btnRefresh.Text = "刷新"; $btnRefresh.Location = New-Object System.Drawing.Point(500, 44)
+  $btnRefresh.Text = "刷新"; $btnRefresh.Location = New-Object System.Drawing.Point(500, 54)
   $btnRefresh.Size = New-Object System.Drawing.Size(80, 23); $form.Controls.Add($btnRefresh)
 
   $btnBrowse = New-Object System.Windows.Forms.Button
-  $btnBrowse.Text = "浏览..."; $btnBrowse.Location = New-Object System.Drawing.Point(588, 44)
+  $btnBrowse.Text = "浏览..."; $btnBrowse.Location = New-Object System.Drawing.Point(588, 54)
   $btnBrowse.Size = New-Object System.Drawing.Size(85, 23); $form.Controls.Add($btnBrowse)
 
-  $btnInstall = New-Object System.Windows.Forms.Button
-  $btnInstall.Text = $btnText
-  $btnInstall.Location = New-Object System.Drawing.Point(12, 78)
-  $btnInstall.Size = New-Object System.Drawing.Size(660, 36)
-  $form.Controls.Add($btnInstall)
+  $lblModel = New-Object System.Windows.Forms.Label
+  $lblModel.Text = "模型路径:"; $lblModel.Location = New-Object System.Drawing.Point(15, 88)
+  $lblModel.Size = New-Object System.Drawing.Size(70, 20); $form.Controls.Add($lblModel)
+
+  $txtModel = New-Object System.Windows.Forms.TextBox
+  $txtModel.Location = New-Object System.Drawing.Point(90, 85)
+  $txtModel.Size = New-Object System.Drawing.Size(583, 21)
+  $form.Controls.Add($txtModel)
+
+  $btnFiles = New-Object System.Windows.Forms.Button
+  $btnFiles.Text = "复制文件"
+  $btnFiles.Location = New-Object System.Drawing.Point(12, 115)
+  $btnFiles.Size = New-Object System.Drawing.Size(210, 36)
+  $form.Controls.Add($btnFiles)
+
+  $btnAdd = New-Object System.Windows.Forms.Button
+  $btnAdd.Text = "方案配置加 LLM"
+  $btnAdd.Location = New-Object System.Drawing.Point(230, 115)
+  $btnAdd.Size = New-Object System.Drawing.Size(226, 36)
+  $form.Controls.Add($btnAdd)
+
+  $btnRemove = New-Object System.Windows.Forms.Button
+  $btnRemove.Text = "方案配置去 LLM"
+  $btnRemove.Location = New-Object System.Drawing.Point(462, 115)
+  $btnRemove.Size = New-Object System.Drawing.Size(206, 36)
+  $form.Controls.Add($btnRemove)
 
   $lblStatus = New-Object System.Windows.Forms.Label
-  $lblStatus.Location = New-Object System.Drawing.Point(15, 122)
+  $lblStatus.Location = New-Object System.Drawing.Point(15, 158)
   $lblStatus.Size = New-Object System.Drawing.Size(660, 18)
   $lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
   $form.Controls.Add($lblStatus)
 
   $txtLog = New-Object System.Windows.Forms.TextBox
-  $txtLog.Location = New-Object System.Drawing.Point(15, 144)
-  $txtLog.Size = New-Object System.Drawing.Size(655, 185)
+  $txtLog.Location = New-Object System.Drawing.Point(15, 180)
+  $txtLog.Size = New-Object System.Drawing.Size(655, 180)
   $txtLog.Multiline = $true; $txtLog.ReadOnly = $true
   $txtLog.ScrollBars = "Vertical"; $txtLog.WordWrap = $false
   $txtLog.Font = New-Object System.Drawing.Font("Consolas", 9)
@@ -371,7 +487,9 @@ function Run-InstallerGui([string]$edition) {
     $lblStatus.Text = ("安装文件: " + $(if ($ready) { "就绪" } else { "缺失" }) + "  |  小狼毫: " +
                        $(if ($dir) { $dir } else { "未找到（请先安装官方小狼毫）" }))
     $lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
-    $btnInstall.Enabled = $ready -and $dir -and ($cmbSchema.Items.Count -gt 0)
+    $btnFiles.Enabled = ($ready -and $dir)
+    $btnAdd.Enabled = ($cmbSchema.Items.Count -gt 0)
+    $btnRemove.Enabled = ($cmbSchema.Items.Count -gt 0)
   }
 
   # 后台子进程执行（自身 CLI 模式，stdout 重定向轮询刷日志）
@@ -385,19 +503,21 @@ function Run-InstallerGui([string]$edition) {
   $timer = New-Object System.Windows.Forms.Timer
   $timer.Interval = 250
 
-  function Start-Work([string]$schemaName) {
+  function Start-Work([string]$action, [string]$schemaName, [string]$modelPath) {
     if (-not $script:WorkDone) { return }
     $script:WorkDone = $false; $script:WorkOff = 0
     if (Test-Path $script:WorkLog) { Remove-Item $script:WorkLog -Force }
     $txtLog.AppendText("────────────────────`r`n")
     $lblStatus.Text = "执行中…（文件复制/替换可能需要数十秒）"
-    $btnInstall.Enabled = $false
+    $btnFiles.Enabled = $false; $btnAdd.Enabled = $false; $btnRemove.Enabled = $false
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
       $psExe = (Get-Process -Id $PID).Path
-      $script:WorkProc = Start-Process -FilePath $psExe `
-        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$entryScript`"",
-                        "-CliAction", "install", "-SchemaName", "`"$schemaName`"") `
+      $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$entryScript`"",
+                   "-CliAction", $action)
+      if ($schemaName) { $argList += @("-SchemaName", "`"$schemaName`"") }
+      if ($modelPath)  { $argList += @("-ModelPath", "`"$modelPath`"") }
+      $script:WorkProc = Start-Process -FilePath $psExe -ArgumentList $argList `
         -WindowStyle Hidden -RedirectStandardOutput $script:WorkLog -PassThru
       $timer.Start()
     } catch {
@@ -466,12 +586,20 @@ function Run-InstallerGui([string]$edition) {
       if ($cmbSchema.Items.Contains($name)) { $cmbSchema.SelectedItem = $name }
     }
   })
-  $btnInstall.Add_Click({
+  $btnFiles.Add_Click({ Start-Work "copy-files" "" "" })
+  $btnAdd.Add_Click({
     if ($cmbSchema.SelectedItem -eq $null) {
       [System.Windows.Forms.MessageBox]::Show("请先选择方案文件", "提示") | Out-Null
       return
     }
-    Start-Work $cmbSchema.SelectedItem.ToString()
+    Start-Work "schema-add" $cmbSchema.SelectedItem.ToString() $txtModel.Text.Trim()
+  })
+  $btnRemove.Add_Click({
+    if ($cmbSchema.SelectedItem -eq $null) {
+      [System.Windows.Forms.MessageBox]::Show("请先选择方案文件", "提示") | Out-Null
+      return
+    }
+    Start-Work "schema-remove" $cmbSchema.SelectedItem.ToString() ""
   })
 
   $form.Add_Shown({

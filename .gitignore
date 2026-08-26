@@ -25,8 +25,9 @@ user/ggml-cuda.dll
 # Python 缓存
 __pycache__/
 
-# installer 产物：source\ 入库（2026-08-25 用户定案：部署走仓库 clone，
-# 不再发 Release——GCM 凭据抽风太烦）；plugin\ 是 user\ 的重复副本、
-# zip 为本地打包产物，仍忽略
+# installer：本仓库只带插件版安装器（common.ps1 共用 + install_plugin.*）；
+# 源码版安装器与 source\ 二进制已迁至 rime-llm-ime 仓库（2026-08-26 分仓）。
+# plugin\ 是 user\ 的重复副本、zip 为本地打包产物，忽略
 installer/plugin/
 installer/*.zip
+installer/source/

@@ -219,20 +219,22 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ## 一键部署（推荐）
 
-**两个独立安装器**（`installer\` 目录）：`install_plugin.bat`（插件版）与 `install_source.bat`（源码版），各自独立运行。安装器做**文件操作 + 方案加入 LLM 组件行**（幂等，重复运行不重复插入）——停算法服务 + 清理上次安装残留 → 替换二进制（一律改名腾位 `*.llm_old`，下次安装时清理）→ schema 插入组件行 → 启服务 + 自动重新部署。不碰注册表。
+**插件版安装器**（本仓库 `installer\` 目录，2026-08-26 分仓：源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库，各自只带本版文件；`common.ps1` 为共用逻辑，两仓库各存一份保持一致）。界面为**三个按钮**：**复制文件**（停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务）与**方案配置加 / 去 LLM**（只改选中的方案文件，幂等，完成后自动重新部署）分离；模型路径输入框留空 = 默认 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`，填写则写入配置生效行。不碰注册表。
 
 **前提**：已安装官方小狼毫；方案配置已含 LLM 组件行（拼读双拼方案自带——`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`；其他方案参照"手动安装"第三步自行添加）。
 
-1. `git clone` 本仓库到目标电脑（或下载仓库 zip 解压——插件版文件在 `user\`、源码版二进制在 `installer\source\`，均已入库）
+1. `git clone` 本仓库到目标电脑（或下载仓库 zip 解压——插件版文件在 `user\`，已入库）
 2. **双击 `installer\install_plugin.bat`**（自动请求管理员权限）
-3. 选择方案文件（下拉列出 `%APPDATA%\Rime\*.schema.yaml`，可浏览外部 yaml 自动拷入）→ 点击 **安装**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → schema 幂等插入 LLM 组件行 → 启服务 + 自动重新部署
-4. **托盘小狼毫 → 右键 → 重新部署**。验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`
+3. 选择方案文件（下拉列出 `%APPDATA%\Rime\*.schema.yaml`，可浏览外部 yaml 自动拷入）；模型路径留空 = 默认
+4. 点击 **复制文件**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → 启服务
+5. 点击 **方案配置加 LLM**：schema 幂等插入组件行（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）→ 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离这些行/节）
+6. 验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
 
-**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 把原始（不含 LLM 组件行）的方案配置重新复制到 `%APPDATA%\Rime\` → 运行另一安装器。**切换没有自动流程**，这是刻意设计——避免任何状态残留。
+**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 把原始（不含 LLM 组件行）的方案配置重新复制到 `%APPDATA%\Rime\` → 运行另一版安装器（源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库）。**切换没有自动流程**，这是刻意设计——避免任何状态残留。
 
-**输入法图标消失时**：运行 `installer\repair_tsf.ps1`（右键"使用 PowerShell 运行"，自动提权；重注册 TSF 并挂回语言列表）。
+**输入法图标消失时**：运行 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库的 `installer\repair_tsf.ps1`（右键"使用 PowerShell 运行"，自动提权；重注册 TSF 并挂回语言列表——插件版安装不碰注册表，此症状只源于源码版操作或系统问题）。
 
-命令行模式：`install_plugin.ps1 -CliAction install|status -SchemaName pdsp.schema.yaml`（源码版同）。
+命令行模式：`install_plugin.ps1 -CliAction install|copy-files|schema-add|schema-remove|status -SchemaName pdsp.schema.yaml -ModelPath <模型路径>`（源码版同；`install` = 复制文件 + 配置加 LLM 全流程）。
 
 ## 手动安装
 
@@ -385,9 +387,9 @@ rime-llm-rerank\
 │   ├── prep_training.py       #   打字语料 llm_training.txt → train_samples.tsv
 │   └── run_tests.py           #   test_core 自动化测试驱动
 ├── bin\bench_threads.exe      # 预编译线程测定工具
-└── installer\                 # 双安装器：install_plugin.bat / install_source.bat
-                                # + common.ps1 共享逻辑 + repair_tsf.ps1 应急修复
-                                # + source\ 源码版二进制（插件版载荷 = user\）
+└── installer\                 # 插件版安装器（分仓：只带本版文件）
+                                # install_plugin.bat 提权入口 + install_plugin.ps1
+                                # + common.ps1 共用逻辑（与源码版仓库保持一致）
 ```
 
 > 评估工具路径约定：**项目内资源**（词库 `pdsp_dict.yaml`、样本 `eval_samples.tsv`、`sim_rerank.exe`）相对脚本位置，cpp 程序数据文件相对 cwd（在项目根运行）；**本机/跨项目资源**（模型、语料、venv、处理脚本）用环境变量覆盖，默认值见下表。GPU 版（`rime_llm_cuda.cpp`/DLL）与语料（`train_samples.tsv` 等）仅本地留存，不进 GitHub。
@@ -477,7 +479,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 ## 安装器原理
 
-`installer\common.ps1`（`install_plugin.bat` / `install_source.bat` 提权启动对应入口）：停算法服务 + 清理上次安装残留 → 替换二进制（一律改名腾位 `*.llm_old`，下次安装时清理；复制失败自动回滚改名）→ schema 幂等插入 LLM 组件行（processor 最前 / uniquifier 后，检测到另一版组件即中止）→ 启服务 + 自动重新部署。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
+`installer\common.ps1`（`install_plugin.bat` 提权启动本仓库入口；common.ps1 为两仓库共用文件，由 rime-llm-ime 仓库的 make_installer.ps1 保持同步）：GUI 三按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`schema-add`（幂等插入组件行，processor 最前 / uniquifier 后，检测到另一版组件即中止；模型路径非空时写入 `model_path` 生效行）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
 
 ---
 
