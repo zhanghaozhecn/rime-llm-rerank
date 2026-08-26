@@ -219,22 +219,23 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ## 一键部署（推荐）
 
-**插件版安装器**（本仓库 `installer\` 目录，2026-08-26 分仓：源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库，各自只带本版文件；`common.ps1` 为共用逻辑，两仓库各存一份保持一致）。界面为**三个按钮**：**复制文件**（停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务）与**方案配置加 / 去 LLM**（只改选中的方案文件，幂等，完成后自动重新部署）分离；模型路径输入框留空 = 默认 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`，填写则写入配置生效行。不碰注册表。
+**插件版安装器**（本仓库 `installer\` 目录，2026-08-26 分仓：源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库，各自只带本版文件；`common.ps1` 为共用逻辑，两仓库各存一份保持一致）。界面为**四个按钮**：**复制文件**（停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务）、**下载模型**（ModelScope 断点续传，目标 = 模型路径框，留空 = 默认）与**方案配置加 / 去 LLM**（只改选中的方案文件，幂等，完成后自动重新部署）；模型路径输入框留空 = 默认 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`，填写则写入配置生效行。不碰注册表。
 
 **前提**：已安装官方小狼毫；方案配置已含 LLM 组件行（拼读双拼方案自带——`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`；其他方案参照"手动安装"第三步自行添加）。
 
 1. `git clone` 本仓库到目标电脑（或下载仓库 zip 解压——插件版文件在 `user\`，已入库）
 2. **双击 `installer\install_plugin.bat`**（自动请求管理员权限）
 3. 选择方案文件（下拉列出 `%APPDATA%\Rime\*.schema.yaml`，可浏览外部 yaml 自动拷入）；模型路径留空 = 默认
-4. 点击 **复制文件**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → 启服务
-5. 点击 **方案配置加 LLM**：schema 幂等插入组件行（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）→ 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离这些行/节）
-6. 验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
+4. 缺模型时点击 **下载模型**：从 ModelScope 下载到模型路径（约 500MB，断点续传——中断/失败后重新点击自动续传）
+5. 点击 **复制文件**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → 启服务
+6. 点击 **方案配置加 LLM**：schema 幂等插入组件行（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）→ 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离这些行/节）
+7. 验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
 
 **切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 把原始（不含 LLM 组件行）的方案配置重新复制到 `%APPDATA%\Rime\` → 运行另一版安装器（源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库）。**切换没有自动流程**，这是刻意设计——避免任何状态残留。
 
 **输入法图标消失时**：运行 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库的 `installer\repair_tsf.ps1`（右键"使用 PowerShell 运行"，自动提权；重注册 TSF 并挂回语言列表——插件版安装不碰注册表，此症状只源于源码版操作或系统问题）。
 
-命令行模式：`install_plugin.ps1 -CliAction install|copy-files|schema-add|schema-remove|status -SchemaName pdsp.schema.yaml -ModelPath <模型路径>`（源码版同；`install` = 复制文件 + 配置加 LLM 全流程）。
+命令行模式：`install_plugin.ps1 -CliAction install|copy-files|schema-add|schema-remove|download-model|status -SchemaName pdsp.schema.yaml -ModelPath <模型路径>`（源码版同；`install` = 复制文件 + 配置加 LLM 全流程）。
 
 ## 手动安装
 
@@ -479,7 +480,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 ## 安装器原理
 
-`installer\common.ps1`（`install_plugin.bat` 提权启动本仓库入口；common.ps1 为两仓库共用文件，由 rime-llm-ime 仓库的 make_installer.ps1 保持同步）：GUI 三按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`schema-add`（幂等插入组件行，processor 最前 / uniquifier 后，检测到另一版组件即中止；模型路径非空时写入 `model_path` 生效行）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
+`installer\common.ps1`（`install_plugin.bat` 提权启动本仓库入口；common.ps1 为两仓库共用文件，由 rime-llm-ime 仓库的 make_installer.ps1 保持同步）：GUI 四按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程每 5 秒打进度行到日志）、`schema-add`（幂等插入组件行，processor 最前 / uniquifier 后，检测到另一版组件即中止；模型路径非空时写入 `model_path` 生效行）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
 
 ---
 

@@ -25,6 +25,10 @@ $SourceReady = Test-Path (Join-Path $SourceSrc "rime.dll")
 $RIME_USER = Join-Path $env:APPDATA "Rime"
 $LUA_DIR = Join-Path $RIME_USER "lua"
 
+# ── 模型（下载按钮用；curl 为 Win10 1803+ 自带）──
+$DEFAULT_MODEL = "D:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf"
+$MODEL_URL = "https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf"
+
 function Find-WeaselDir {
   foreach ($p in @("C:\Program Files\Rime\weasel-0.17.4",
                    "C:\Program Files (x86)\Rime\weasel-0.17.4",
@@ -89,8 +93,15 @@ function Invoke-Redeploy([string]$installDir, $Log) {
   if (Test-Path $deployer) {
     & $Log "  触发重新部署（WeaselDeployer /deploy）…"
     try {
-      $p = Start-Process -FilePath $deployer -ArgumentList "/deploy" -PassThru -Wait -ErrorAction Stop
-      & $Log ("  重新部署退出码: " + $p.ExitCode)
+      $p = Start-Process -FilePath $deployer -ArgumentList "/deploy" -PassThru -ErrorAction Stop
+      # 只等 15 秒拿快速退出码（成功 / 互斥冲突）。真机曾遇 deployer 在
+      # EndMaintenance 的管道应答 ReadFile（无超时）中挂死——部署本身已完成，
+      # 不能无限 -Wait 卡死安装器；超时则留后台继续，不杀进程
+      if ($p.WaitForExit(15000)) {
+        & $Log ("  重新部署退出码: " + $p.ExitCode)
+      } else {
+        & $Log "  重新部署仍在后台进行（已不再等待）；完成后输入法自动生效，若候选异常请托盘手动重新部署"
+      }
     } catch { & $Log "  [警告] 自动重新部署失败，请手动：托盘小狼毫 → 重新部署" }
   } else {
     & $Log "  请手动重新部署：托盘小狼毫 → 重新部署"
@@ -345,6 +356,43 @@ function Schema-RemoveAction([string]$schemaName, $Log) {
   & $Log "完成。"
 }
 
+# 下载模型（v1/v2 实测实现移植：curl 断点续传 + 分片转正；子进程轮询分片
+# 大小打进度行 → GUI 日志滚动显示。失败保留分片，重试 curl -C - 续传）
+function Download-ModelAction([string]$modelPath, $Log) {
+  & $Log "── 下载模型 ──"
+  if (-not $modelPath) { $modelPath = $DEFAULT_MODEL }
+  & $Log ("  目标: " + $modelPath)
+  if (Test-Path $modelPath) {
+    & $Log ("  模型已存在（{0:N0} MB），无需下载" -f ((Get-Item $modelPath).Length / 1MB))
+    & $Log "完成。"
+    return
+  }
+  $dir = Split-Path $modelPath -Parent
+  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  $tmp = $modelPath + ".download"
+  if ((Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 0)) {
+    & $Log ("  发现未完成分片 {0:N0} MB — 断点续传" -f ((Get-Item $tmp).Length / 1MB))
+  }
+  $p = Start-Process -FilePath "curl.exe" `
+    -ArgumentList @("-L", "-C", "-", "-s", "-S", "-o", "`"$tmp`"", "`"$MODEL_URL`"") `
+    -PassThru -WindowStyle Hidden
+  while (-not $p.HasExited) {
+    Start-Sleep -Seconds 5
+    if (Test-Path $tmp) {
+      & $Log ("  进度: {0:N0} MB / 约 500MB" -f ((Get-Item $tmp).Length / 1MB))
+    }
+  }
+  $code = $p.ExitCode
+  if ($code -eq 0 -and (Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 100MB)) {
+    Move-Item $tmp $modelPath -Force
+    & $Log ("  下载完成: {0:N0} MB → {1}" -f ((Get-Item $modelPath).Length / 1MB), $modelPath)
+    & $Log "完成。"
+  } else {
+    & $Log ("  [ERROR] 下载失败（curl 退出码 $code）；分片已保留，重试可续传；或手动下载: $MODEL_URL")
+    throw ("模型下载失败（curl 退出码 $code）——重试可断点续传")
+  }
+}
+
 # 完整安装 = 复制文件 + 方案配置（CLI -CliAction install，自动化旧路径）
 function Install-PluginAction([string]$schemaName, $Log) {
   Copy-FilesPluginAction $Log
@@ -386,7 +434,8 @@ function Invoke-Installer([string]$edition, [string]$cliAction, [string]$schemaN
           if (-not $schemaName) { throw "需要 -SchemaName 指定方案文件" }
           Schema-RemoveAction $schemaName $Log
         }
-        default { Write-Host "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove）"; exit 1 }
+        "download-model" { Download-ModelAction $modelPath $Log }
+        default { Write-Host "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove | download-model）"; exit 1 }
       }
     } catch {
       Write-Host ("[ERROR] " + $_.Exception.Message)
@@ -411,7 +460,7 @@ function Run-InstallerGui([string]$edition) {
   $form.MaximizeBox = $false
 
   $lblIntro = New-Object System.Windows.Forms.Label
-  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务。『方案配置加/去 LLM』只改选中的方案文件并自动重新部署；模型路径留空 = 默认 d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf，填写则写入配置。切换版本：重装小狼毫 + 恢复原始方案配置。"
+  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= 缺模型时从 ModelScope 下载（断点续传；目标 = 模型路径框，留空 = 默认 d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。切换版本：重装小狼毫 + 恢复原始方案配置。"
   $lblIntro.Location = New-Object System.Drawing.Point(15, 12)
   $lblIntro.Size = New-Object System.Drawing.Size(660, 40)
   $lblIntro.ForeColor = [System.Drawing.Color]::DimGray
@@ -447,19 +496,25 @@ function Run-InstallerGui([string]$edition) {
   $btnFiles = New-Object System.Windows.Forms.Button
   $btnFiles.Text = "复制文件"
   $btnFiles.Location = New-Object System.Drawing.Point(12, 115)
-  $btnFiles.Size = New-Object System.Drawing.Size(210, 36)
+  $btnFiles.Size = New-Object System.Drawing.Size(150, 36)
   $form.Controls.Add($btnFiles)
+
+  $btnModel = New-Object System.Windows.Forms.Button
+  $btnModel.Text = "下载模型"
+  $btnModel.Location = New-Object System.Drawing.Point(170, 115)
+  $btnModel.Size = New-Object System.Drawing.Size(150, 36)
+  $form.Controls.Add($btnModel)
 
   $btnAdd = New-Object System.Windows.Forms.Button
   $btnAdd.Text = "方案配置加 LLM"
-  $btnAdd.Location = New-Object System.Drawing.Point(230, 115)
-  $btnAdd.Size = New-Object System.Drawing.Size(226, 36)
+  $btnAdd.Location = New-Object System.Drawing.Point(328, 115)
+  $btnAdd.Size = New-Object System.Drawing.Size(172, 36)
   $form.Controls.Add($btnAdd)
 
   $btnRemove = New-Object System.Windows.Forms.Button
   $btnRemove.Text = "方案配置去 LLM"
-  $btnRemove.Location = New-Object System.Drawing.Point(462, 115)
-  $btnRemove.Size = New-Object System.Drawing.Size(206, 36)
+  $btnRemove.Location = New-Object System.Drawing.Point(506, 115)
+  $btnRemove.Size = New-Object System.Drawing.Size(162, 36)
   $form.Controls.Add($btnRemove)
 
   $lblStatus = New-Object System.Windows.Forms.Label
@@ -488,6 +543,7 @@ function Run-InstallerGui([string]$edition) {
                        $(if ($dir) { $dir } else { "未找到（请先安装官方小狼毫）" }))
     $lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
     $btnFiles.Enabled = ($ready -and $dir)
+    $btnModel.Enabled = $true
     $btnAdd.Enabled = ($cmbSchema.Items.Count -gt 0)
     $btnRemove.Enabled = ($cmbSchema.Items.Count -gt 0)
   }
@@ -508,8 +564,9 @@ function Run-InstallerGui([string]$edition) {
     $script:WorkDone = $false; $script:WorkOff = 0
     if (Test-Path $script:WorkLog) { Remove-Item $script:WorkLog -Force }
     $txtLog.AppendText("────────────────────`r`n")
-    $lblStatus.Text = "执行中…（文件复制/替换可能需要数十秒）"
-    $btnFiles.Enabled = $false; $btnAdd.Enabled = $false; $btnRemove.Enabled = $false
+    $lblStatus.Text = "执行中…（文件复制/替换/模型下载可能需要较长时间）"
+    $btnFiles.Enabled = $false; $btnModel.Enabled = $false
+    $btnAdd.Enabled = $false; $btnRemove.Enabled = $false
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
       $psExe = (Get-Process -Id $PID).Path
@@ -587,6 +644,7 @@ function Run-InstallerGui([string]$edition) {
     }
   })
   $btnFiles.Add_Click({ Start-Work "copy-files" "" "" })
+  $btnModel.Add_Click({ Start-Work "download-model" "" $txtModel.Text.Trim() })
   $btnAdd.Add_Click({
     if ($cmbSchema.SelectedItem -eq $null) {
       [System.Windows.Forms.MessageBox]::Show("请先选择方案文件", "提示") | Out-Null
