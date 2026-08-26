@@ -230,6 +230,20 @@ function Edit-SchemaSource([string]$schemaPath, [string]$modelPath, $Log) {
   else { & $Log "  schema 组件已存在，无需修改" }
 }
 
+# 读方案 llm_rerank 节内已生效的 model_path（先剥离后添加时保留用户已设路径）
+function Get-ActiveModelPath([string]$schemaPath) {
+  $lines = Read-Schema $schemaPath
+  $inCfg = $false
+  foreach ($ln in $lines) {
+    if ($ln -match '^llm_rerank:') { $inCfg = $true; continue }
+    if ($inCfg) {
+      if ($ln -match '^\S') { return $null }
+      if ($ln -match '^\s+model_path:\s*(.+?)\s*$') { return $Matches[1].Trim('"') }
+    }
+  }
+  return $null
+}
+
 # 去除 LLM 组件（两版通用）：processor/filter 组件行 + llm_rerank 整节（含前置空行）
 function Edit-SchemaRemove([string]$schemaPath, $Log) {
   $lines = Read-Schema $schemaPath
@@ -336,9 +350,15 @@ function Schema-AddAction([string]$edition, [string]$schemaName, [string]$modelP
   & $Log "── 方案配置加入 LLM 组件 ──"
   $schemaPath = Get-SchemaPath $schemaName
   & $Log ("  方案: " + $schemaPath)
-  if ($modelPath) { & $Log ("  模型: " + $modelPath) }
-  if ($edition -eq "plugin") { Edit-SchemaPlugin $schemaPath $modelPath $Log }
-  else { Edit-SchemaSource $schemaPath $modelPath $Log }
+  # 先剥离再添加（2026-08-26 定案）：无论原状是无 LLM / 本版 / 另一版配置，
+  # 先统一剥净再全新插入（另一版组件行被 Edit-SchemaRemove 一并剥掉，无冲突）。
+  # 模型路径本次未填时，保留方案中原有的生效 model_path（剥离会删整个节）
+  $keepModel = Get-ActiveModelPath $schemaPath
+  Edit-SchemaRemove $schemaPath $Log
+  $useModel = if ($modelPath) { $modelPath } else { $keepModel }
+  if ($useModel) { & $Log ("  模型: " + $useModel) }
+  if ($edition -eq "plugin") { Edit-SchemaPlugin $schemaPath $useModel $Log }
+  else { Edit-SchemaSource $schemaPath $useModel $Log }
   $installDir = Find-WeaselDir
   if ($installDir) { Invoke-Redeploy $installDir $Log }
   else { & $Log "  [警告] 未找到小狼毫目录，跳过自动重新部署（请托盘手动重新部署）" }

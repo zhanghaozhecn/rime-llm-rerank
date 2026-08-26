@@ -231,7 +231,7 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 6. 点击 **方案配置加 LLM**：schema 幂等插入组件行（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）→ 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离这些行/节）
 7. 验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
 
-**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 把原始（不含 LLM 组件行）的方案配置重新复制到 `%APPDATA%\Rime\` → 运行另一版安装器（源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库）。**切换没有自动流程**，这是刻意设计——避免任何状态残留。
+**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 运行另一版安装器（源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库）——其**方案配置加 LLM** 会先剥离本版组件行再插入（跨版自动转换），**无需恢复原始方案配置**。
 
 **输入法图标消失时**：运行 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库的 `installer\repair_tsf.ps1`（右键"使用 PowerShell 运行"，自动提权；重注册 TSF 并挂回语言列表——插件版安装不碰注册表，此症状只源于源码版操作或系统问题）。
 
@@ -480,7 +480,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 ## 安装器原理
 
-`installer\common.ps1`（`install_plugin.bat` 提权启动本仓库入口；common.ps1 为两仓库共用文件，由 rime-llm-ime 仓库的 make_installer.ps1 保持同步）：GUI 四按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程每 5 秒打进度行到日志）、`schema-add`（幂等插入组件行，processor 最前 / uniquifier 后，检测到另一版组件即中止；模型路径非空时写入 `model_path` 生效行）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
+`installer\common.ps1`（`install_plugin.bat` 提权启动本仓库入口；common.ps1 为两仓库共用文件，由 rime-llm-ime 仓库的 make_installer.ps1 保持同步）：GUI 四按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程每 5 秒打进度行到日志）、`schema-add`（**先剥离后插入**——方案原状无论无 LLM / 本版 / 另一版组件均先剥净再全新插入，跨版自动转换；模型路径未填时保留原有生效 `model_path`，非空时写入新值）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
 
 ---
 
