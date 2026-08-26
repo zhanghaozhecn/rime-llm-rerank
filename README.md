@@ -219,7 +219,7 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ## 一键部署（推荐）
 
-**两个独立安装器**（`installer\` 目录）：`install_plugin.bat`（插件版）与 `install_source.bat`（源码版），各自独立运行。安装器做**文件操作 + 方案加入 LLM 组件行**（幂等，重复运行不重复插入）——停算法服务 → 复制/替换文件（被占用自动改名腾位，极端延迟替换重启生效）→ schema 插入组件行 → 启服务 + 自动重新部署。不碰注册表。
+**两个独立安装器**（`installer\` 目录）：`install_plugin.bat`（插件版）与 `install_source.bat`（源码版），各自独立运行。安装器做**文件操作 + 方案加入 LLM 组件行**（幂等，重复运行不重复插入）——停算法服务 + 清理上次安装残留 → 替换二进制（一律改名腾位 `*.llm_old`，下次安装时清理）→ schema 插入组件行 → 启服务 + 自动重新部署。不碰注册表。
 
 **前提**：已安装官方小狼毫；方案配置已含 LLM 组件行（拼读双拼方案自带——`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`；其他方案参照"手动安装"第三步自行添加）。
 
@@ -477,7 +477,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 ## 安装器原理
 
-`installer\common.ps1`（`install_plugin.bat` / `install_source.bat` 提权启动对应入口）：停算法服务 → 复制/替换文件（被占用改名腾位，极端 MoveFileEx 延迟替换）→ schema 幂等插入 LLM 组件行（processor 最前 / uniquifier 后，检测到另一版组件即中止）→ 启服务 + 自动重新部署。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
+`installer\common.ps1`（`install_plugin.bat` / `install_source.bat` 提权启动对应入口）：停算法服务 + 清理上次安装残留 → 替换二进制（一律改名腾位 `*.llm_old`，下次安装时清理；复制失败自动回滚改名）→ schema 幂等插入 LLM 组件行（processor 最前 / uniquifier 后，检测到另一版组件即中止）→ 启服务 + 自动重新部署。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
 
 ---
 

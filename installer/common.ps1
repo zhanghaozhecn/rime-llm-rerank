@@ -59,34 +59,22 @@ function Start-WeaselService([string]$installDir, $Log) {
   }
 }
 
-# 替换文件：直接复制 → 被占用则改名腾位（Windows 允许改名加载中的镜像）→
-# 连改名都失败则 MoveFileEx 延迟替换（重启生效）
-Add-Type -Namespace LlmInst -Name Native -MemberDefinition @"
-[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-public static extern bool MoveFileExW(string lpExistingFileName, string lpNewFileName, int dwFlags);
-"@
+# 替换二进制：一律改名腾位（2026-08-26 简化——只此一条路径，不再直接复制 /
+# MoveFileEx 延迟替换）。Windows 允许改名加载中的镜像：目标先改名 *.llm_old
+# （旧镜像留给运行中的进程继续用），再复制新文件；复制失败则回滚改名，避免
+# 目标缺失。*.llm_old 由下次安装开始时的 Clean-OldBinaries 清理。
 function Copy-Binary([string]$s, [string]$d, $Log) {
-  for ($i = 0; $i -le 2; $i++) {
-    try { Copy-Item $s $d -Force -ErrorAction Stop; return }
-    catch {
-      try {
-        Move-Item $d ($d + ".llm_old") -Force -ErrorAction Stop
-        Copy-Item $s $d -Force -ErrorAction Stop
-        & $Log ("  " + [IO.Path]::GetFileName($d) + " 被占用，改名替换（旧镜像留给运行中的进程）")
-        return
-      } catch {
-        Invoke-Native taskkill @("/f", "/im", "WeaselServer.exe") | Out-Null
-        Start-Sleep -Seconds 2
-      }
-    }
+  $bak = $null
+  if (Test-Path $d) {
+    $bak = $d + ".llm_old"
+    Move-Item $d $bak -Force -ErrorAction Stop
+    & $Log ("  " + [IO.Path]::GetFileName($d) + " → .llm_old（旧镜像留给运行中的进程，下次安装时清理）")
   }
-  $tmp = $d + ".llm_new"
-  Copy-Item $s $tmp -Force
-  if ([LlmInst.Native]::MoveFileExW($tmp, $d, 4)) {   # MOVEFILE_DELAY_UNTIL_REBOOT
-    & $Log ("  " + [IO.Path]::GetFileName($d) + " 已排队延迟替换 —— 需重启系统生效")
-    return
+  try { Copy-Item $s $d -Force -ErrorAction Stop }
+  catch {
+    if ($bak -and (Test-Path $bak)) { Move-Item $bak $d -Force -ErrorAction SilentlyContinue }
+    throw
   }
-  throw ("无法替换 " + $d + "：" + $_.Exception.Message)
 }
 function Clean-OldBinaries([string]$dir, $Log) {
   $old = Get-ChildItem $dir -Filter "*.llm_old" -ErrorAction SilentlyContinue
@@ -216,8 +204,9 @@ function Install-PluginAction([string]$schemaName, $Log) {
     if (-not (Test-Path (Join-Path $PluginSrc $f))) { throw "插件版文件不完整: 缺 $f" }
   }
 
-  & $Log "[1/4] 停止算法服务"
+  & $Log "[1/4] 停止算法服务 + 清理上次安装的旧二进制"
   Stop-WeaselService
+  Clean-OldBinaries $installDir $Log
   & $Log "[2/4] 复制插件文件"
   foreach ($d in @("rime_llm.dll", "llama.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll")) {
     $s = Join-Path $PluginSrc $d
@@ -231,7 +220,6 @@ function Install-PluginAction([string]$schemaName, $Log) {
     Copy-Item (Join-Path $PluginSrc $l) (Join-Path $LUA_DIR $l) -Force
     & $Log ("  + lua\" + $l)
   }
-  Clean-OldBinaries $installDir $Log
   & $Log "[3/4] 方案加入 LLM 组件"
   Edit-SchemaPlugin $schemaPath $Log
   & $Log "[4/4] 启动服务 + 重新部署"
@@ -250,8 +238,11 @@ function Install-SourceAction([string]$schemaName, $Log) {
     if (-not (Test-Path (Join-Path $SourceSrc $f))) { throw "源码版文件不完整: 缺 $f" }
   }
 
-  & $Log "[1/5] 停止算法服务"
+  & $Log "[1/5] 停止算法服务 + 清理上次安装的旧二进制"
   Stop-WeaselService
+  Clean-OldBinaries $installDir $Log
+  Clean-OldBinaries "C:\Windows\System32" $Log
+  Clean-OldBinaries "C:\Windows\SysWOW64" $Log
   & $Log "[2/5] 复制安装目录二进制"
   foreach ($pair in @(
       @("rime.dll", "rime.dll"), @("WeaselServer.exe", "WeaselServer.exe"),
@@ -266,22 +257,18 @@ function Install-SourceAction([string]$schemaName, $Log) {
       & $Log ("  [MISS] " + $pair[0] + "（跳过，保留现有文件）")
     }
   }
-  Clean-OldBinaries $installDir $Log
-
   & $Log "[3/5] 替换 System32 / SysWOW64 的 TSF DLL（不碰注册表）"
   Copy-Binary (Join-Path $SourceSrc "weaselx64.dll") "C:\Windows\System32\weasel.dll" $Log
   & $Log "  + System32\weasel.dll"
   Copy-Binary (Join-Path $SourceSrc "weasel32.dll") "C:\Windows\SysWOW64\weasel.dll" $Log
   & $Log "  + SysWOW64\weasel.dll"
-  Clean-OldBinaries "C:\Windows\System32" $Log
-  Clean-OldBinaries "C:\Windows\SysWOW64" $Log
 
   & $Log "[4/5] 方案加入 LLM 组件"
   Edit-SchemaSource $schemaPath $Log
   & $Log "[5/5] 启动服务 + 重新部署"
   Start-WeaselService $installDir $Log
   Invoke-Redeploy $installDir $Log
-  & $Log "完成。若日志出现"延迟替换"提示需重启系统；托盘重新部署后生效。"
+  & $Log "完成。无需重启系统；重新部署后生效（存量 TSF 宿主退出后自动走新 DLL）。"
 }
 
 # ── CLI / GUI 入口（由入口脚本调用）──────────────
