@@ -12,7 +12,6 @@ local cfg = {
     max_tokens       = 6,
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = auto-detect in C++
-    long_word_first = false,  -- true = 重排后多字词优先、单字词靠后（组内按 LLM 评分）
     expected_length_weight = 0,  -- > 0 = 两码一字方案的编码长度匹配加权
     freq_weight = 0.25,  -- 用户词频融合权重 (0=关闭); total=(1-w)·LLM + w·词频
     freq_k = 5,          -- 词频饱和常数: s_f = eff/(eff+k); eff = rime 时间衰减计数
@@ -80,8 +79,6 @@ local function init_config(env)
     if v then cfg.min_code_len = v end
     v = sc:get_int("llm_rerank/max_code_len")
     if v then cfg.max_code_len = v end
-    v = sc:get_bool("llm_rerank/long_word_first")
-    if v ~= nil then cfg.long_word_first = v end
     v = get_config_number(sc, "llm_rerank/expected_length_weight")
     if v ~= nil then cfg.expected_length_weight = math.max(0, v) end
     v = get_config_number(sc, "llm_rerank/freq_weight")
@@ -223,7 +220,7 @@ return function(translation, env)
         -- 久未使用的自动消退。实证 (17258 真实候选窗, 6000 抽样, 事前计数
         -- 口径): 纯 LLM 97.08%, 衰减融合约 +0.4pp; 融合的意义在个性化高频
         -- 词 (纯 LLM 排错事件 87% 选中词词频>=2)。同分稳定保序。
-        -- 应用于其他排序策略之前: expected_length / long_word_first 以同分
+        -- 应用于其他排序策略之前: expected_length 以同分
         -- idx 的方式保留其影响。
         if cfg.freq_weight > 0 and #ordered > 1 and scores then
             local freq_eff = _G.user_freq_eff
@@ -292,18 +289,6 @@ return function(translation, env)
                 end)
                 for i = 1, #arr do ordered[i] = arr[i].c end
             end
-        -- long-word-first (long_word_first): 未启用新方案时按词长降序，
-        -- 同词长保持 LLM 评分序。
-        elseif cfg.expected_length_weight <= 0 and cfg.long_word_first and #ordered > 1 then
-            local arr = {}
-            for i, c in ipairs(ordered) do
-                arr[i] = { c = c, len = utf8.len(c.text or "") or 0, idx = i }
-            end
-            table.sort(arr, function(a, b)
-                if a.len ~= b.len then return a.len > b.len end
-                return a.idx < b.idx
-            end)
-            for i = 1, #arr do ordered[i] = arr[i].c end
         end
         for i, c in ipairs(ordered) do
             if i == 1 then

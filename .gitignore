@@ -7,7 +7,6 @@ cpp/bench_threads_result.txt
 bench_threads_result.txt
 
 # 本地私有（不发布）
-CLAUDE.md
 AGENTS.md
 docs/
 memory/

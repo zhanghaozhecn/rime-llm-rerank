@@ -118,7 +118,7 @@ function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $
 function Get-LlmCfgLines([string]$modelPath) {
   $l = @(
     "", "llm_rerank:", "  enabled: true", "  min_code_len: 4",
-    "  # max_code_len: 0", "  # long_word_first: false",
+    "  # max_code_len: 0",
     "  # expected_length_weight: 0.20", "  # freq_weight: 0.25", "  # freq_k: 5",
     "  # min_tokens: 1", "  # max_tokens: 10", "  # max_candidates: 5",
     "  # cpu_cores: 4"

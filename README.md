@@ -111,9 +111,8 @@ score = -ce_sum - (ce_sum/3) · (n_tokens-3) · λ,   λ = 0.6
 - **触发区间**：编码长度达 `min_code_len`（默认 4）才触发；`max_code_len` 可选设上限，两值组成触发区间。
 - **上文来源**：仅上屏历史（`commit_history`）。lua 侧无法感知鼠标/光标位置；应用切换经 TSF session 重置间接感知；浏览器网页切换不可感知（能力边界见 §5）。
 - **编辑键重置**：退格/Delete/导航/回车视为编辑位置变化，上文基座重置（`commit_base`），并清空 filter 结果缓存——重打相同编码必须重新推理。
-- **long_word_first**：long-word-first——候选算完 CE 后按词长降序排序、同词长按 CE 评分序（四码方案长词重码率高的优先展示）。
-- **expected_length_weight**：适用于双拼等“两码一字”方案。输入 `L` 码时，候选字数为 `L/2` 或 `(L-1)/2`（整数化后即 `floor(L/2)`）的候选获得加权；加成是本次候选 LLM 分数跨度乘以该权重。加权分数相同时，所有匹配候选优先，再按原始 LLM 顺序排列。启用时优先于 `long_word_first`。
-- **freq_weight / freq_k**：用户词频融合。`total = (1-w)·LLM评分 + w·count/(count+k)`——LLM 评分按候选窗内 min-max 归一，用户词频取饱和函数 `count/(count+k)`（词频数据由 lua 自动统计于 RIME 用户目录 `user_freq.tsv`）。解决“个人高频词在语料中罕见、纯 LLM 排序排不到第一”的问题（实证：LLM 排错事件 87% 的选中词用户词频≥2）。默认 `0.25/5`（真实候选窗回放：首选率 97.08%→98.20%）；`freq_weight: 0` 关闭。融合先于 expected_length_weight / long_word_first 应用。
+- **expected_length_weight**：适用于双拼等“两码一字”方案。输入 `L` 码时，候选字数为 `L/2` 或 `(L-1)/2`（整数化后即 `floor(L/2)`）的候选获得加权；加成是本次候选 LLM 分数跨度乘以该权重。加权分数相同时，所有匹配候选优先，再按原始 LLM 顺序排列。（`long_word_first` 长词优先已删——2026-08-27 两版参数统一，统一用本参数。）
+- **freq_weight / freq_k**：用户词频融合。`total = (1-w)·LLM评分 + w·count/(count+k)`——LLM 评分按候选窗内 min-max 归一，用户词频取饱和函数 `count/(count+k)`（词频数据由 lua 自动统计于 RIME 用户目录 `user_freq.tsv`）。解决“个人高频词在语料中罕见、纯 LLM 排序排不到第一”的问题（实证：LLM 排错事件 87% 的选中词用户词频≥2）。默认 `0.25/5`（真实候选窗回放：首选率 97.08%→98.20%）；`freq_weight: 0` 关闭。融合先于 expected_length_weight 应用。
 - **热开关**：每次 filter 调用重读 `llm_rerank.enabled`，重新部署即生效，无需重启。
 - **AI 标记**：LLM 首选候选以 ShadowCandidate 附加 "AI" 注释，肉眼可验证重排生效。
 
@@ -286,7 +285,6 @@ llm_rerank:
   min_tokens: 1        # 最少上文 token 才重排
   max_tokens: 10       # 截取的上文 token 数（1-20），10 为性价比最优点
   max_candidates: 5    # 并行评分候选数（2-9），5 为延迟/准确率最佳平衡
-  # long_word_first: false       # 长词优先（适用于四码等定长方案）
   # expected_length_weight: 0.20 # 适用于双拼等两码出一字的方案：当 `候选词字数=编码数÷2` 或 `候选词字数=(编码数-1)÷2` 时，此候选词获得排序加权。0=关闭；1=所有匹配候选词优先，内部按加权后评分排序
   # freq_weight: 0.25  # 用户词频融合权重 (0=关闭); freq_k: 5 饱和常数
   #   total = (1-w)·LLM(min-max归一) + w·count/(count+k), 词频自动统计
@@ -300,8 +298,7 @@ llm_rerank:
 | `enabled` | false | `true` 启用 LLM 重排 / `false` 关闭（不加载 DLL，候选原样透传） |
 | `min_code_len` | 4 | 编码达到此长度才触发 LLM（与 `max_code_len` 组成触发区间） |
 | `max_code_len` | 0 | 编码长度上限（0=不限制）；超出此长度不推理 |
-| `long_word_first` | false | `true` 时 long-word-first：候选算完 CE 后按词长降序、同词长按 CE 评分序排列 |
-| `expected_length_weight` | 0 | 双拼等“两码一字”方案的预期字长匹配权重。输入 `L` 码时，`L/2` 或 `(L-1)/2` 字候选获得“本次有效 LLM 分数跨度 × 权重”的加成；失败哨兵分数不参与跨度计算，也不获得加成。加权分数相同时，匹配候选优先。`0` 关闭。大于 `0` 时优先于 `long_word_first`，推荐从 `0.20` 开始调试。 |
+| `expected_length_weight` | 0 | 双拼等“两码一字”方案的预期字长匹配权重。输入 `L` 码时，`L/2` 或 `(L-1)/2` 字候选获得“本次有效 LLM 分数跨度 × 权重”的加成；失败哨兵分数不参与跨度计算，也不获得加成。加权分数相同时，匹配候选优先。`0` 关闭，推荐从 `0.20` 开始调试。（`long_word_first` 已删，2026-08-27 两版参数统一。） |
 | `freq_weight` | 0.25 | 用户词频融合权重。`total = (1-w)·LLM评分(窗内min-max归一) + w·count/(count+k)`。词频由 lua 自动统计（RIME 用户目录 `user_freq.tsv`，仅中文词，每 20 词落盘）。真实候选窗回放实证（6000 抽样）：w=0.25 首选率 97.08%→98.20%。调大更个性化、调小更依语义；`0` 关闭。 |
 | `freq_k` | 5 | 词频饱和常数：`count/(count+k)`。c=1→0.17、c=5→0.5、c=20→0.8。k 越大高频词越难饱和（更保守）。 |
 | `min_tokens` | 1 | 上文 token 不够时不重排 |
