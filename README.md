@@ -218,7 +218,7 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ## 一键部署（推荐）
 
-**插件版安装器**（本仓库 `installer\` 目录，2026-08-26 分仓：源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库，各自只带本版文件；`common.ps1` 为共用逻辑，两仓库各存一份保持一致）。界面为**四个按钮**：**复制文件**（停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务）、**下载模型**（ModelScope 断点续传，目标 = 模型路径框，留空 = 默认）与**方案配置加 / 去 LLM**（只改选中的方案文件，幂等，完成后自动重新部署）；模型路径输入框留空 = 默认 `%USERPROFILE%\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`（2026-08-27 定案：默认不假设 D 盘），填写则写入配置生效行。不碰注册表。
+**插件版安装器**（本仓库 `installer\` 目录；源码版 2026-08-27 起改用 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的 setup.exe 安装包，不再带 PS 安装器）。界面为**四个按钮**：**复制文件**（停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务）、**下载模型**（ModelScope 断点续传，目标 = 模型路径框，留空 = 默认）与**方案配置加 / 去 LLM**（只改选中的方案文件，幂等，完成后自动重新部署）；模型路径输入框留空 = 默认 `%USERPROFILE%\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`（2026-08-27 定案：默认不假设 D 盘），填写则写入配置生效行。不碰注册表。
 
 **前提**：已安装官方小狼毫；方案配置已含 LLM 组件行（拼读双拼方案自带——`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`；其他方案参照"手动安装"第三步自行添加）。
 
@@ -230,9 +230,9 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 6. 点击 **方案配置加 LLM**：schema 幂等插入组件行（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）→ 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离这些行/节）
 7. 验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
 
-**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 运行另一版安装器（源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库）——其**方案配置加 LLM** 会先剥离本版组件行再插入（跨版自动转换），**无需恢复原始方案配置**。
+**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 源码版跑 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的安装包 / 插件版跑本仓库安装器（其**方案配置加 LLM** 会先剥离另一版组件行再插入，跨版自动转换，无需恢复原始方案配置）。
 
-**输入法图标消失时**：运行 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库的 `installer\repair_tsf.ps1`（右键"使用 PowerShell 运行"，自动提权；重注册 TSF 并挂回语言列表——插件版安装不碰注册表，此症状只源于源码版操作或系统问题）。
+**输入法图标消失时**：运行源码版安装目录下的 `repair_tsf.ps1`（随 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 安装包装入，右键"使用 PowerShell 运行"自动提权重注册 TSF——插件版安装不碰注册表，此症状只源于源码版操作或系统问题）。
 
 命令行模式：`install_plugin.ps1 -CliAction install|copy-files|schema-add|schema-remove|download-model|status -SchemaName pdsp.schema.yaml -ModelPath <模型路径>`（源码版同；`install` = 复制文件 + 配置加 LLM 全流程）。
 
@@ -477,7 +477,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 ## 安装器原理
 
-`installer\common.ps1`（`install_plugin.bat` 提权启动本仓库入口；common.ps1 为两仓库共用文件，由 rime-llm-ime 仓库的 make_installer.ps1 保持同步）：GUI 四按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程每 5 秒打进度行到日志）、`schema-add`（**先剥离后插入**——方案原状无论无 LLM / 本版 / 另一版组件均先剥净再全新插入，跨版自动转换；模型路径未填时保留原有生效 `model_path`，非空时写入新值）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
+`installer\common.ps1`（`install_plugin.bat` 提权启动本仓库入口；2026-08-27 起为本仓库独有，不再跨仓同步）：GUI 四按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程每 5 秒打进度行到日志）、`schema-add`（**先剥离后插入**——方案原状无论无 LLM / 本版 / 另一版组件均先剥净再全新插入，跨版自动转换；模型路径未填时保留原有生效 `model_path`，非空时写入新值）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
 
 ---
 
