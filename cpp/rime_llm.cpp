@@ -25,12 +25,21 @@ extern "C" {
 #include <cmath>
 #include <cstring>
 #include <cstdarg>
+#include <cstdlib>
 #include <algorithm>
 
 // ============================================================
 // 配置默认值
 // ============================================================
-static std::string  g_model_path      = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
+// 默认模型路径 = %USERPROFILE%\gguf_models\（2026-08-27 用户定案：不假设
+// 存在 D: 分区；本机/有 D 盘的机器用 schema model_path 显式指向）
+static std::string default_model_path() {
+  const char *up = getenv("USERPROFILE");
+  if (up && *up)
+    return std::string(up) + "\\gguf_models\\Qwen3.5-0.8B-Q4_K_M.gguf";
+  return "gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
+}
+static std::string  g_model_path      = default_model_path();
 static int          g_min_tokens      = 1;
 static int          g_max_ctx_tokens  = 10; // tok=10 准确率 93.4%，10→17 收益仅 +1.1pp 但延迟翻倍
 static int          g_n_threads       = 4;  // 默认=GGML 默认; 可用 bench_threads 实测后配置

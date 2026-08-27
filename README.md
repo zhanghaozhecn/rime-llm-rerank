@@ -1,4 +1,4 @@
-# RIME LLM 候选重排（rime-llm-rerank）
+﻿# RIME LLM 候选重排（rime-llm-rerank）
 
 使用本地部署的小型 LLM 为任意 RIME **四码定长**输入方案（五笔、郑码、仓颉、拼读双拼等）提供打字时的智能候选排序。LLM 与编码方案无关——它只看到最终的中文候选词列表，利用上文的语义把正确词排到候选第一位，减少手动选重。
 
@@ -214,11 +214,11 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 - 小狼毫（Weasel）0.17.x 已安装，且 `rime.dll` 为官方原版（含 Lua 支持）
 - 使用四码定长方案（拼读双拼、五笔、郑码、仓颉等）
-- 下载模型 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500 MB），默认路径 `D:\gguf_models\`
+- 下载模型 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500 MB），默认路径 `%USERPROFILE%\gguf_models\`（有 D 盘等自定义位置用 `model_path` 指定）
 
 ## 一键部署（推荐）
 
-**插件版安装器**（本仓库 `installer\` 目录，2026-08-26 分仓：源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库，各自只带本版文件；`common.ps1` 为共用逻辑，两仓库各存一份保持一致）。界面为**四个按钮**：**复制文件**（停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务）、**下载模型**（ModelScope 断点续传，目标 = 模型路径框，留空 = 默认）与**方案配置加 / 去 LLM**（只改选中的方案文件，幂等，完成后自动重新部署）；模型路径输入框留空 = 默认 `d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`，填写则写入配置生效行。不碰注册表。
+**插件版安装器**（本仓库 `installer\` 目录，2026-08-26 分仓：源码版安装器在 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 仓库，各自只带本版文件；`common.ps1` 为共用逻辑，两仓库各存一份保持一致）。界面为**四个按钮**：**复制文件**（停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务）、**下载模型**（ModelScope 断点续传，目标 = 模型路径框，留空 = 默认）与**方案配置加 / 去 LLM**（只改选中的方案文件，幂等，完成后自动重新部署）；模型路径输入框留空 = 默认 `%USERPROFILE%\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf`（2026-08-27 定案：默认不假设 D 盘），填写则写入配置生效行。不碰注册表。
 
 **前提**：已安装官方小狼毫；方案配置已含 LLM 组件行（拼读双拼方案自带——`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`；其他方案参照"手动安装"第三步自行添加）。
 
@@ -240,7 +240,7 @@ Qwen3.5-2B Q4_K_M（1.3 GB）vs 0.8B（508 MB），10 tok / 5 cand：
 
 ### 第一步：下载模型
 
-打开 https://www.modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/files ，下载 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500 MB），放到 `D:\gguf_models\`。
+打开 https://www.modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/files ，下载 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500 MB），放到 `%USERPROFILE%\gguf_models\`（默认路径；放其他位置需在方案中设置 `llm_rerank.model_path`）。
 
 > 放其他路径需在 schema 中设置 `llm_rerank.model_path`。
 

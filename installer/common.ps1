@@ -26,7 +26,9 @@ $RIME_USER = Join-Path $env:APPDATA "Rime"
 $LUA_DIR = Join-Path $RIME_USER "lua"
 
 # ── 模型（下载按钮用；curl 为 Win10 1803+ 自带）──
-$DEFAULT_MODEL = "D:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf"
+# 默认模型路径 = 用户文件夹（2026-08-27 用户定案：不假设存在 D: 分区；
+# 有 D 盘模型的机器在 GUI/schema 里显式填 D:\gguf_models\...）
+$DEFAULT_MODEL = Join-Path $env:USERPROFILE "gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf"
 $MODEL_URL = "https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf"
 
 function Find-WeaselDir {
@@ -124,7 +126,7 @@ function Get-LlmCfgLines([string]$modelPath) {
     "  # cpu_cores: 4"
   )
   if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
-  else { $l += "  # model_path: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf" }
+  else { $l += "  # model_path: <绝对路径；默认 = ${env:USERPROFILE}\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf>" }
   return $l
 }
 function Convert-ToYamlPath([string]$p) {
@@ -326,7 +328,8 @@ function Copy-FilesSourceAction($Log) {
       @("rime.dll", "rime.dll"), @("WeaselServer.exe", "WeaselServer.exe"),
       @("WeaselDeployer.exe", "WeaselDeployer.exe"), @("opencc.dll", "opencc.dll"),
       @("vcomp140.dll", "vcomp140.dll"), @("weaselx64.dll", "weaselx64.dll"),
-      @("weasel32.dll", "weasel.dll"))) {
+      @("weasel32.dll", "weasel.dll"),
+      @("WeaselLLMSetup.exe", "WeaselLLMSetup.exe"))) {
     $s = Join-Path $SourceSrc $pair[0]
     if (Test-Path $s) {
       Copy-Binary $s (Join-Path $installDir $pair[1]) $Log
@@ -480,7 +483,7 @@ function Run-InstallerGui([string]$edition) {
   $form.MaximizeBox = $false
 
   $lblIntro = New-Object System.Windows.Forms.Label
-  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= 缺模型时从 ModelScope 下载（断点续传；目标 = 模型路径框，留空 = 默认 d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。切换版本：重装小狼毫 + 恢复原始方案配置。"
+  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= 缺模型时从 ModelScope 下载（断点续传；目标 = 模型路径框，留空 = 默认 %USERPROFILE%\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。切换版本：重装小狼毫 + 恢复原始方案配置。"
   $lblIntro.Location = New-Object System.Drawing.Point(15, 12)
   $lblIntro.Size = New-Object System.Drawing.Size(660, 40)
   $lblIntro.ForeColor = [System.Drawing.Color]::DimGray

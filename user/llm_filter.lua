@@ -61,7 +61,8 @@ local function load_llm(env)
     if ok and cpp then
         local sc = env.engine.schema.config
         local mp = sc:get_string("llm_rerank/model_path")
-        cpp.model_path = (mp and mp ~= "") and mp or "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
+        -- 未配置时留给 C++ 默认（%USERPROFILE%\gguf_models\，2026-08-27）
+        if mp and mp ~= "" then cpp.model_path = mp end
         cpp.max_ctx    = cfg.max_tokens
         cpp.min_tokens = cfg.min_tokens
         if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end
