@@ -148,13 +148,24 @@ local function processor(key, env)
     local enabled = sc:get_bool("llm_rerank/enabled") or false
     if not enabled then
         llm_prep = nil  -- 释放已加载的 DLL 引用
-    elseif not llm_prep then
-        local ok, result = pcall(require, "rime_llm")
-        if ok then
-            -- 日志目录: RIME 用户目录 (与 filter 共用同一模块实例)
-            local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
-            if okd and ud and ud ~= "" then result.log_dir = ud end
-            llm_prep = result
+    else
+        if not llm_prep then
+            local ok, result = pcall(require, "rime_llm")
+            if ok then
+                -- 日志目录: RIME 用户目录 (与 filter 共用同一模块实例)
+                local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
+                if okd and ud and ud ~= "" then result.log_dir = ud end
+                llm_prep = result
+            end
+        end
+        -- model_path 每键轻量同步（仅变化时写，2026-08-31 修配置不生效的
+        -- 根因）：路径只在"一次性 require 块"里读的话，首个触发 require 的
+        -- 会话（部署期编译会话/配置未就绪的瞬间）会把默认路径永久固化到
+        -- 模块级 llm_prep，之后的按键永不重读。prepare 是懒加载触发点，
+        -- 同步必须发生在它之前——本键同步、本键 prepare，路径必然就位。
+        local mp = sc:get_string("llm_rerank/model_path")
+        if mp and mp ~= "" and llm_prep and llm_prep.model_path ~= mp then
+            llm_prep.model_path = mp
         end
     end
     -- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,

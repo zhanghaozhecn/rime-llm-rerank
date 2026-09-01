@@ -31,13 +31,16 @@ extern "C" {
 // ============================================================
 // 配置默认值
 // ============================================================
-// 默认模型路径 = %USERPROFILE%\gguf_models\（2026-08-27 用户定案：不假设
-// 存在 D: 分区；本机/有 D 盘的机器用 schema model_path 显式指向）
+// 默认模型路径 = RIME 用户目录根\Qwen...gguf（2026-08-31 用户澄清定案：
+// "用户文件夹"= 小狼毫右键的用户文件夹 %APPDATA%\Rime——方案配置所在
+// 处，模型直接放根目录、不套子文件夹；8-27 曾误用 %USERPROFILE%\
+// gguf_models\。自定义位置用 schema model_path 显式指向。便携模式小狼毫
+// 的用户目录不在 %APPDATA%\Rime，此类部署需显式配置 model_path）
 static std::string default_model_path() {
-  const char *up = getenv("USERPROFILE");
-  if (up && *up)
-    return std::string(up) + "\\gguf_models\\Qwen3.5-0.8B-Q4_K_M.gguf";
-  return "gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
+  const char *ad = getenv("APPDATA");
+  if (ad && *ad)
+    return std::string(ad) + "\\Rime\\Qwen3.5-0.8B-Q4_K_M.gguf";
+  return "Qwen3.5-0.8B-Q4_K_M.gguf";
 }
 static std::string  g_model_path      = default_model_path();
 static int          g_min_tokens      = 1;
@@ -154,6 +157,25 @@ static void load_model_async() {
         g_loading.store(false);
         log_msg("model ready (n_ctx=%d threads=%d)", g_n_ctx, n_thr);
     }).detach();
+}
+
+// 卸载模型（model_path 变更时由 lua_newindex 调用，2026-09-01）：旧模型
+// 驻留内存会让新路径被无视——卸载后下一次 prepare/score 懒加载新路径。
+// 与源码版 llm_filter.cc 的 unload_model 同构（等待在途加载 + 锁内释放）。
+static void unload_model() {
+    while (g_loading.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_loaded.load() || g_model || g_ctx) {
+        if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
+        if (g_model) { llama_model_free(g_model); g_model = nullptr; }
+        g_vocab = nullptr;
+        g_loaded.store(false);
+        g_prep_ready = false;
+        g_prep_ctx.clear();
+        g_prep_logits.clear();
+        log_msg("model unloaded (model_path changed)");
+    }
 }
 
 // ============================================================
@@ -449,7 +471,12 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
 // Lua API
 // ============================================================
 static int lua_prepare(lua_State * L) {
+    // 懒加载触发点（2026-08-31 修 model_path 不生效）：加载不在 luaopen
+    // 急切启动——那时 lua 侧还没把 schema 的 model_path 写进来，加载线程
+    // 会拿默认路径开跑，配置形同虚设。首个触发方是 processor 的 prepare
+    //（其 lua 在 require 后、prepare 前已设好 model_path），score 是兜底。
     if (!g_loaded.load()) {
+        if (!g_loading.load()) load_model_async();
         lua_pushboolean(L, 0);
         return 1;
     }
@@ -574,7 +601,15 @@ static int lua_index(lua_State * L) {
 
 static int lua_newindex(lua_State * L) {
     const char * key = luaL_checkstring(L, 2);
-    if (strcmp(key, "model_path") == 0)      g_model_path = luaL_checkstring(L, 3);
+    if (strcmp(key, "model_path") == 0) {
+        std::string np = luaL_checkstring(L, 3);
+        if (np != g_model_path) {
+            g_model_path = np;
+            // 路径变更：卸载旧模型（等待在途加载有界；free 毫秒级），
+            // 下一次 prepare/score 以新路径懒加载
+            if (g_loaded.load()) unload_model();
+        }
+    }
     else if (strcmp(key, "max_ctx") == 0)    g_max_ctx_tokens = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "min_tokens") == 0) g_min_tokens = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_threads") == 0)  g_n_threads = (int)luaL_checkinteger(L, 3);
@@ -599,21 +634,11 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
     lua_pushcfunction(L, lua_is_ready);
     lua_setfield(L, -2, "is_ready");
 
-    lua_pushstring(L, g_model_path.c_str());
-    lua_setfield(L, -2, "model_path");
-
-    lua_pushinteger(L, g_max_ctx_tokens);
-    lua_setfield(L, -2, "max_ctx");
-
-    lua_pushinteger(L, g_n_threads);
-    lua_setfield(L, -2, "n_threads");
-
-    lua_pushinteger(L, g_n_ctx);
-    lua_setfield(L, -2, "n_ctx");
-
-    lua_pushinteger(L, g_n_seq_max);
-    lua_setfield(L, -2, "n_seq_max");
-
+    // 可写属性（model_path/max_ctx/n_threads/n_ctx/n_seq_max/min_tokens）
+    // 严禁在此预填充为原始字段——Lua 的 __newindex 只对表中不存在的键
+    // 触发，预填充过的键被赋值时只是 rawset 覆盖，永远到不了 C++ setter
+    //（2026-08-31 终审定位：model_path 配置自插件版诞生即被此吞掉，一直
+    // 靠默认路径恰好正确掩盖）。读由 __index 动态服务，写走 __newindex。
     lua_newtable(L);
     lua_pushcfunction(L, lua_index);
     lua_setfield(L, -2, "__index");
@@ -621,7 +646,7 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
     lua_setfield(L, -2, "__newindex");
     lua_setmetatable(L, -2);
 
-    load_model_async();
-
+    // 不在此启动模型加载（2026-08-31）：require 时 model_path 尚未由 lua
+    // 写入，急切加载会锁定默认路径——加载改由 prepare/score 懒触发。
     return 1;
 }

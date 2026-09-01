@@ -61,7 +61,7 @@ local function load_llm(env)
     if ok and cpp then
         local sc = env.engine.schema.config
         local mp = sc:get_string("llm_rerank/model_path")
-        -- 未配置时留给 C++ 默认（%USERPROFILE%\gguf_models\，2026-08-27）
+        -- 未配置时留给 C++ 默认（RIME 用户目录根，2026-08-31）
         if mp and mp ~= "" then cpp.model_path = mp end
         cpp.max_ctx    = cfg.max_tokens
         cpp.min_tokens = cfg.min_tokens

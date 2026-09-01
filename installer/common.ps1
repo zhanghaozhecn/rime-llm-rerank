@@ -28,7 +28,7 @@ $LUA_DIR = Join-Path $RIME_USER "lua"
 # ── 模型（下载按钮用；curl 为 Win10 1803+ 自带）──
 # 默认模型路径 = 用户文件夹（2026-08-27 用户定案：不假设存在 D: 分区；
 # 有 D 盘模型的机器在 GUI/schema 里显式填 D:\gguf_models\...）
-$DEFAULT_MODEL = Join-Path $env:USERPROFILE "gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf"
+$DEFAULT_MODEL = Join-Path (Join-Path $env:APPDATA "Rime") "Qwen3.5-0.8B-Q4_K_M.gguf"
 $MODEL_URL = "https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf"
 
 function Find-WeaselDir {
@@ -116,7 +116,7 @@ function Read-Schema([string]$path) { [IO.File]::ReadAllLines($path, [Text.Encod
 function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $lines, $Utf8NoBom) }
 
 # llm_rerank 配置节；modelPath 非空时写为生效行（反斜杠→正斜杠，含空格则加引号），
-# 留空则保持注释示例（运行时默认 d:\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf）
+# 留空则保持注释示例（运行时默认 %APPDATA%RimeQwen3.5-0.8B-Q4_K_M.gguf）
 function Get-LlmCfgLines([string]$modelPath) {
   $l = @(
     "", "llm_rerank:", "  enabled: true", "  min_code_len: 4",
@@ -126,7 +126,7 @@ function Get-LlmCfgLines([string]$modelPath) {
     "  # cpu_cores: 4"
   )
   if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
-  else { $l += "  # model_path: <绝对路径；默认 = ${env:USERPROFILE}\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf>" }
+  else { $l += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen3.5-0.8B-Q4_K_M.gguf>" }
   return $l
 }
 function Convert-ToYamlPath([string]$p) {
@@ -483,7 +483,7 @@ function Run-InstallerGui([string]$edition) {
   $form.MaximizeBox = $false
 
   $lblIntro = New-Object System.Windows.Forms.Label
-  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= 缺模型时从 ModelScope 下载（断点续传；目标 = 模型路径框，留空 = 默认 %USERPROFILE%\gguf_models\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。切换版本：重装小狼毫 + 恢复原始方案配置。"
+  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= 缺模型时从 ModelScope 下载（断点续传；目标 = 模型路径框，留空 = 默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。切换版本：重装小狼毫 + 恢复原始方案配置。"
   $lblIntro.Location = New-Object System.Drawing.Point(15, 12)
   $lblIntro.Size = New-Object System.Drawing.Size(660, 40)
   $lblIntro.ForeColor = [System.Drawing.Color]::DimGray
