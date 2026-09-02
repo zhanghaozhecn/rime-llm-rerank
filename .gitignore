@@ -10,10 +10,6 @@ bench_threads_result.txt
 AGENTS.md
 docs/
 memory/
-eval_samples.tsv
-train_samples.tsv
-pdsp_dict.yaml
-评测文本/
 cpp/build_eval_s3.bat
 
 # GPU 版（仅本地留存）
