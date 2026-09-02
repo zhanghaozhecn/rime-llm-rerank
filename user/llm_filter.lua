@@ -9,9 +9,9 @@ local cfg = {
     min_code_len     = 4,
     max_code_len     = 0,   -- 0 = 不限制（编码长度上限，超出不推理）
     min_tokens       = 1,
-    max_tokens       = 6,
+    max_tokens       = 10,  -- 截取的上文 token 数（与 C++ 默认/源码版/README 统一，2026-09-02）
     max_candidates   = 5,
-    cpu_cores        = nil,  -- nil = auto-detect in C++
+    cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
     expected_length_weight = 0,  -- > 0 = 两码一字方案的编码长度匹配加权
     freq_weight = 0.25,  -- 用户词频融合权重 (0=关闭); total=(1-w)·LLM + w·词频
     freq_k = 5,          -- 词频饱和常数: s_f = eff/(eff+k); eff = rime 时间衰减计数
