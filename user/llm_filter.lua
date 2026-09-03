@@ -12,9 +12,8 @@ local cfg = {
     max_tokens       = 10,  -- 截取的上文 token 数（与 C++ 默认/源码版/README 统一，2026-09-02）
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
-    expected_length_weight = 0,  -- > 0 = 两码一字方案的编码长度匹配加权
-    freq_weight = 0.25,  -- 用户词频融合权重 (0=关闭); total=(1-w)·LLM + w·词频
-    freq_k = 5,          -- 词频饱和常数: s_f = eff/(eff+k); eff = rime 时间衰减计数
+    expected_length_weight = 0.2,  -- 预期词长加成 (冷启动标定 2026-09-03; 0=关闭)
+    freq_beta = 1.5,  -- 对数词频融合系数 (0=关闭); fused = score + β·log(1+eff)
 }
 
 local lat_max   = 0
@@ -82,10 +81,8 @@ local function init_config(env)
     if v then cfg.max_code_len = v end
     v = get_config_number(sc, "llm_rerank/expected_length_weight")
     if v ~= nil then cfg.expected_length_weight = math.max(0, v) end
-    v = get_config_number(sc, "llm_rerank/freq_weight")
-    if v ~= nil then cfg.freq_weight = math.max(0, v) end
-    v = get_config_number(sc, "llm_rerank/freq_k")
-    if v ~= nil and v >= 1 then cfg.freq_k = v end
+    v = get_config_number(sc, "llm_rerank/freq_beta")
+    if v ~= nil then cfg.freq_beta = math.max(0, v) end
     v = sc:get_int("llm_rerank/max_tokens")
     if v then cfg.max_tokens = v end
     v = sc:get_int("llm_rerank/max_candidates")
@@ -214,81 +211,79 @@ return function(translation, env)
                 end
             end
         end
-        -- 用户词频融合 (freq_weight, 2026-08-19; 2026-08-21 词频改 Rime 时间衰减):
-        -- total = (1-w)·LLM_minmax + w·eff/(eff+k)。eff = librime algo::formula_d
-        -- 指数衰减计数 (τ=200 tick, tick=每词提交+1, 与引擎调频同源; 由
-        -- llm_processor 维护, _G.user_freq_eff 查询) — 近期常打的词权重高,
-        -- 久未使用的自动消退。实证 (17258 真实候选窗, 6000 抽样, 事前计数
-        -- 口径): 纯 LLM 97.08%, 衰减融合约 +0.4pp; 融合的意义在个性化高频
-        -- 词 (纯 LLM 排错事件 87% 选中词词频>=2)。同分稳定保序。
-        -- 应用于其他排序策略之前: expected_length 以同分
-        -- idx 的方式保留其影响。
-        if cfg.freq_weight > 0 and #ordered > 1 and scores then
+        -- 统一结合公式 (2026-09-03, 冷启动标定):
+        --   fused(w) = score(w) + β·log(1+eff(w)) + elw·span·[词长==⌊码长/2⌋]
+        -- score = 原始 LLM 分 (−CE, 对数概率域); eff = librime algo::formula_d
+        -- 指数衰减计数 (τ=200 tick, tick=每词提交+1, 引擎调频同源; llm_processor
+        -- 维护, _G.user_freq_eff 查询)。对数域三项加法:
+        --   ① 词频无上限: 强个人高频词可翻盘 CE 分差 (β=1.5, 本机真实窗回放
+        --      事前口径 β∈[1,2] 平台);
+        --   ② 预期词长加成作用于融合分 (elw=0.2, 冷启动标定: dict 窗+零词频
+        --      argmax [0.15,0.2], ≥0.4 转负)——修复旧实现按原始分重排导致
+        --      ELW 架空词频融合的组成缺陷 (2026-09-03 实测 +0.00pp);
+        --   ③ 冷启动 eff≡0 自动退化为 score + elw·span·匹配, 成熟期三项叠加。
+        -- span 取窗内有效原始分跨度; 失败哨兵分 (≤-1e9) 排尾部不参与;
+        -- 任一候选无有效融合分则整体跳过 elw 段。同分稳定保序 (融合序)。
+        local fused_scores = nil
+        if #ordered > 1 and scores then
             local freq_eff = _G.user_freq_eff
-            if freq_eff then
-                local lo, hi
-                for _, c in ipairs(ordered) do
-                    local s = scores[c.text]
-                    if is_valid_llm_score(s) then
-                        if not lo or s < lo then lo = s end
-                        if not hi or s > hi then hi = s end
-                    end
+            fused_scores = {}
+            local arr = {}
+            for i, c in ipairs(ordered) do
+                local s = scores[c.text]
+                if is_valid_llm_score(s) then
+                    local n = freq_eff and freq_eff(c.text) or 0
+                    local t = s + cfg.freq_beta * math.log(1 + n)
+                    fused_scores[c.text] = t
+                    arr[i] = { c = c, t = t, idx = i }
+                else
+                    fused_scores[c.text] = -math.huge
+                    arr[i] = { c = c, t = -math.huge, idx = i }  -- 无效分保序排尾
                 end
-                local span = (lo and hi) and (hi - lo) or 0
-                if span > 0 then
-                    local w, k = cfg.freq_weight, cfg.freq_k
-                    local arr = {}
-                    for i, c in ipairs(ordered) do
-                        local s = scores[c.text]
-                        -- 失败哨兵/缺分 → s_l=0 (排尾部, 词频仍可救)
-                        local sl = is_valid_llm_score(s) and ((s - lo) / span) or 0
-                        local n = freq_eff(c.text)
-                        arr[i] = { c = c, t = (1 - w) * sl + w * (n / (n + k)), idx = i }
+            end
+            table.sort(arr, function(a, b)
+                if a.t ~= b.t then return a.t > b.t end
+                return a.idx < b.idx  -- 同分保持 LLM 评分序
+            end)
+            for i = 1, #arr do ordered[i] = arr[i].c end
+        end
+        -- 预期词长加权 (expected_length_weight): 两码一字方案 L 码对应 floor(L/2) 字
+        if cfg.expected_length_weight > 0 and #ordered > 1 and fused_scores then
+            local expected_len = math.floor(#input / 2)
+            local min_score, max_score
+            for _, c in ipairs(ordered) do
+                local s = scores[c.text]
+                if is_valid_llm_score(s) then
+                    if not min_score or s < min_score then min_score = s end
+                    if not max_score or s > max_score then max_score = s end
+                end
+            end
+            local span = (min_score and max_score) and (max_score - min_score) or 0
+            if expected_len >= 1 and span > 0 then
+                local arr, ok = {}, true
+                for i, c in ipairs(ordered) do
+                    local f = fused_scores[c.text]
+                    if not f or f == -math.huge then
+                        ok = false
+                        break
+                    end
+                    local len = utf8.len(c.text or "") or 0
+                    arr[i] = { c = c, s = f,
+                               m = (len == expected_len), idx = i }
+                end
+                if ok then
+                    for _, item in ipairs(arr) do
+                        if item.m then
+                            item.s = item.s + cfg.expected_length_weight * span
+                        end
                     end
                     table.sort(arr, function(a, b)
-                        if a.t ~= b.t then return a.t > b.t end
-                        return a.idx < b.idx  -- 同分保持 LLM 评分序
+                        if a.s ~= b.s then return a.s > b.s end
+                        if a.m ~= b.m then return a.m end
+                        return a.idx < b.idx  -- 分数相同保持融合序
                     end)
                     for i = 1, #arr do ordered[i] = arr[i].c end
                 end
-            end
-        end
-        -- 两码一字方案: L 码对应 L/2 或 (L-1)/2 字。整数化后等价于 floor(L/2)。
-        -- 奖励使用本次 LLM 分数跨度，保留分数差明显时的语义排序。
-        if cfg.expected_length_weight > 0 and #ordered > 1 and scores then
-            local arr = {}
-            local min_score, max_score
-            for i, c in ipairs(ordered) do
-                local score = scores[c.text]
-                if not is_finite_number(score) then
-                    arr = nil
-                    break
-                end
-                local valid = is_valid_llm_score(score)
-                if valid then
-                    if not min_score or score < min_score then min_score = score end
-                    if not max_score or score > max_score then max_score = score end
-                end
-                arr[i] = { c = c, score = score, valid = valid, idx = i }
-            end
-            local expected_len = math.floor(#input / 2)
-            local span = (min_score and max_score) and (max_score - min_score) or 0
-            if arr and expected_len >= 1 and span > 0 then
-                for _, item in ipairs(arr) do
-                    local len = utf8.len(item.c.text or "") or 0
-                    item.matches_expected_length = item.valid and len == expected_len
-                    if item.matches_expected_length then
-                        item.score = item.score + cfg.expected_length_weight * span
-                    end
-                end
-                table.sort(arr, function(a, b)
-                    if a.score ~= b.score then return a.score > b.score end
-                    if a.matches_expected_length ~= b.matches_expected_length then
-                        return a.matches_expected_length
-                    end
-                    return a.idx < b.idx  -- 分数相同保持 LLM 评分序
-                end)
-                for i = 1, #arr do ordered[i] = arr[i].c end
             end
         end
         for i, c in ipairs(ordered) do
