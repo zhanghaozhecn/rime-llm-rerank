@@ -52,39 +52,10 @@ if(MSVC)
             "$<TARGET_FILE:rime_llm>"
             "${CMAKE_SOURCE_DIR}/../user/rime_llm.dll"
     )
-    # Automated core tests (CE correctness + accuracy regression)
-    add_executable(test_core test_core.cpp)
-    target_include_directories(test_core PRIVATE
-        "${LLAMA_ROOT}/include"
-        "${LLAMA_ROOT}/ggml/include"
-        "${LLAMA_ROOT}/common"
-    )
-    target_link_libraries(test_core PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
-    )
-    target_compile_options(test_core PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
-    # Dict-based sweep benchmark (CPU, same algorithm as production)
-    add_executable(bench_sweep2 bench_sweep2.cpp)
-    target_include_directories(bench_sweep2 PRIVATE
-        "${LLAMA_ROOT}/include"
-        "${LLAMA_ROOT}/ggml/include"
-        "${LLAMA_ROOT}/common"
-    )
-    target_link_libraries(bench_sweep2 PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl
-    )
-    target_compile_options(bench_sweep2 PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
-
-    # Single-char 3-code accuracy (tok=10, cand=5)
-    add_executable(bench_single_char bench_single_char.cpp)
-    target_include_directories(bench_single_char PRIVATE
-        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
-    target_link_libraries(bench_single_char PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
-    target_compile_options(bench_single_char PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
-
-    # Thread count sweep benchmark
+    # Thread count sweep benchmark (用户 cpu_cores 实测工具；重排效果研究评测器
+    # sim_rerank/test_core/bench_sweep2/bench_single_char 已迁研究库
+    # D:\llm-rerank-research\cpp\，2026-09-02)
     add_executable(bench_thr bench_threads.cpp)
     target_include_directories(bench_thr PRIVATE
         "${LLAMA_ROOT}/include"
@@ -95,14 +66,6 @@ if(MSVC)
         llama_cpu ggml_cpu ggml_base ggml_cpu_impl
     )
     target_compile_options(bench_thr PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
-
-    # Interactive rerank simulator (context + candidates → ranked output)
-    add_executable(sim_rerank sim_rerank.cpp)
-    target_include_directories(sim_rerank PRIVATE
-        "${LLAMA_ROOT}/include" "${LLAMA_ROOT}/ggml/include" "${LLAMA_ROOT}/common")
-    target_link_libraries(sim_rerank PRIVATE
-        llama_cpu ggml_cpu ggml_base ggml_cpu_impl)
-    target_compile_options(sim_rerank PRIVATE /O2 /arch:AVX2 /utf-8 /std:c++17)
 
     # GPU production DLL (CUDA backend, same layered algorithm as CPU)
     add_library(rime_llm_cuda SHARED rime_llm_cuda.cpp ${LUA_SRCS})
