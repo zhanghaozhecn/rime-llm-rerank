@@ -12,6 +12,7 @@ local cfg = {
     max_tokens       = 10,  -- 截取的上文 token 数（与 C++ 默认/源码版/README 统一，2026-09-02）
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
+    debug_fusion     = false, -- true = 逐候选融合明细写 rime_llm_debug.txt (诊断用)
     expected_length_weight = 0.2,  -- 预期词长加成 (冷启动标定 2026-09-03; 0=关闭)
     freq_beta = 1.5,  -- 对数词频融合系数 (0=关闭); fused = score + β·log(1+eff)
 }
@@ -91,6 +92,8 @@ local function init_config(env)
     if v then cfg.cpu_cores = v end
     v = sc:get_int("llm_rerank/min_tokens")
     if v then cfg.min_tokens = v end
+    local dbg = sc:get_bool("llm_rerank/debug_fusion")
+    if dbg ~= nil then cfg.debug_fusion = dbg end
 end
 
 -- === Filter ===
@@ -162,8 +165,10 @@ return function(translation, env)
     -- 重打相同词重新推理 (同 ctx+input 的旧结果不适用于编辑后的新候选窗)
     local cache = _G.llm_filter_cache
     local ok, result, scores
+    local dbg_cache = "MISS"
     if cache and cache.ctx == context and cache.input == input and cache.result then
         ok, result, scores = true, cache.result, cache.scores
+        dbg_cache = "HIT"
     else
         local t0 = os.clock()
         ok, result = pcall(function() return llm.score(context, cands) end)
@@ -196,6 +201,30 @@ return function(translation, env)
                 os.date("%H:%M:%S"), lat_count, input,
                 cand_str, ctx_safe, res_info, elapsed_ms, ctx_src))
             ef:close()
+        end
+    end
+
+    -- 融合诊断 (llm_rerank/debug_fusion: true): 每次评分逐候选记录
+    -- CE/eff/词频加成/词长加成/最终 key 与名次, 写 rime_llm_debug.txt
+    local dbg = cfg.debug_fusion and {} or nil
+    local dbg_span = nil
+    if dbg then
+        local ctx_tail = #context > 16 and ("…" .. context:sub(-15)) or context
+        local ready = "n/a"
+        local okr, r = pcall(function() return llm.is_ready() end)
+        if okr then ready = r and "1" or "0" end
+        table.insert(dbg, string.format(
+            "%s|score|input=%s|cache=%s|ctx=[%s]|src=%s|tick=%s|ready=%s|n=%d",
+            os.date("%H:%M:%S"), input, dbg_cache, ctx_tail, ctx_src,
+            tostring(_G.user_freq_tick), ready, #cands))
+        if not ok then
+            table.insert(dbg, "  ERROR: score pcall failed")
+        elseif type(result) ~= "table" then
+            table.insert(dbg, string.format(
+                "  score=nil (ready=%s, ctx空=%s — ready=0 模型未载/加载中; ctx空=min_tokens 跳过)",
+                ready, context == "" and "是" or "否"))
+        elseif not scores then
+            table.insert(dbg, "  融合跳过: scores=nil (get_scores 校验失败 — 候选缺分/含异常值)")
         end
     end
 
@@ -236,9 +265,18 @@ return function(translation, env)
                     local t = s + cfg.freq_beta * math.log(1 + n)
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
+                    if dbg then
+                        dbg[c.text] = { ce = s, eff = n,
+                                        fb = cfg.freq_beta * math.log(1 + n),
+                                        fused = t, cerank = i }
+                    end
                 else
                     fused_scores[c.text] = -math.huge
                     arr[i] = { c = c, t = -math.huge, idx = i }  -- 无效分保序排尾
+                    if dbg then
+                        dbg[c.text] = { ce = s, eff = 0, fb = 0,
+                                        fused = -1 / 0, cerank = i, invalid = true }
+                    end
                 end
             end
             table.sort(arr, function(a, b)
@@ -260,21 +298,25 @@ return function(translation, env)
             end
             local span = (min_score and max_score) and (max_score - min_score) or 0
             if expected_len >= 1 and span > 0 then
-                local arr, ok = {}, true
+                local arr, ok2 = {}, true
                 for i, c in ipairs(ordered) do
                     local f = fused_scores[c.text]
                     if not f or f == -math.huge then
-                        ok = false
+                        ok2 = false
                         break
                     end
                     local len = utf8.len(c.text or "") or 0
                     arr[i] = { c = c, s = f,
                                m = (len == expected_len), idx = i }
                 end
-                if ok then
+                if ok2 then
                     for _, item in ipairs(arr) do
                         if item.m then
                             item.s = item.s + cfg.expected_length_weight * span
+                            if dbg and dbg[item.c.text] then
+                                dbg[item.c.text].eb =
+                                    cfg.expected_length_weight * span
+                            end
                         end
                     end
                     table.sort(arr, function(a, b)
@@ -284,7 +326,50 @@ return function(translation, env)
                     end)
                     for i = 1, #arr do ordered[i] = arr[i].c end
                 end
+                if dbg then dbg_span = span end
             end
+        end
+
+        -- 诊断输出: 逐候选明细 + 名次变化汇总
+        if dbg then
+            local final_rank = {}
+            for i, c in ipairs(ordered) do final_rank[c.text] = i end
+            local all_rank = {}
+            for i, c in ipairs(all) do all_rank[c.text] = i end
+            for i = 1, math.min(#ordered, 8) do
+                local c = ordered[i]
+                local d = dbg[c.text]
+                if d then
+                    table.insert(dbg, string.format(
+                        "  #%d %-6s CE=%8.3f eff=%6.3f 频+%6.3f 长+%5.2f key=%8.3f  原次序%d→%d",
+                        i, c.text, d.ce or 0, d.eff or 0, d.fb or 0,
+                        d.eb or 0, (d.fused or 0) + (d.eb or 0),
+                        d.cerank or 0, final_rank[c.text] or 0))
+                end
+            end
+            local moved = {}
+            for i, c in ipairs(ordered) do
+                local d = dbg[c.text]
+                if d and d.cerank and final_rank[c.text] and
+                        d.cerank ~= final_rank[c.text] then
+                    table.insert(moved, string.format("%s %d→%d",
+                        c.text, d.cerank, final_rank[c.text]))
+                end
+            end
+            table.insert(dbg, #moved > 0
+                and ("  名次变化: " .. table.concat(moved, ", "))
+                or  "  名次变化: 无 (CE 序即融合序)")
+            if dbg_span then
+                table.insert(dbg, string.format("  词长span=%.3f", dbg_span))
+            end
+            local okw = pcall(function()
+                local f = io.open(rime_api.get_user_data_dir()
+                                  .. "\\rime_llm_debug.txt", "a")
+                if f then
+                    f:write(table.concat(dbg, "\n") .. "\n\n")
+                    f:close()
+                end
+            end)
         end
         for i, c in ipairs(ordered) do
             if i == 1 then

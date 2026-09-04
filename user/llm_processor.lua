@@ -215,6 +215,18 @@ local function processor(key, env)
         commit_base = #ch:to_table()
         -- 编辑后重打相同词 (ctx+input 相同) 必须重新推理: 清空 filter 结果缓存
         _G.llm_filter_cache = nil
+        if sc:get_bool("llm_rerank/debug_fusion") then
+            pcall(function()
+                local f = io.open(rime_api.get_user_data_dir()
+                    .. "\\rime_llm_debug.txt", "a")
+                if f then
+                    f:write(string.format(
+                        "%s|reset|编辑键(%s)→上文重置+缓存清空\n",
+                        os.date("%H:%M:%S"), key:repr()))
+                    f:close()
+                end
+            end)
+        end
         -- 上文已重置 → 立即异步预解码 (空上文)
         cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
         if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
@@ -265,7 +277,27 @@ local function processor(key, env)
                 pending_code = ""
                 last_full = ""
                 -- 词频计数: 仅含中文的词 (含英文/数字/标点不参与融合)
-                if has_chinese then freq_bump(w) end
+                if has_chinese then
+                    if not _G.user_word_freq then freq_load() end  -- 诊断读数前先就位
+                    local before = _G.user_freq_eff and _G.user_freq_eff(w) or 0
+                    local t_before = _G.user_freq_tick or 0
+                    freq_bump(w)
+                    local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
+                    if dbg_flag then
+                        pcall(function()
+                            local f = io.open(rime_api.get_user_data_dir()
+                                .. "\\rime_llm_debug.txt", "a")
+                            if f then
+                                f:write(string.format(
+                                    "%s|commit|词=%s|码=%s|eff %.3f→%.3f|tick %d→%d|flush脏%d/20\n",
+                                    os.date("%H:%M:%S"), w, code, before,
+                                    _G.user_freq_eff(w), t_before,
+                                    _G.user_freq_tick or 0, freq_dirty))
+                                f:close()
+                            end
+                        end)
+                    end
+                end
                 -- 真实候选窗快照 (llm_filter 记录): 用截断前的完整码匹配
                 -- (filter 记录的是完整 input; 训练样本带真实候选窗 词\t码\t候选1,候选2,...,
                 -- LLM 重排目标 = 在窗内把正确词排第一; 无快照/不匹配回退旧格式 仅词+码)

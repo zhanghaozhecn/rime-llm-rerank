@@ -201,8 +201,8 @@ int main(int argc, char **argv) {
   int max_thr = std::min(cores, 10);
   out("== bench_threads: per-thread latency ==\n");
   out("model: %s\n", model_path);
-  out("logical cores: %d (scanning 1..%d)\n", cores, max_thr);
-  if (max_thr < 1) {
+  out("logical cores: %d (scanning 3..%d)\n", cores, max_thr);
+  if (max_thr < 3) {
     fprintf(stderr, "ERROR: no logical processors detected (cores=%d)\n", cores);
     wait_exit();
     return 1;
@@ -264,7 +264,8 @@ int main(int argc, char **argv) {
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
 
-  for (int thr = 1; thr <= max_thr; thr++) {
+  // 实践发现 1-2 线程延迟基本不可用, 从 3 起扫 (2026-09-03)
+  for (int thr = 3; thr <= max_thr; thr++) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 128;
     cp.n_threads = thr;
