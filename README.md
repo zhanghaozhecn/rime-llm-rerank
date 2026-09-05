@@ -218,9 +218,11 @@ rime-llm-rerank\
 │   ├── bench_threads.cpp      #   CPU 线程数测定（bin\ 预编译版源码）
 │   └── lua/                   #   Lua 5.4 嵌入源码
 ├── bin\bench_threads.exe      # 预编译线程测定工具
-└── installer\                 # 插件版安装器（分仓：只带本版文件）
-                                # install_plugin.bat 提权入口 + install_plugin.ps1
-                                # + common.ps1 共用逻辑（与源码版仓库保持一致）
+└── installer\                 # 插件版安装器（单文件逻辑 + 提权入口）
+                                # install_plugin.bat（ASCII 提权垫片，走 5.1 免依赖）
+                                # + install_plugin.ps1（全部逻辑；原 common.ps1
+                                #   已并入——源码版 2026-08-27 起 setup.exe 分发，
+                                #   双版共用设计废弃）
 ```
 
 > **研究工具链与语料不在本仓库**：评测 python 工具、样本语料、研究评测器（sim_rerank /
@@ -262,7 +264,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 ## 安装器原理
 
-`installer\common.ps1`（`install_plugin.bat` 提权启动本仓库入口；2026-08-27 起为本仓库独有，不再跨仓同步）：GUI 四按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程每 5 秒打进度行到日志）、`schema-add`（**先剥离后插入**——方案原状无论无 LLM / 本版 / 另一版组件均先剥净再全新插入，跨版自动转换；模型路径未填时保留原有生效 `model_path`，非空时写入新值）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
+`installer\install_plugin.ps1`（**单文件全部逻辑**；`install_plugin.bat` 为 ASCII 提权垫片，用系统自带 PowerShell 5.1 启动——无 pwsh 的机器也可用。2026-09-04 起原入口壳 + common.ps1 双文件合并：源码版 2026-08-27 改 setup.exe 分发后"两仓共用"已名存实亡，源码版动作与双版分支一并删除）：GUI 四按钮各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程每 5 秒打进度行到日志）、`schema-add`（**先剥离后插入**——方案原状无论无 LLM / 本版 / 另一版组件均先剥净再全新插入，跨版自动转换；模型路径未填时保留原有生效 `model_path`，非空时写入新值）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。
 
 ---
 

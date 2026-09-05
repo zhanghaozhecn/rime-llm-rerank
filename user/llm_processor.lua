@@ -54,9 +54,13 @@ end
 -- 衰减算法 = librime algo::formula_d (user_dictionary.cc 调频同源):
 --   提交: dee = 1 + dee·exp((t_old - t_now)/200)   时间常数 τ=200 tick
 --   查询: eff = dee·exp((t_word - t_now)/200)      (未提交期间持续衰减)
--- 每 20 个新词重写落盘 user_freq.tsv (崩溃最多丢 19 次计数)。仅计含中文的词。
+-- 每 20 个新词重写落盘 user_freq.tsv (崩溃最多丢 19 次计数)。仅计含中文的词
+-- (判定为非 ASCII 即计, 与 Rime userdb "任何词条提交推 tick" 同源口径——
+-- 全角标点也计, 有意为之; 2026-09-03 tick 含一字词定案同源原则)。
 -- 格式: 首行 "#tick=N", 数据行 "词\t累计\tdee\ttick"; 兼容旧版 "词\t次数"
 -- (迁移为 dee=次数, tick=当前 — 视为刚提交过)。
+-- 落盘修剪 (2026-09-04): eff < 1e-3 的冷词条不再写 (对融合分影响
+-- < 0.002 nats, 远低于任何实际分差) — 文件有界, 旧冷词条自然淘汰。
 local FREQ_TAU = 200
 local FREQ_FLUSH = 20
 local freq_dirty = 0
@@ -94,8 +98,12 @@ local function freq_save()
     local f = io.open(freq_file(), "w")
     if f then
         f:write("#tick=" .. (_G.user_freq_tick or 0) .. "\n")
+        local now = _G.user_freq_tick or 0
         for w, e in pairs(_G.user_word_freq) do
-            f:write(string.format("%s\t%d\t%.3f\t%d\n", w, e.c, e.d, e.t))
+            local eff = e.d * math.exp((e.t - now) / FREQ_TAU)
+            if eff >= 1e-3 then  -- 修剪: 衰减到噪声级的冷词条不落盘
+                f:write(string.format("%s\t%d\t%.3f\t%d\n", w, e.c, e.d, e.t))
+            end
         end
         f:close()
     end
@@ -166,6 +174,9 @@ local function processor(key, env)
         local mp = sc:get_string("llm_rerank/model_path")
         if mp and mp ~= "" and llm_prep and llm_prep.model_path ~= mp then
             llm_prep.model_path = mp
+            -- 模型将卸载重载, 旧模型的评分缓存作废 (2026-09-04; 源码版
+            -- unload_model 清 s_cache 同理)——不清则同码重打期间继续用旧分
+            _G.llm_filter_cache = nil
         end
     end
     -- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,

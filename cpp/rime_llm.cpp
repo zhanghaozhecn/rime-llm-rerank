@@ -94,6 +94,16 @@ static void log_msg(const char * fmt, ...) {
         GetTempPathA(sizeof(path), path);
         strcat_s(path, sizeof(path), "rime_llm_log.txt");
     }
+    // 日志轮转（2026-09-04）：>5MB 改名 .old（单文件轮转）防无限增长；
+    // 改名失败（被占等罕见）则继续追加，不丢日志
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa) &&
+        ((((unsigned long long)fa.nFileSizeHigh << 32) |
+          (unsigned long long)fa.nFileSizeLow) > 5ull * 1024 * 1024)) {
+        std::string oldp = std::string(path) + ".old";
+        DeleteFileA(oldp.c_str());
+        MoveFileA(path, oldp.c_str());
+    }
     FILE * f = fopen(path, "a");
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
 }
@@ -107,6 +117,13 @@ static void load_model_async() {
     g_loading.store(true);
 
     std::thread([]() {
+#ifdef _WIN32
+        // 加载期让渡 CPU（2026-09-04，与源码版同步）：模型读取+反量化+预热
+        // 吃满 CPU/IO，会拖挂并发启动的进程（源码版实测 QQ 音乐等 CEF 应用
+        // 秒级挂起）；warmup 前恢复 NORMAL——llama 的 decode worker 靠条件
+        // 变量协同，低优先级下会被 NORMAL 线程饿死，卡在 warmup 不返回
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
         log_msg("loading model: %s", g_model_path.c_str());
 
         llama_backend_init();
@@ -138,6 +155,10 @@ static void load_model_async() {
             g_loading.store(false);
             return;
         }
+
+#ifdef _WIN32
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+#endif
 
         // warmup
         {
@@ -342,10 +363,13 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
                 if (l) ce_sum[ci] += cross_entropy(l, vs, cands[ci][1]);
                 else   ce_sum[ci] = -1e10;
             }
-        } else {
-            for (int ci : idx2) ce_sum[ci] = -1e10;
-        }
-        llama_batch_free(b2);
+    } else {
+        for (int ci : idx2) ce_sum[ci] = -1e10;
+        // 失败自愈：prep 命中路径无 memory_clear，decode 失败多为 KV 耗尽
+        // （见下方 worker 清理说明）——置无效强制下次 score 走全流程重建
+        g_prep_ready = false;
+    }
+    llama_batch_free(b2);
         auto ts2_1 = std::chrono::high_resolution_clock::now();
         ms2a = std::chrono::duration<double, std::milli>(ts2_kv - ts2_0).count();
         ms2b = std::chrono::duration<double, std::milli>(ts2_1 - ts2_kv).count();
@@ -375,10 +399,25 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
             }
         } else {
             for (int ci : idx3) ce_sum[ci] = -1e10;
+            g_prep_ready = false;  // 同 Step2：失败自愈
         }
         llama_batch_free(b3);
         auto ts3_1 = std::chrono::high_resolution_clock::now();
         ms3 = std::chrono::duration<double, std::milli>(ts3_1 - ts3_0).count();
+    }
+
+    // ---- worker 序列 KV 清理（2026-09-04 修"推理自停"根因，与源码版同步）----
+    // seq_cp 是共享标记非复制：Step2/3 的 decode cell 在评分结束后仍归属
+    // seq 1..M。prep 命中路径无 memory_clear，同 ctx 连续评分（退格重打/
+    // 改码不换 ctx/失败重试）每轮净耗 M+K cell —— n_ctx=64 约 6~7 轮耗尽
+    // → decode 静默失败 → 全哨兵分且 prep_ready 仍真 → 卡死失败循环，
+    // 仅 commit 触发 prepare 或重部署可解（非本机实测）。评分尾部立即释放
+    // worker 归属：共享 cell 只去掉一个归属方，seq0 与 prep 状态不受影响，
+    // prep 命中照常，每次评分净耗归零。
+    if (M > 0) {
+        auto *mem = llama_get_memory(g_ctx);
+        for (int s = 1; s <= M; s++)
+            llama_memory_seq_rm(mem, s, 0, -1);
     }
 
     // ---- 输出分数 ----
@@ -419,7 +458,15 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
 // seq 用于跳过过期请求（新的 prepare 已到达，旧的直接放弃）
 // ============================================================
 static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    // 推理进行中（score 持锁）则放弃本轮（2026-09-04，与源码版同步）：
+    // prep 只是预解码优化，下次 score 的全流程会自我刷新兜底；阻塞等锁
+    // 会让 detached prepare 线程在 g_mutex 上与 score 争用、堆积排队
+    std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        log_msg("prepare: SKIP score in progress (seq=%d ctx_tok=%d)",
+                seq, (int)ctx_ids.size());
+        return;
+    }
 
     int ctx_len = (int)ctx_ids.size();
 

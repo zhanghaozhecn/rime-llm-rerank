@@ -185,7 +185,18 @@ return function(translation, env)
         if not okd or not log_dir or log_dir == "" then
             log_dir = os.getenv("TEMP") or "C:\\Windows\\Temp"
         end
-        local ef = io.open(log_dir .. "\\rime_llm_events.txt", "a")
+        local epath = log_dir .. "\\rime_llm_events.txt"
+        local ef = io.open(epath, "a")
+        -- 日志轮转 (2026-09-04): >5MB 改名 .old (单文件轮转), 防无限增长
+        if ef then
+            local esz = ef:seek("end")
+            if esz and esz > 5 * 1024 * 1024 then
+                ef:close()
+                os.remove(epath .. ".old")
+                os.rename(epath, epath .. ".old")
+                ef = io.open(epath, "a")
+            end
+        end
         if ef then
             local cand_str = table.concat(cands, ","):gsub("|", "/")
             local ctx_safe = context:gsub("|", "/"):gsub("\n", " ")
@@ -340,9 +351,11 @@ return function(translation, env)
                 local c = ordered[i]
                 local d = dbg[c.text]
                 if d then
+                    local ce_str = (d.ce and d.ce > -1e9)
+                        and string.format("%8.3f", d.ce) or "   -sent"
                     table.insert(dbg, string.format(
-                        "  #%d %-6s CE=%8.3f eff=%6.3f 频+%6.3f 长+%5.2f key=%8.3f  原次序%d→%d",
-                        i, c.text, d.ce or 0, d.eff or 0, d.fb or 0,
+                        "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f 长+%5.2f key=%8.3f  原次序%d→%d",
+                        i, c.text, ce_str, d.eff or 0, d.fb or 0,
                         d.eb or 0, (d.fused or 0) + (d.eb or 0),
                         d.cerank or 0, final_rank[c.text] or 0))
                 end
