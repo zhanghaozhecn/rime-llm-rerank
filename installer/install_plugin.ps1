@@ -352,13 +352,16 @@ function Install-PluginAction([string]$schemaName, $Log) {
 function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$modelPath) {
   if ($cliAction) {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
-    $Log = { param($t) Write-Host $t }
+    # 5.1 坑：stdout 重定向到文件时 Write-Host 行尾只有裸 LF（0A），WinForms
+    # TextBox 不认孤立 \n → GUI 日志区全部挤成一行（含 ^\[ERROR\] 行首锚定
+    # 失效）。显式 CRLF + 逐条 Flush（GUI 250ms 轮询要实时增量）
+    $Log = { param($t) [Console]::Out.Write($t + "`r`n"); [Console]::Out.Flush() }
     try {
       switch ($cliAction) {
         "status" {
-          Write-Host ("安装文件: " + $(if ($PluginReady) { "就绪 ($PluginSrc)" } else { "缺失" }))
+          & $Log ("安装文件: " + $(if ($PluginReady) { "就绪 ($PluginSrc)" } else { "缺失" }))
           $dir = Find-WeaselDir
-          Write-Host ("小狼毫目录: " + $(if ($dir) { $dir } else { "未找到" }))
+          & $Log ("小狼毫目录: " + $(if ($dir) { $dir } else { "未找到" }))
         }
         "install" {
           if (-not $schemaName) { throw "需要 -SchemaName 指定方案文件" }
@@ -374,10 +377,10 @@ function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$mode
           Schema-RemoveAction $schemaName $Log
         }
         "download-model" { Download-ModelAction $modelPath $Log }
-        default { Write-Host "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove | download-model）"; exit 1 }
+        default { & $Log "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove | download-model）"; exit 1 }
       }
     } catch {
-      Write-Host ("[ERROR] " + $_.Exception.Message)
+      & $Log ("[ERROR] " + $_.Exception.Message)
       exit 1
     }
     exit 0
@@ -462,7 +465,8 @@ function Run-InstallerGui {
   $txtLog.Location = New-Object System.Drawing.Point(15, 180)
   $txtLog.Size = New-Object System.Drawing.Size(655, 180)
   $txtLog.Multiline = $true; $txtLog.ReadOnly = $true
-  $txtLog.ScrollBars = "Vertical"; $txtLog.WordWrap = $false
+  # 自动折行：长路径 / 模型 URL 超出框宽时不截断隐藏（无需横向滚动条）
+  $txtLog.ScrollBars = "Vertical"; $txtLog.WordWrap = $true
   $txtLog.Font = New-Object System.Drawing.Font("Consolas", 9)
   $form.Controls.Add($txtLog)
 
