@@ -200,6 +200,15 @@ local function processor(key, env)
             _G.llm_filter_cache = nil
         end
     end
+    -- 鼠标点击检测（2026-09-11 深夜用户定案：任何点击=光标可能移动→
+    -- 清历史上文兜底，不做例外排除——候选窗/工具栏点击也清，上下文
+    -- 宁可变短不可错；COM/UIA 真文通道不受影响，只影响兜底）
+    if llm_prep and llm_prep.click_happened and llm_prep.click_happened() then
+        local ch0 = env.engine.context.commit_history
+        if ch0 then commit_base = #ch0:to_table() end
+        reset_history()
+    end
+
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     trigger_prepare()
 

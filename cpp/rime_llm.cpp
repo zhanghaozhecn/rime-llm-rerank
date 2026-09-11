@@ -1297,6 +1297,21 @@ static int lua_fg_changed(lua_State * L) {
     return 1;
 }
 
+// 鼠标点击检测（2026-09-11 深夜用户定案：鼠标移动主要靠点击检测——
+// 任何点击=光标可能移动→清历史上文兜底，不做例外排除——候选窗/工具
+// 栏点击也清，上下文宁可变短不可错；COM/UIA 真文通道不受影响）。
+// GetAsyncKeyState LSB=自本进程上次查询以来按下过，专为轮询设计；
+// 首次调用建立基线防进程历史点击误报。
+static int lua_click_happened(lua_State * L) {
+    static bool inited = false;
+    short b = GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+              GetAsyncKeyState(VK_MBUTTON);
+    bool clicked = inited && (b & 1);
+    inited = true;
+    lua_pushboolean(L, clicked ? 1 : 0);
+    return 1;
+}
+
 // ============================================================
 // __index / __newindex
 // ============================================================
@@ -1309,6 +1324,7 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "llm_context") == 0)    lua_pushcfunction(L, lua_llm_context);
     else if (strcmp(key, "kick_context") == 0)   lua_pushcfunction(L, lua_kick_context);
     else if (strcmp(key, "fg_changed") == 0)     lua_pushcfunction(L, lua_fg_changed);
+    else if (strcmp(key, "click_happened") == 0) lua_pushcfunction(L, lua_click_happened);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
     else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);
     else if (strcmp(key, "min_tokens") == 0) lua_pushinteger(L, g_min_tokens);
@@ -1364,6 +1380,9 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
 
     lua_pushcfunction(L, lua_fg_changed);
     lua_setfield(L, -2, "fg_changed");
+
+    lua_pushcfunction(L, lua_click_happened);
+    lua_setfield(L, -2, "click_happened");
 
     // 可写属性（model_path/max_ctx/n_threads/n_ctx/n_seq_max/min_tokens）
     // 严禁在此预填充为原始字段——Lua 的 __newindex 只对表中不存在的键
