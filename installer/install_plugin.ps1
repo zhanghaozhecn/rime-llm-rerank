@@ -62,8 +62,13 @@ function Stop-WeaselService {
 function Start-WeaselService([string]$installDir, $Log) {
   $exe = Join-Path $installDir "WeaselServer.exe"
   if (Test-Path $exe) {
-    Start-Process -FilePath $exe -WorkingDirectory $installDir
-    & $Log "  算法服务已启动"
+    # 降权启动（2026-09-10 真机踩坑）：本安装器经 bat 提权垫片以管理员运行，
+    # 直接 Start-Process 会让 WeaselServer 继承管理员令牌——提权进程读非提权
+    # 应用（WPS/Word）的 ROT 对象被 DCOM 安全边界拒绝，COM 光标上文旁路
+    # 整层失效（UIA 不受影响——辅助功能框架允许跨权限读取）。经 explorer.exe
+    # 代启回落普通用户令牌（explorer 恒为非提权，其子进程继承之）。
+    Start-Process -FilePath "explorer.exe" -ArgumentList "`"$exe`""
+    & $Log "  算法服务已启动（explorer 代启·普通权限）"
   }
 }
 

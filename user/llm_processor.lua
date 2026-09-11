@@ -7,6 +7,7 @@ local prev_hist = {}     -- 上次 history 快照
 local history = {}       -- 当前上屏词序列
 local commit_base = 0    -- 上文基座: 只认 commit_history 中 base 之后的新词
                          -- (编辑键后旧词永久忽略——librime 无法清 commit_history)
+local com_ctx_enabled = true  -- llm_rerank/com_context（默认 true，每键刷新）
 local SPLIT = "|"
 local TAB = "\t"
 local BSP = "←"
@@ -154,6 +155,7 @@ local function processor(key, env)
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
     local enabled = sc:get_bool("llm_rerank/enabled") or false
+    com_ctx_enabled = sc:get_bool("llm_rerank/com_context") ~= false
     if not enabled then
         llm_prep = nil  -- 释放已加载的 DLL 引用
     else
@@ -191,6 +193,17 @@ local function processor(key, env)
     local ctx = env.engine.context
     local ch = ctx.commit_history
     if not ch then return 2 end
+
+    -- 跨应用切换检测（2026-09-11，DLL fg_changed 内部比前台 pid）：插件版
+    -- lua 无焦点事件，切换后旧窗口的 history 残留会冒充新窗口上文（真机
+    -- 踩坑：切新文档首词标 AI·历史而非无徽章）。切到新进程 → 重置历史 +
+    -- commit_history 旧词记为基座（只认切换后的新词，与编辑键同款语义）。
+    -- 比 pid 不比 HWND：同应用内对话框/多文档窗口不误清。
+    if llm_prep and llm_prep.fg_changed and llm_prep.fg_changed() then
+        local all0 = ch:to_table()
+        commit_base = #all0
+        reset_history()
+    end
 
     -- 追踪满码（顶屏时回退用）
     if ctx.input ~= "" and #ctx.input >= MAX_CODE then
@@ -326,6 +339,12 @@ local function processor(key, env)
             end
             local sep = (overlap > 0 and SPLIT or "")
             append_raw(sep .. table.concat(parts, SPLIT))
+
+            -- 上屏后立即刷新 COM/UIA 快照（2026-09-10）：新词此刻已入
+            -- 文档/控件，读链 6-13ms 在后台线程完成，下一键即有新鲜上文
+            if llm_prep and llm_prep.kick_context then
+                pcall(llm_prep.kick_context)
+            end
         end
 
         if #new_words == 0 and #history < #prev_hist and #history < 3 then
@@ -342,7 +361,17 @@ local function processor(key, env)
 end
 
 local function get_context()
-    -- 上文 = 上屏历史 (commit_history)。返回 (文本, 来源)
+    -- 三层上文（2026-09-10 全功能）：COM（Word/WPS 文字文档模型）→
+    -- UIA TextPattern（通用现代应用）→ 上屏历史（兜底）。前两层由 DLL
+    -- llm_context() 完成（前台门控 + 快照新鲜度 + 来源进程校验都在 C++，
+    -- 按键路径零阻塞）；失败/关闭回落历史。com_context=false 仅用历史
+    -- （与源码版同名参数语义一致，热切换=下一键生效）
+    if com_ctx_enabled and llm_prep and llm_prep.llm_context then
+        local ok, t, src = pcall(llm_prep.llm_context)
+        if ok and type(t) == "string" and #t > 0 then
+            return t, src
+        end
+    end
     return table.concat(history, ""), "rime"
 end
 

@@ -7,6 +7,14 @@
 
 #define NOMINMAX
 #include <windows.h>
+#include <objbase.h>
+#include <oleauto.h>
+// UIA 客户端接口（IUIAutomationTextPattern 等）在 Client.h，TextUnit 枚举在 Core.h
+#include <UIAutomationClient.h>
+#include <UIAutomationCore.h>
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "UIAutomationCore.lib")
 
 extern "C" {
 #include <lua.h>
@@ -22,6 +30,7 @@ extern "C" {
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <cstdarg>
@@ -46,7 +55,10 @@ static std::string  g_model_path      = default_model_path();
 static int          g_min_tokens      = 1;
 static int          g_max_ctx_tokens  = 10; // tok=10 准确率 93.4%，10→17 收益仅 +1.1pp 但延迟翻倍
 static int          g_n_threads       = 4;  // 默认=GGML 默认; 可用 bench_threads 实测后配置
-static int          g_n_ctx           = 64;
+static int          g_n_ctx           = 128; // KV: 11 seqs × (ctx 10 + cand 2) = 132, 64 溢出
+                                              //（2026-09-11 对齐源码版 llm_filter.cc 同款修正：
+                                              //  64 时 score 的 S2 恒 ~100ms vs 128 的 ~40ms，
+                                              //  真机 DLL 日志实证）
 static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker seq
 
 // ============================================================
@@ -107,6 +119,459 @@ static void log_msg(const char * fmt, ...) {
     FILE * f = fopen(path, "a");
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
 }
+
+
+// ============================================================
+// 光标上文旁路（2026-09-10 插件版全功能：三层上文的前两层）
+//   COM = Word/WPS 文字文档模型（前台 OpusApp 门控；Kwps→Word 双 ProGID，
+//         WPS 双注册 Word CLSID 但以文档打开为条件，Kwps 优先无歧义）
+//   UIA = UIA TextPattern 焦点元素前文（通用现代应用：Chromium 系/记事本
+//         实测 8-13ms；读的是"当时焦点元素"，消费时校验前台进程一致）
+//   历史 = lua 侧 commit_history 兜底（llm_processor.get_context）
+// 实验依据与真机数据：memory wps-context-investigation.md 十一/十二节
+//（探针 scripts/probe_wps_ctx.cpp / probe_uia_ctx.cpp，源码版 llm_filter.cc
+//  comctx 同源实现已真机验证）。单后台线程 STA：2s 周期 + kick（commit 后）
+// 刷新；lua 调用线程经 mutex 快照消费，COM/UIA 调用绝不在按键同步路径。
+// ============================================================
+namespace ctxlink {
+
+static std::mutex g_mu;
+static std::string g_com_text;                 // UTF-8
+static unsigned long long g_com_stamp = 0;
+static std::string g_uia_text;                 // UTF-8
+static unsigned long long g_uia_stamp = 0;
+static DWORD g_uia_pid = 0;                    // 快照来源焦点元素进程
+
+static std::mutex g_cv_mu;
+static std::condition_variable g_cv;
+static std::atomic<bool> g_kick{false};
+static std::atomic<bool> g_started{false};
+static std::atomic<unsigned long long> g_last_kick_ms{0};  // 打字活跃期判定
+
+// 前台 Office 判定（2026-09-11 扩展演示）：OpusApp 同属 MS Word（开发代号
+// Opus）与 WPS 文字（复刻 Word 窗口体系）；PP12FrameClass 同属 MS
+// PowerPoint（2010+）与 WPS 演示（实测 12.1.0.28505）→ 两个类名圈定
+// "文字处理器 + 演示文档"。表格 XLMAIN（复刻 Excel）刻意不含——单元格
+// 编辑态 COM 盲区（Office 系通病：编辑态对象模型挂起、无 Selection.Start
+// 等价物），输入法打字恰在盲区，落 UIA/历史兜底。候选窗不抢前台。
+enum class OfficeKind { NONE, WRITER, PPT };
+static OfficeKind foreground_office() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return OfficeKind::NONE;
+    wchar_t cls[64];
+    if (GetClassNameW(fg, cls, 64) <= 0) return OfficeKind::NONE;
+    if (wcscmp(cls, L"OpusApp") == 0) return OfficeKind::WRITER;
+    if (wcscmp(cls, L"PP12FrameClass") == 0) return OfficeKind::PPT;
+    return OfficeKind::NONE;
+}
+static DWORD foreground_pid() {
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    return pid;
+}
+
+// ---- COM 读链（源码版 llm_filter.cc comctx 同源）----
+static HRESULT disp_invoke(IDispatch * obj, const wchar_t * name, WORD flags,
+                           DISPPARAMS * pdp, VARIANT * ret) {
+    DISPID dispid = 0;
+    HRESULT hr = obj->GetIDsOfNames(IID_NULL, (LPOLESTR *)&name, 1,
+                                    LOCALE_USER_DEFAULT, &dispid);
+    if (FAILED(hr)) return hr;
+    VariantInit(ret);
+    return obj->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, flags, pdp,
+                       ret, nullptr, nullptr);
+}
+static HRESULT disp_get(IDispatch * obj, const wchar_t * name, VARIANT * ret) {
+    DISPPARAMS dp;
+    ZeroMemory(&dp, sizeof(dp));
+    return disp_invoke(obj, name, DISPATCH_PROPERTYGET, &dp, ret);
+}
+
+enum class ComRead { OK, NO_DOC, DEAD };
+
+static ComRead com_read_chain(IDispatch * app, std::string & out) {
+    VARIANT vwin, vsel, vstart, vdoc, vrng, vtxt;
+    VariantInit(&vwin); VariantInit(&vsel); VariantInit(&vstart);
+    VariantInit(&vdoc); VariantInit(&vrng); VariantInit(&vtxt);
+    auto vt_ok = [](const VARIANT & v) {
+        return v.vt == VT_DISPATCH && v.pdispVal;
+    };
+    HRESULT hr;
+    if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
+        FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) ||
+        !vt_ok(vsel) ||
+        FAILED(hr = disp_get(vsel.pdispVal, L"Start", &vstart)) ||
+        vstart.vt != VT_I4) {
+        VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
+        VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+        if (hr == DISP_E_EXCEPTION || hr == DISP_E_MEMBERNOTFOUND)
+            return ComRead::NO_DOC;
+        return ComRead::DEAD;
+    }
+    long pos = vstart.lVal, from = pos - 64;
+    if (from < 0) from = 0;
+    ComRead res = ComRead::OK;
+    do {
+        if (FAILED(hr = disp_get(app, L"ActiveDocument", &vdoc)) ||
+            !vt_ok(vdoc)) {
+            res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
+            break;
+        }
+        VARIANT args[2];  // rgvark 反序：末参数 (pos) 在前
+        VariantInit(&args[0]); args[0].vt = VT_I4; args[0].lVal = pos;
+        VariantInit(&args[1]); args[1].vt = VT_I4; args[1].lVal = from;
+        DISPPARAMS dp;
+        ZeroMemory(&dp, sizeof(dp));
+        dp.rgvarg = args; dp.cArgs = 2;
+        if (FAILED(hr = disp_invoke(vdoc.pdispVal, L"Range",
+                                    DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+                                    &dp, &vrng)) || !vt_ok(vrng)) {
+            res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
+            break;
+        }
+        if (FAILED(hr = disp_get(vrng.pdispVal, L"Text", &vtxt)) ||
+            vtxt.vt != VT_BSTR) {
+            res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
+            break;
+        }
+        int n = WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, nullptr, 0,
+                                    nullptr, nullptr);
+        if (n > 0) {
+            out.resize(n - 1);
+            if (n > 1)
+                WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, &out[0], n,
+                                    nullptr, nullptr);
+        }
+    } while (false);
+    VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
+    VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+    return res;
+}
+
+// ---- 演示读链（WPP/PowerPoint，2026-09-11 本机实测验证）----
+// app.ActiveWindow.Selection.Type==3(文本编辑) 时：start = TextRange.Start
+//（框内 1-based 偏移）；前文 = ShapeRange.TextFrame.TextRange.Characters(
+// max(1,start-64), min(64, start-1)).Text。Type!=3 → NO_DOC 语义
+//（无文本编辑：形状/幻灯片选择态）。表格 XLMAIN 不在此链（编辑态盲区）。
+static ComRead ppt_read_chain(IDispatch * app, std::string & out) {
+    VARIANT vwin, vsel, vtype, vstart, vshape, vframe, vrng, vtxt;
+    VariantInit(&vwin); VariantInit(&vsel); VariantInit(&vtype);
+    VariantInit(&vstart); VariantInit(&vshape); VariantInit(&vframe);
+    VariantInit(&vrng); VariantInit(&vtxt);
+    auto vt_ok = [](const VARIANT & v) {
+        return v.vt == VT_DISPATCH && v.pdispVal;
+    };
+    HRESULT hr;
+    if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
+        FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) ||
+        !vt_ok(vsel) ||
+        FAILED(hr = disp_get(vsel.pdispVal, L"Type", &vtype)) ||
+        vtype.vt != VT_I4) {
+        VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
+        VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
+        VariantClear(&vrng); VariantClear(&vtxt);
+        if (hr == DISP_E_EXCEPTION) return ComRead::NO_DOC;
+        return ComRead::DEAD;
+    }
+    if (vtype.lVal != 3) {  // ppSelectionText = 3：非文本编辑态
+        VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
+        VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
+        VariantClear(&vrng); VariantClear(&vtxt);
+        return ComRead::NO_DOC;
+    }
+    ComRead res = ComRead::OK;
+    do {
+        if (FAILED(hr = disp_get(vsel.pdispVal, L"TextRange", &vrng)) ||
+            !vt_ok(vrng) ||
+            FAILED(hr = disp_get(vrng.pdispVal, L"Start", &vstart)) ||
+            vstart.vt != VT_I4) {
+            res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
+            break;
+        }
+        long start = vstart.lVal;               // 1-based
+        long len = start - 1 > 64 ? 64 : start - 1;  // 前文字数（截 64）
+        if (len <= 0) { out.clear(); break; }   // 光标在框首：前文真空
+        if (FAILED(hr = disp_get(vsel.pdispVal, L"ShapeRange", &vshape)) ||
+            !vt_ok(vshape) ||
+            FAILED(hr = disp_get(vshape.pdispVal, L"TextFrame", &vframe)) ||
+            !vt_ok(vframe)) {
+            res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
+            break;
+        }
+        VARIANT vfull;
+        VariantInit(&vfull);
+        if (FAILED(hr = disp_get(vframe.pdispVal, L"TextRange", &vfull)) ||
+            !vt_ok(vfull)) {
+            VariantClear(&vfull);
+            res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
+            break;
+        }
+        // Characters(start_index, length)：rgvark 反序 [length, start_index]
+        VARIANT args[2];
+        VariantInit(&args[0]); args[0].vt = VT_I4; args[0].lVal = len;
+        VariantInit(&args[1]); args[1].vt = VT_I4;
+        args[1].lVal = start - len;             // 起始字符 = start-len（含尾部）
+        DISPPARAMS dp;
+        ZeroMemory(&dp, sizeof(dp));
+        dp.rgvarg = args; dp.cArgs = 2;
+        VariantClear(&vrng);  // 复用作出参：先释放首个 TextRange 引用
+        if (FAILED(hr = disp_invoke(vfull.pdispVal, L"Characters",
+                                    DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+                                    &dp, &vrng)) || !vt_ok(vrng)) {
+            VariantClear(&vfull);
+            res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
+            break;
+        }
+        VariantClear(&vfull);
+        if (FAILED(hr = disp_get(vrng.pdispVal, L"Text", &vtxt)) ||
+            vtxt.vt != VT_BSTR) {
+            res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
+            break;
+        }
+        int n = WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, nullptr, 0,
+                                    nullptr, nullptr);
+        if (n > 0) {
+            out.resize(n - 1);
+            if (n > 1)
+                WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, &out[0], n,
+                                    nullptr, nullptr);
+        }
+    } while (false);
+    VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
+    VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
+    VariantClear(&vrng); VariantClear(&vtxt);
+    return res;
+}
+
+// ---- UIA 读链（2026-09-11 瘦身：~10 个跨进程往返 → 6 个）----
+// 省法：①GetPattern 失败即无 TextPattern（去掉 IsTextPatternAvailable
+// 属性往返）；②selection range 直接 Clone 后把 Start 端点前移 64 字
+//（数学上等价于 [doc.Start, sel.Start) 截尾 64——去掉 DocumentRange +
+// 2×MoveEndpointByRange 共 3 个往返）。每次跨进程往返 1-3ms 且打断
+// 目标应用 UI 线程，读链瘦身同时降两边开销（真机 A/B：ctxlink 活跃
+// 期 score 均值 +36%，2026-09-11 排查）。
+static bool uia_read(IUIAutomation * uia, std::string & out, DWORD & pid) {
+    IUIAutomationElement * el = nullptr;
+    if (FAILED(uia->GetFocusedElement(&el)) || !el)
+        return false;
+    bool ret = false;
+    int elpid = 0;
+    el->get_CurrentProcessId(&elpid);
+    IUIAutomationTextPattern * tp = nullptr;
+    if (SUCCEEDED(el->GetCurrentPattern(UIA_TextPatternId,
+                                        (IUnknown **)&tp)) && tp) {
+        IUIAutomationTextRangeArray * sel = nullptr;
+        if (SUCCEEDED(tp->GetSelection(&sel)) && sel) {
+            IUIAutomationTextRange * s0 = nullptr;
+            int nsel = 0;
+            sel->get_Length(&nsel);
+            if (nsel > 0) sel->GetElement(0, &s0);
+            sel->Release();
+            if (s0) {
+                IUIAutomationTextRange * r = nullptr;
+                if (SUCCEEDED(s0->Clone(&r))) {
+                    // r = [光标(或选区起点)-64 字, 光标]：Start 端点前移
+                    int moved = 0;
+                    r->MoveEndpointByUnit(TextPatternRangeEndpoint_Start,
+                                          TextUnit_Character, -64, &moved);
+                    BSTR txt = nullptr;
+                    if (SUCCEEDED(r->GetText(-1, &txt)) && txt) {
+                        int n = WideCharToMultiByte(
+                            CP_UTF8, 0, txt, -1, nullptr, 0,
+                            nullptr, nullptr);
+                        if (n > 0) {
+                            out.resize(n - 1);
+                            if (n > 1)
+                                WideCharToMultiByte(
+                                    CP_UTF8, 0, txt, -1, &out[0], n,
+                                    nullptr, nullptr);
+                            ret = true;
+                        }
+                        SysFreeString(txt);
+                    }
+                    r->Release();
+                }
+                s0->Release();
+            }
+        }
+        tp->Release();
+    }
+    if (ret && elpid) pid = (DWORD)elpid;
+    el->Release();
+    return ret;
+}
+
+static void thread_proc() {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    IUIAutomation * uia = nullptr;
+    bool uia_ok = SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                                             CLSCTX_INPROC_SERVER,
+                                             IID_IUIAutomation,
+                                             (void **)&uia));
+    // 仅 WPS 系 ProgID（2026-09-11 定案）：COM 旁路只补 TSF/UIA 墙上唯一
+    // 缺口=WPS（微软 Word/PPT 的 TSF/UIA 完整，无需 COM）。类名二义由
+    // 附着成败天然消解：Kwps 附着成功=WPS 文字（用 COM）；失败=微软 Word
+    // 或无文档（落 UIA/历史）——Word/PPT 的 ProgID 回落已撤（共存双注册
+    // 误附风险随之归零）。
+    CLSID clsid_kwps, clsid_kwpp;
+    bool has_kwps = SUCCEEDED(CLSIDFromProgID(L"Kwps.Application",
+                                              &clsid_kwps));
+    bool has_kwpp = SUCCEEDED(CLSIDFromProgID(L"KWPP.Application",
+                                              &clsid_kwpp));
+    if (!uia_ok && !has_kwps && !has_kwpp)
+        return;  // 无任何可用通道（极罕见）
+
+    IDispatch * app = nullptr;
+    OfficeKind app_kind = OfficeKind::NONE;  // 附着实例类型（文字/演示链路不同）
+    bool logged_attach = false;
+    bool com_pending = true;  // 前台 Office 且未附着 → 500ms 快速重试
+                              //（文档打开瞬间 WPS 才注册 ROT，缩短发现间隙；
+                              //  成功即回 2s，开销仅微秒级 ROT 查询）
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(g_cv_mu);
+            g_cv.wait_for(lk, std::chrono::milliseconds(
+                                  g_kick.load() ? 1 : (com_pending ? 500 : 2000)));
+        }
+        bool woken_by_kick = g_kick.exchange(false);
+        com_pending = false;
+
+        // COM：前台 Office 才读（读端门控省后台空转；切回的
+        // 首词缓存 age ≤ 2s+读链，kick/周期兜住）
+        if (has_kwps || has_kwpp) {
+            OfficeKind fg = foreground_office();
+            if (fg != OfficeKind::NONE) {
+                // 前台类型切换（文字↔演示）→ 释放旧附着，按前台类型选
+                // ProgID（防 WPS 文字后台开文档时误附 Kwps 读错对象）
+                if (app && fg != app_kind) {
+                    app->Release();
+                    app = nullptr;
+                    app_kind = OfficeKind::NONE;
+                    logged_attach = false;
+                }
+                if (!app) {
+                    const char * via = nullptr;
+                    IUnknown * punk = nullptr;
+                    if (fg == OfficeKind::WRITER && has_kwps) {
+                        if (SUCCEEDED(GetActiveObject(clsid_kwps, nullptr,
+                                                      &punk)) && punk)
+                            via = "Kwps.Application";
+                    } else if (fg == OfficeKind::PPT && has_kwpp) {
+                        if (SUCCEEDED(GetActiveObject(clsid_kwpp, nullptr,
+                                                      &punk)) && punk)
+                            via = "KWPP.Application";
+                    }
+                    if (punk) {
+                        punk->QueryInterface(IID_IDispatch, (void **)&app);
+                        punk->Release();
+                        app_kind = fg;
+                        if (!logged_attach) {
+                            log_msg("ctx probe: com attached (%s)", via);
+                            logged_attach = true;
+                        }
+                    }
+                }
+                if (app) {
+                    std::string txt;
+                    ComRead r = (app_kind == OfficeKind::PPT)
+                                    ? ppt_read_chain(app, txt)
+                                    : com_read_chain(app, txt);
+                    std::lock_guard<std::mutex> lk(g_mu);
+                    if (r == ComRead::OK) {
+                        g_com_text = txt;
+                        g_com_stamp = GetTickCount64();
+                    } else {
+                        g_com_text.clear();
+                        g_com_stamp = 0;
+                        if (r == ComRead::DEAD) {
+                            if (logged_attach) {
+                                log_msg("ctx probe: office app gone, "
+                                        "will re-attach");
+                                logged_attach = false;
+                            }
+                            app->Release();
+                            app = nullptr;
+                            app_kind = OfficeKind::NONE;
+                        }
+                        // NO_DOC（文档全关/演示非文本编辑态）：保留引用重试
+                    }
+                } else {
+                    std::lock_guard<std::mutex> lk(g_mu);
+                    g_com_text.clear();
+                    g_com_stamp = 0;
+                }
+            } else {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_com_text.clear();
+                g_com_stamp = 0;  // 前台非 Office：COM 缓存即刻失效
+            }
+            com_pending = (foreground_office() != OfficeKind::NONE) && !app;
+        }
+
+        // UIA：读当前焦点元素（不限前台是谁——消费时校验进程一致）。
+        // 打字活跃期（最近 3s 内有 kick）暂停周期读：动态内容应用（终端
+        // 状态行时间戳等）的周期刷新令快照文本抖动 → prepare/score 双双
+        // 失配 + 推理锁竞争（真机实测 150-215ms 长尾，2026-09-11）；
+        // kick 读已覆盖上屏后的更新需求，打字期间快照保持稳定。
+        if (uia_ok && (woken_by_kick ||
+                       GetTickCount64() - g_last_kick_ms.load() > 3000)) {
+            std::string txt;
+            DWORD pid = 0;
+            if (uia_read(uia, txt, pid)) {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_uia_text = txt;
+                g_uia_stamp = GetTickCount64();
+                g_uia_pid = pid;
+            } else {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_uia_text.clear();
+                g_uia_stamp = 0;
+                g_uia_pid = 0;
+            }
+        }
+    }
+}
+
+static void ensure_started() {
+    bool expect = false;
+    if (g_started.compare_exchange_strong(expect, true))
+        std::thread(thread_proc).detach();
+}
+static void kick() {
+    g_last_kick_ms.store(GetTickCount64());
+    g_kick.store(true);
+    g_cv.notify_all();
+}
+
+// lua 调用线程消费：三层前两层判定（历史兜底由 lua 侧完成）。
+// 返回 true 时 text/src 有效（src = "com" | "uia"）。
+static bool pick(std::string & text, const char *& src) {
+    unsigned long long now = GetTickCount64();
+    if (foreground_office() != OfficeKind::NONE) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_com_stamp && now - g_com_stamp <= 2500 && !g_com_text.empty()) {
+            text = g_com_text;
+            src = "com";
+            return true;
+        }
+    }
+    {
+        // UIA 快照：新鲜 && 前台进程 == 快照来源进程（防切窗残留文本误用）
+        DWORD fg = foreground_pid();
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_uia_stamp && now - g_uia_stamp <= 2500 && !g_uia_text.empty() &&
+            g_uia_pid != 0 && g_uia_pid == fg) {
+            text = g_uia_text;
+            src = "uia";
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace ctxlink
 
 
 // ============================================================
@@ -627,6 +1092,43 @@ static int lua_is_ready(lua_State * L) {
     return 1;
 }
 
+// 光标上文（三层前两层，2026-09-10）：成功返回 (text, "com"|"uia")，
+// 无可用快照返回 nil —— lua 侧回落 commit_history。
+// COM/UIA 调用全部在后台线程（本函数只读 mutex 快照 + 前台窗口判定，
+// 按键路径零阻塞）
+static int lua_llm_context(lua_State * L) {
+    ctxlink::ensure_started();
+    std::string text;
+    const char * src = nullptr;
+    if (ctxlink::pick(text, src)) {
+        lua_pushstring(L, text.c_str());
+        lua_pushstring(L, src);
+        return 2;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+// commit 后触发：立即刷新 COM/UIA 快照（新词已入文档/控件，读链 ~6-13ms
+// 异步完成，下一键即有新鲜上文）
+static int lua_kick_context(lua_State * L) {
+    ctxlink::kick();
+    return 0;
+}
+
+// 前台进程切换检测（跨应用，2026-09-11）：插件版 lua 无焦点事件，经此
+// 让 processor 在跨应用切换后重置历史上文（对齐源码版 focus:switch
+// reset 语义——真机踩坑：切新文档首词用旧窗口历史冒充上文标 AI·历史）。
+// 比 pid 不比 HWND：同应用内对话框/多文档窗口不误清。进程级单例状态。
+static int lua_fg_changed(lua_State * L) {
+    static DWORD last_pid = 0;
+    DWORD cur = ctxlink::foreground_pid();
+    bool changed = (last_pid != 0 && cur != 0 && cur != last_pid);
+    last_pid = cur;
+    lua_pushboolean(L, changed ? 1 : 0);
+    return 1;
+}
+
 // ============================================================
 // __index / __newindex
 // ============================================================
@@ -636,6 +1138,9 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "get_scores") == 0) lua_pushcfunction(L, lua_get_scores);
     else if (strcmp(key, "score") == 0)     lua_pushcfunction(L, lua_score);
     else if (strcmp(key, "prepare") == 0)   lua_pushcfunction(L, lua_prepare);
+    else if (strcmp(key, "llm_context") == 0)    lua_pushcfunction(L, lua_llm_context);
+    else if (strcmp(key, "kick_context") == 0)   lua_pushcfunction(L, lua_kick_context);
+    else if (strcmp(key, "fg_changed") == 0)     lua_pushcfunction(L, lua_fg_changed);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
     else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);
     else if (strcmp(key, "min_tokens") == 0) lua_pushinteger(L, g_min_tokens);
@@ -680,6 +1185,17 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
 
     lua_pushcfunction(L, lua_is_ready);
     lua_setfield(L, -2, "is_ready");
+
+    // 光标上文旁路（2026-09-10 三层上文前两层）：函数注册与 score/prepare
+    // 同款（setfield 直挂，不走 __newindex 属性语义）
+    lua_pushcfunction(L, lua_llm_context);
+    lua_setfield(L, -2, "llm_context");
+
+    lua_pushcfunction(L, lua_kick_context);
+    lua_setfield(L, -2, "kick_context");
+
+    lua_pushcfunction(L, lua_fg_changed);
+    lua_setfield(L, -2, "fg_changed");
 
     // 可写属性（model_path/max_ctx/n_threads/n_ctx/n_seq_max/min_tokens）
     // 严禁在此预填充为原始字段——Lua 的 __newindex 只对表中不存在的键
