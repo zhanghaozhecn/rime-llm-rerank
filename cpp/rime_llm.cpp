@@ -188,6 +188,19 @@ static HRESULT disp_get(IDispatch * obj, const wchar_t * name, VARIANT * ret) {
     return disp_invoke(obj, name, DISPATCH_PROPERTYGET, &dp, ret);
 }
 
+// BSTR → UTF-8（COM 两读链与 UIA 读链共用；失败时 out 不变返回 false）
+static bool bstr_to_utf8(BSTR s, std::string & out) {
+    if (!s) return false;
+    int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0,
+                                nullptr, nullptr);
+    if (n <= 0) return false;
+    out.resize(n - 1);
+    if (n > 1)
+        WideCharToMultiByte(CP_UTF8, 0, s, -1, &out[0], n,
+                            nullptr, nullptr);
+    return true;
+}
+
 enum class ComRead { OK, NO_DOC, DEAD };
 
 static ComRead com_read_chain(IDispatch * app, std::string & out) {
@@ -198,13 +211,16 @@ static ComRead com_read_chain(IDispatch * app, std::string & out) {
         return v.vt == VT_DISPATCH && v.pdispVal;
     };
     HRESULT hr;
+    auto cleanup = [&]() {
+        VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
+        VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+    };
     if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
         FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) ||
         !vt_ok(vsel) ||
         FAILED(hr = disp_get(vsel.pdispVal, L"Start", &vstart)) ||
         vstart.vt != VT_I4) {
-        VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
-        VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+        cleanup();
         if (hr == DISP_E_EXCEPTION || hr == DISP_E_MEMBERNOTFOUND)
             return ComRead::NO_DOC;
         return ComRead::DEAD;
@@ -235,17 +251,9 @@ static ComRead com_read_chain(IDispatch * app, std::string & out) {
             res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
             break;
         }
-        int n = WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, nullptr, 0,
-                                    nullptr, nullptr);
-        if (n > 0) {
-            out.resize(n - 1);
-            if (n > 1)
-                WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, &out[0], n,
-                                    nullptr, nullptr);
-        }
+        bstr_to_utf8(vtxt.bstrVal, out);
     } while (false);
-    VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vstart);
-    VariantClear(&vdoc); VariantClear(&vrng); VariantClear(&vtxt);
+    cleanup();
     return res;
 }
 
@@ -263,21 +271,22 @@ static ComRead ppt_read_chain(IDispatch * app, std::string & out) {
         return v.vt == VT_DISPATCH && v.pdispVal;
     };
     HRESULT hr;
+    auto cleanup = [&]() {
+        VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
+        VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
+        VariantClear(&vrng); VariantClear(&vtxt);
+    };
     if (FAILED(hr = disp_get(app, L"ActiveWindow", &vwin)) || !vt_ok(vwin) ||
         FAILED(hr = disp_get(vwin.pdispVal, L"Selection", &vsel)) ||
         !vt_ok(vsel) ||
         FAILED(hr = disp_get(vsel.pdispVal, L"Type", &vtype)) ||
         vtype.vt != VT_I4) {
-        VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
-        VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
-        VariantClear(&vrng); VariantClear(&vtxt);
+        cleanup();
         if (hr == DISP_E_EXCEPTION) return ComRead::NO_DOC;
         return ComRead::DEAD;
     }
     if (vtype.lVal != 3) {  // ppSelectionText = 3：非文本编辑态
-        VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
-        VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
-        VariantClear(&vrng); VariantClear(&vtxt);
+        cleanup();
         return ComRead::NO_DOC;
     }
     ComRead res = ComRead::OK;
@@ -329,18 +338,9 @@ static ComRead ppt_read_chain(IDispatch * app, std::string & out) {
             res = (hr == DISP_E_EXCEPTION) ? ComRead::NO_DOC : ComRead::DEAD;
             break;
         }
-        int n = WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, nullptr, 0,
-                                    nullptr, nullptr);
-        if (n > 0) {
-            out.resize(n - 1);
-            if (n > 1)
-                WideCharToMultiByte(CP_UTF8, 0, vtxt.bstrVal, -1, &out[0], n,
-                                    nullptr, nullptr);
-        }
+        bstr_to_utf8(vtxt.bstrVal, out);
     } while (false);
-    VariantClear(&vwin); VariantClear(&vsel); VariantClear(&vtype);
-    VariantClear(&vstart); VariantClear(&vshape); VariantClear(&vframe);
-    VariantClear(&vrng); VariantClear(&vtxt);
+    cleanup();
     return res;
 }
 
@@ -377,17 +377,7 @@ static bool uia_read(IUIAutomation * uia, std::string & out, DWORD & pid) {
                                           TextUnit_Character, -64, &moved);
                     BSTR txt = nullptr;
                     if (SUCCEEDED(r->GetText(-1, &txt)) && txt) {
-                        int n = WideCharToMultiByte(
-                            CP_UTF8, 0, txt, -1, nullptr, 0,
-                            nullptr, nullptr);
-                        if (n > 0) {
-                            out.resize(n - 1);
-                            if (n > 1)
-                                WideCharToMultiByte(
-                                    CP_UTF8, 0, txt, -1, &out[0], n,
-                                    nullptr, nullptr);
-                            ret = true;
-                        }
+                        ret = bstr_to_utf8(txt, out);
                         SysFreeString(txt);
                     }
                     r->Release();
@@ -420,8 +410,10 @@ static void thread_proc() {
                                               &clsid_kwps));
     bool has_kwpp = SUCCEEDED(CLSIDFromProgID(L"KWPP.Application",
                                               &clsid_kwpp));
-    if (!uia_ok && !has_kwps && !has_kwpp)
-        return;  // 无任何可用通道（极罕见）
+    if (!uia_ok && !has_kwps && !has_kwpp) {
+        CoUninitialize();  // 与 CoInitializeEx 配对（无任何通道，极罕见）
+        return;
+    }
 
     IDispatch * app = nullptr;
     OfficeKind app_kind = OfficeKind::NONE;  // 附着实例类型（文字/演示链路不同）
@@ -507,7 +499,7 @@ static void thread_proc() {
                 g_com_text.clear();
                 g_com_stamp = 0;  // 前台非 Office：COM 缓存即刻失效
             }
-            com_pending = (foreground_office() != OfficeKind::NONE) && !app;
+            com_pending = (fg != OfficeKind::NONE) && !app;
         }
 
         // UIA：读当前焦点元素（不限前台是谁——消费时校验进程一致）。
@@ -682,6 +674,17 @@ static std::vector<llama_token> tokenize(const char * text) {
     return toks;
 }
 
+// 上文 token 化 + min_tokens/max_ctx 截尾（prepare/score 入口共用）。
+// token 数不足 min_tokens（方案 llm_rerank/min_tokens，lua 传入）→ 返回空
+//（空 ctx 无推理是配置语义, 非 bug）。
+static std::vector<llama_token> ctx_token_ids(const char * context) {
+    auto ids = tokenize(context);
+    if ((int)ids.size() < g_min_tokens) return {};
+    if ((int)ids.size() > g_max_ctx_tokens)
+        ids.erase(ids.begin(), ids.end() - g_max_ctx_tokens);
+    return ids;
+}
+
 // ============================================================
 // Softmax CE 辅助：-log(softmax(x)[target])
 // ============================================================
@@ -828,13 +831,14 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
                 if (l) ce_sum[ci] += cross_entropy(l, vs, cands[ci][1]);
                 else   ce_sum[ci] = -1e10;
             }
-    } else {
-        for (int ci : idx2) ce_sum[ci] = -1e10;
-        // 失败自愈：prep 命中路径无 memory_clear，decode 失败多为 KV 耗尽
-        // （见下方 worker 清理说明）——置无效强制下次 score 走全流程重建
-        g_prep_ready = false;
-    }
-    llama_batch_free(b2);
+        } else {
+            for (int ci : idx2) ce_sum[ci] = -1e10;
+            log_msg("WARN: step2 decode failed");
+            // 失败自愈：prep 命中路径无 memory_clear，decode 失败多为 KV 耗尽
+            // （见下方 worker 清理说明）——置无效强制下次 score 走全流程重建
+            g_prep_ready = false;
+        }
+        llama_batch_free(b2);
         auto ts2_1 = std::chrono::high_resolution_clock::now();
         ms2a = std::chrono::duration<double, std::milli>(ts2_kv - ts2_0).count();
         ms2b = std::chrono::duration<double, std::milli>(ts2_1 - ts2_kv).count();
@@ -864,6 +868,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
             }
         } else {
             for (int ci : idx3) ce_sum[ci] = -1e10;
+            log_msg("WARN: step3 decode failed");
             g_prep_ready = false;  // 同 Step2：失败自愈
         }
         llama_batch_free(b3);
@@ -969,7 +974,7 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     g_prep_logits.assign(cl, cl + vs);
     llama_batch_free(ctx_batch);
 
-    // 不预复制 KV——n_ctx=64 太小，且 KV copy 本身很快
+    // 不预复制 KV——score 的 KV copy 本身很快（n_ctx=128 下微秒级），
     // score() 检测 ctx 一致时跳过 Step 1，但仍执行 KV copy + Step 2
 
     g_seq0_gen++;   // seq0 KV 已更新 (本代)
@@ -993,15 +998,12 @@ static int lua_prepare(lua_State * L) {
         return 1;
     }
     const char * context = luaL_checkstring(L, 1);
-    auto ctx_ids = tokenize(context);
-    // 上文 token 数 < min_tokens (方案文件 llm_rerank/min_tokens, lua 传入)
-    // → 不预解码 (空 ctx 无推理是配置语义, 非 bug)
-    if ((int)ctx_ids.size() < g_min_tokens) {
+    // 上文 token 数 < min_tokens → 不预解码（空 ctx 无推理是配置语义）
+    auto ctx_ids = ctx_token_ids(context);
+    if (ctx_ids.empty()) {
         lua_pushboolean(L, 0);
         return 1;
     }
-    if ((int)ctx_ids.size() > g_max_ctx_tokens)
-        ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
 
     // 递增序列号，之前的过期 prepare 会在获取 mutex 后自行跳过
     int seq = ++g_prep_seq;
@@ -1037,12 +1039,8 @@ static int lua_score(lua_State * L) {
     }
     if (cand_texts.size() < 2) { lua_pushnil(L); return 1; }
 
-    std::vector<llama_token> ctx_ids = tokenize(context);
-    // 上文 token 数 < min_tokens (方案文件 llm_rerank/min_tokens, lua 传入)
-    // → 不推理 (空 ctx 无推理是配置语义, 非 bug)
-    if ((int)ctx_ids.size() < g_min_tokens) { lua_pushnil(L); return 1; }
-    if ((int)ctx_ids.size() > g_max_ctx_tokens)
-        ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - g_max_ctx_tokens);
+    std::vector<llama_token> ctx_ids = ctx_token_ids(context);
+    if (ctx_ids.empty()) { lua_pushnil(L); return 1; }
 
     std::vector<std::vector<llama_token>> cand_ids;
     for (auto & s : cand_texts) {

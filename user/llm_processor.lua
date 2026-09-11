@@ -20,18 +20,25 @@ local last_prep_ctx = "" -- 上次 prepare 的 context，避免重复调用
 
 local NAV_KEYS = { Left=true, Right=true, Up=true, Down=true,
                    Home=true, End=true, Page_Up=true, Page_Down=true }
+
+-- 导航/换行类键（含组合导航 Control+Left / Shift+Home 等：以导航键名结尾的
+-- repr 均算）。与删除类键分开：编辑键重置两者共用，训练数据标记只区分这两类
+--（导航/回车 → 换行 "\n"；删除 → 退格 "←"）。
+local function is_nav_ish_key(k)
+    if NAV_KEYS[k] or k == "Return" or k == "KP_Enter" then return true end
+    for name in pairs(NAV_KEYS) do
+        if #k > #name and k:sub(-#name) == name then return true end
+    end
+    return false
+end
+
 -- 编辑位置变化键: 退格/删除 (删词) + 导航键 (光标移动/滚动) + 回车 (换行)
 -- 这些键使会话上屏词序列不再代表光标前上文 → 上屏历史上文重置为空
 local function is_edit_key(k)
     if k == "BackSpace" or k == "Delete"
         or k == "Control+BackSpace" or k == "Control+Delete"
-        or NAV_KEYS[k]
-        or k == "Return" or k == "KP_Enter" then  -- 回车换行: 新段落, 上屏词序列断开
+        or is_nav_ish_key(k) then
         return true
-    end
-    -- 组合导航 (Control+Left / Shift+Home 等): 以导航键名结尾的 repr 均视为编辑位置变化
-    for name in pairs(NAV_KEYS) do
-        if #k > #name and k:sub(-#name) == name then return true end
     end
     return false
 end
@@ -39,6 +46,18 @@ end
 local function reset_history()
     history = {}
     prev_hist = {}
+end
+
+-- 异步预解码触发（归一化 + 去重，按键路径与编辑键重置路径共用）。
+-- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,
+-- 不一致会导致 prep 永远不命中 → 每次 score 完整解码 (~50ms)。
+-- 中文无空白两者相同; 含英文/空格 (如 "Hello world 你好") 时保证一致。
+local function trigger_prepare()
+    local cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
+    if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
+        last_prep_ctx = cur_ctx
+        llm_prep.prepare(cur_ctx)
+    end
 end
 
 local function append_raw(text)
@@ -181,14 +200,8 @@ local function processor(key, env)
             _G.llm_filter_cache = nil
         end
     end
-    -- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,
-    -- 不一致会导致 prep 永远不命中 → 每次 score 完整解码 (~50ms)。
-    -- 中文无空白两者相同; 含英文/空格 (如 "Hello world 你好") 时保证一致。
-    local cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
-    if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
-        last_prep_ctx = cur_ctx
-        llm_prep.prepare(cur_ctx)
-    end
+    -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
+    trigger_prepare()
 
     local ctx = env.engine.context
     local ch = ctx.commit_history
@@ -224,8 +237,7 @@ local function processor(key, env)
     --   退格后剩余词不会作为新词重新记录训练数据)
     if ctx.input == "" and is_edit_key(key:repr()) then
         local k = key:repr()
-        if NAV_KEYS[k] or k == "Return" or k == "KP_Enter" or
-           k:match("(Left|Right|Up|Down|Home|End|Page_Up|Page_Down)$") then
+        if is_nav_ish_key(k) then
             if #history > 0 then
                 append_raw("\n")
             end
@@ -252,11 +264,7 @@ local function processor(key, env)
             end)
         end
         -- 上文已重置 → 立即异步预解码 (空上文)
-        cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
-        if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
-            last_prep_ctx = cur_ctx
-            llm_prep.prepare(cur_ctx)
-        end
+        trigger_prepare()
         return 0
     end
 
