@@ -130,8 +130,11 @@ static void log_msg(const char * fmt, ...) {
 //   历史 = lua 侧 commit_history 兜底（llm_processor.get_context）
 // 实验依据与真机数据：memory wps-context-investigation.md 十一/十二节
 //（探针 scripts/probe_wps_ctx.cpp / probe_uia_ctx.cpp，源码版 llm_filter.cc
-//  comctx 同源实现已真机验证）。单后台线程 STA：2s 周期 + kick（commit 后）
-// 刷新；lua 调用线程经 mutex 快照消费，COM/UIA 调用绝不在按键同步路径。
+//  comctx 同源实现已真机验证）。单后台线程 STA：2s 周期 + kick（commit
+// 后 / 编辑键 / 点击，kick 唤醒统一延迟 ~50ms 再读）刷新；编辑键/点击
+// 经 edit_reset 先失效再 kick（2026-09-12 信号层统一——快照制对非
+// commit 编辑事件原本是盲区，旧快照 2.5s 新鲜窗内冒充真文）。
+// lua 调用线程经 mutex 快照消费，COM/UIA 调用绝不在按键同步路径。
 // ============================================================
 namespace ctxlink {
 
@@ -142,6 +145,7 @@ static std::wstring g_com_title;               // 发布时的前台标题（消
 static std::string g_uia_text;                 // UTF-8
 static unsigned long long g_uia_stamp = 0;
 static DWORD g_uia_pid = 0;                    // 快照来源焦点元素进程
+static std::wstring g_uia_title;               // 发布时的前台标题（消费端指纹）
 
 static std::mutex g_cv_mu;
 static std::condition_variable g_cv;
@@ -554,6 +558,12 @@ static void thread_proc() {
         }
         bool woken_by_kick = g_kick.exchange(false);
         com_pending = false;
+        // kick 统一延迟 ~50ms 再读（2026-09-12 信号层统一）：编辑键/点击
+        // 的 kick 若立即读会赶在应用处理完退格/点击之前拿到旧文本；commit
+        // kick 的文档更新同量级。下一键远晚于 100ms（人手速度），统一延迟
+        // 无感。连续 kick 在 sleep 期间再次置位 g_kick，下一轮 1ms 即醒，
+        // 自然合并不叠加。
+        if (woken_by_kick) Sleep(50);
 
         // COM：前台 Office 才读（读端门控省后台空转；切标签/切窗由发布
         // 标题指纹在消费端即刻拦截，kick/周期兜住换新）
@@ -674,15 +684,20 @@ static void thread_proc() {
             std::string txt;
             DWORD pid = 0;
             if (uia_read(uia, txt, pid)) {
+                wchar_t ut[256] = {0};
+                HWND ufh = GetForegroundWindow();
+                if (ufh) GetWindowTextW(ufh, ut, 256);
                 std::lock_guard<std::mutex> lk(g_mu);
                 g_uia_text = txt;
                 g_uia_stamp = GetTickCount64();
                 g_uia_pid = pid;
+                g_uia_title = ut;  // 消费端指纹：同进程多窗/标签切换即变
             } else {
                 std::lock_guard<std::mutex> lk(g_mu);
                 g_uia_text.clear();
                 g_uia_stamp = 0;
                 g_uia_pid = 0;
+                g_uia_title.clear();
             }
         }
     }
@@ -697,6 +712,26 @@ static void kick() {
     g_last_kick_ms.store(GetTickCount64());
     g_kick.store(true);
     g_cv.notify_all();
+}
+
+// 任何"光标前文本可能变了"的已知信号（编辑键/点击，2026-09-12 信号层
+// 统一）：成对执行 (a) 快照失效 (b) kick 延迟重读。失效保证 50ms 读回
+// 窗口内旧快照不冒充（pick 拒用 → lua 落历史）；kick 保证应用处理完编辑
+// 后读到新真文。缺失效则读早竞态冒充，缺 kick 则退格后首词无上文。
+// 点击候选窗选词场景：click 信号废掉 commit kick 刚刷新的正确快照，
+// 但随后的 kick 读回同样正确的文本（点击已处理完、含新上屏词），自愈。
+static void edit_reset() {
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_com_text.clear();
+        g_com_stamp = 0;
+        g_com_title.clear();
+        g_uia_text.clear();
+        g_uia_stamp = 0;
+        g_uia_pid = 0;
+        g_uia_title.clear();
+    }
+    kick();
 }
 
 // lua 调用线程消费：三层前两层判定（历史兜底由 lua 侧完成）。
@@ -721,10 +756,17 @@ static bool pick(std::string & text, const char *& src) {
     }
     {
         // UIA 快照：新鲜 && 前台进程 == 快照来源进程（防切窗残留文本误用）
+        // + 标题指纹（2026-09-12）：pid 校验挡不住同进程多窗/多标签（Chrome
+        // 双窗、Win11 记事本标签同 pid）——发布后标题变 = 已切窗/标签 →
+        // 拒用，与 COM 同款；任一侧取不到标题 → 保守放行
         DWORD fg = foreground_pid();
+        wchar_t t[256] = {0};
+        HWND fh = GetForegroundWindow();
+        bool title_ok = (!fh || GetWindowTextW(fh, t, 256) <= 0);
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_uia_stamp && now - g_uia_stamp <= 2500 && !g_uia_text.empty() &&
-            g_uia_pid != 0 && g_uia_pid == fg) {
+            g_uia_pid != 0 && g_uia_pid == fg &&
+            (title_ok || g_uia_title.empty() || g_uia_title == t)) {
             text = g_uia_text;
             src = "uia";
             return true;
@@ -1284,22 +1326,39 @@ static int lua_kick_context(lua_State * L) {
     return 0;
 }
 
-// 前台进程切换检测（跨应用，2026-09-11）：插件版 lua 无焦点事件，经此
-// 让 processor 在跨应用切换后重置历史上文（对齐源码版 focus:switch
-// reset 语义——真机踩坑：切新文档首词用旧窗口历史冒充上文标 AI·历史）。
-// 比 pid 不比 HWND：同应用内对话框/多文档窗口不误清。进程级单例状态。
+// 编辑键/点击信号（2026-09-12 信号层统一）：失效 COM/UIA 快照 + kick
+// 延迟重读（语义见 ctxlink::edit_reset）。processor 在编辑键与点击检测
+// 分支调用——快照制的失效信号不再只有 commit。
+static int lua_edit_reset_context(lua_State * L) {
+    ctxlink::ensure_started();
+    ctxlink::edit_reset();
+    return 0;
+}
+
+// 前台窗口切换检测（跨应用，2026-09-11）：插件版 lua 无焦点事件，经此
+// 让 processor 在切换后重置历史上文（对齐源码版 focus:switch reset 语义
+// ——真机踩坑：切新文档首词用旧窗口历史冒充上文标 AI·历史）。
+// pid+HWND 双比对（2026-09-12）：仅比 pid 挡不住同应用多窗/多标签切换
+// （Chrome 双窗、Win11 记事本标签，pid 相同），旧窗历史照样冒充；HWND
+// 级对齐源码版 TSF prevFocus!=focus。候选窗不抢前台，打字中不误触。
 static int lua_fg_changed(lua_State * L) {
     static DWORD last_pid = 0;
-    DWORD cur = ctxlink::foreground_pid();
-    bool changed = (last_pid != 0 && cur != 0 && cur != last_pid);
-    last_pid = cur;
+    static HWND last_hwnd = nullptr;
+    DWORD cur_pid = ctxlink::foreground_pid();
+    HWND cur_hwnd = GetForegroundWindow();
+    bool changed = (last_pid != 0 && cur_pid != 0 &&
+                    (cur_pid != last_pid || cur_hwnd != last_hwnd));
+    last_pid = cur_pid;
+    last_hwnd = cur_hwnd;
     lua_pushboolean(L, changed ? 1 : 0);
     return 1;
 }
 
 // 鼠标点击检测（2026-09-11 深夜用户定案：鼠标移动主要靠点击检测——
 // 任何点击=光标可能移动→清历史上文兜底，不做例外排除——候选窗/工具
-// 栏点击也清，上下文宁可变短不可错；COM/UIA 真文通道不受影响）。
+// 栏点击也清，上下文宁可变短不可错）。2026-09-12 起 processor 在点击
+// 分支同时调 edit_reset_context 失效快照+重读（真文快照也是旧时刻的，
+// 点击移光标后同样冒充）。
 // GetAsyncKeyState LSB=自本进程上次查询以来按下过，专为轮询设计；
 // 首次调用建立基线防进程历史点击误报。
 static int lua_click_happened(lua_State * L) {
@@ -1323,6 +1382,7 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "prepare") == 0)   lua_pushcfunction(L, lua_prepare);
     else if (strcmp(key, "llm_context") == 0)    lua_pushcfunction(L, lua_llm_context);
     else if (strcmp(key, "kick_context") == 0)   lua_pushcfunction(L, lua_kick_context);
+    else if (strcmp(key, "edit_reset_context") == 0) lua_pushcfunction(L, lua_edit_reset_context);
     else if (strcmp(key, "fg_changed") == 0)     lua_pushcfunction(L, lua_fg_changed);
     else if (strcmp(key, "click_happened") == 0) lua_pushcfunction(L, lua_click_happened);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
@@ -1377,6 +1437,9 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
 
     lua_pushcfunction(L, lua_kick_context);
     lua_setfield(L, -2, "kick_context");
+
+    lua_pushcfunction(L, lua_edit_reset_context);
+    lua_setfield(L, -2, "edit_reset_context");
 
     lua_pushcfunction(L, lua_fg_changed);
     lua_setfield(L, -2, "fg_changed");

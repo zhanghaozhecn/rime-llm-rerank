@@ -33,11 +33,14 @@ local function is_nav_ish_key(k)
 end
 
 -- 编辑位置变化键: 退格/删除 (删词) + 导航键 (光标移动/滚动) + 回车 (换行)
+-- + Ctrl+z/y/v/x (撤销/重做/粘贴/剪切——改变光标前文本, 2026-09-12 信号层
+-- 统一补入; 字符类含大写形态: Shift 按下时 keysym 为大写)
 -- 这些键使会话上屏词序列不再代表光标前上文 → 上屏历史上文重置为空
 local function is_edit_key(k)
     if k == "BackSpace" or k == "Delete"
-        or k == "Control+BackSpace" or k == "Control+Delete"
-        or is_nav_ish_key(k) then
+       or k == "Control+BackSpace" or k == "Control+Delete"
+       or k:match("^Control%+[zyvxZYVX]$")
+       or is_nav_ish_key(k) then
         return true
     end
     return false
@@ -202,11 +205,17 @@ local function processor(key, env)
     end
     -- 鼠标点击检测（2026-09-11 深夜用户定案：任何点击=光标可能移动→
     -- 清历史上文兜底，不做例外排除——候选窗/工具栏点击也清，上下文
-    -- 宁可变短不可错；COM/UIA 真文通道不受影响，只影响兜底）
+    -- 宁可变短不可错；2026-09-12 起同时失效 COM/UIA 快照+重读——真文
+    -- 快照也是旧时刻的，点击移光标后同样冒充）
     if llm_prep and llm_prep.click_happened and llm_prep.click_happened() then
         local ch0 = env.engine.context.commit_history
         if ch0 then commit_base = #ch0:to_table() end
         reset_history()
+        -- 点击候选窗选词场景：commit kick 刚刷新的正确快照会被废，但
+        -- kick 50ms 后读回同样正确的文本（点击已处理完、含新上屏词），自愈
+        if llm_prep.edit_reset_context then
+            pcall(llm_prep.edit_reset_context)
+        end
     end
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
@@ -256,10 +265,16 @@ local function processor(key, env)
         reset_history()
         -- 编辑键: 当前 commit_history 位置记为基座——旧词永久忽略
         -- (librime lua 无法清 commit_history, 旧词留在引擎里;
-        -- 退格会被引擎清空 commit_history → 同步段检测缩短自动重置基座)
+        --  退格会被引擎清空 commit_history → 同步段检测缩短自动重置基座)
         commit_base = #ch:to_table()
         -- 编辑后重打相同词 (ctx+input 相同) 必须重新推理: 清空 filter 结果缓存
         _G.llm_filter_cache = nil
+        -- 2026-09-12 信号层统一: COM/UIA 快照失效 + kick 延迟重读(~50ms)——
+        -- 退格/导航/撤销/粘贴后旧快照不再 2.5s 新鲜窗内冒充真文; 打首词
+        -- (人手 >300ms) 时新快照已就绪, 首词即有正确 AI·UIA/COM 上文
+        if llm_prep and llm_prep.edit_reset_context then
+            pcall(llm_prep.edit_reset_context)
+        end
         if sc:get_bool("llm_rerank/debug_fusion") then
             pcall(function()
                 local f = io.open(rime_api.get_user_data_dir()
