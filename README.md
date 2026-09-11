@@ -95,11 +95,13 @@ engine:
 
 3. 右键小狼毫 → **重新部署**
 
-LLM 选中的候选显示 `AI` 标记。事件日志（每行：`时间|计数|编码|候选列表|上文|LLM结果|延迟ms|上文来源`）：
+LLM 选中的候选显示来源徽章：`AI·COM`（WPS 文字/演示的文档真文，经 COM 文档模型读取——含打开旧文档的既有内容）、`AI·UIA`（记事本/浏览器/VSCode 等现代应用的 UIA TextPattern 光标前文）、`AI·历史`（本会话上屏记录兜底）。上文来源由后台线程自动判定（前台窗口类型 + COM 附着成败 + 来源进程校验），跨应用切换自动重置，无需配置。事件日志（每行：`时间|计数|编码|候选列表|上文|LLM结果|延迟ms|上文来源`）：
 
 ```powershell
 Get-Content "$env:APPDATA\Rime\rime_llm_events.txt" -Tail 5
 ```
+
+> WPS 表格单元格编辑态为 COM 盲区（Office 系通病：编辑态对象模型不可见），落 UIA/历史兜底——已知边界。完整实验记录见源码版仓库研究文档（wps-context-investigation.md 十一~十五节）。
 
 ## 配置参数
 
@@ -114,6 +116,7 @@ llm_rerank:
   # expected_length_weight: 0.2 # 适用于双拼等两码出一字的方案：当 `候选词字数=编码数÷2` 或 `候选词字数=(编码数-1)÷2` 时，此候选词在融合分上获得加成。0=关闭；冷启动标定值 0.2
   # freq_beta: 1.5    # 用户词频对数融合系数 (0=关闭): fused = LLM分 + β·log(1+eff)
   # cpu_cores: 4      # 可选。CPU 线程数，默认 4（=GGML 默认）。bench_threads.exe 实测后自行调整
+  # com_context: true # 可选。三层光标上文旁路（COM/UIA），默认 true；false=仅用上屏历史
   # model_path: ""     # 可选。模型路径，默认内置 Qwen3.5-0.8B Q4_K_M。换模型只需改此处
   enabled: true        # true=启用 LLM 重排 | false=关闭（不加载 DLL 不推理）
 ```
@@ -129,6 +132,7 @@ llm_rerank:
 | `max_tokens` | 10 | 截取的上文 token 数（10→17 仅 +1.1 pp 但 CPU 延迟翻倍，10 为性价比最优点） |
 | `max_candidates` | 5 | 并行评分候选数（5→9 仅 +0.5 pp 但延迟翻倍，5 为最佳平衡） |
 | `cpu_cores` | 4 | CPU 线程数（固定，无运行时动态调整）。**设备实测**：运行 `bin/bench_threads.exe` 查看延迟表后自行填入 |
+| `com_context` | true | 三层光标上文旁路（2026-09-11）：`true` 启用 COM（WPS 文字/演示）+ UIA（通用现代应用）自动来源判定；`false` 仅用上屏历史（旧版行为）。**注意**：WeaselServer 必须以普通权限运行——提权进程读 WPS 的 COM 对象会被 Windows 安全边界拒绝（安装器已改为 explorer 代启普通权限拉起服务） |
 | `debug_fusion` | false | 诊断模式（2026-09-03）：每次评分逐候选记录 CE/eff/词频加成/词长加成/最终键值与名次变化，提交时记录 eff 前后值与 tick，写入 RIME 用户目录 `rime_llm_debug.txt`（配合 `Get-Content -Wait` 实时观测）。仅排障时开启，日志持续增长 |
 | `model_path` | (内置默认 = 用户文件夹根) | 模型路径。换模型只需设置此项，改后下一次按键自动卸载旧模型并重载新路径 |
 
