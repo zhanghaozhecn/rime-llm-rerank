@@ -61,6 +61,13 @@ static int          g_n_ctx           = 128; // KV: 11 seqs × (ctx 10 + cand 2)
                                               //  真机 DLL 日志实证）
 static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker seq
 
+// CE 位置权重（2026-09-16 采纳，首项归一规范形；与 (1.15,1.30,0.70) 排序等价、
+// ce2 判别力最强（同时携带上下文契合 + 词内连贯），ce3 已深入词内部、上下文
+// 影响衰减属噪声源降权；4+ token 词只算前三项——外推证伪删除（λ 0→1 端到端
+// 命中率单调递减，λ=0 最优；旧 λ=0.6 标定用"与全量 CE 一致率"口径，与端
+// 指标分道扬镳）。胜出变体 conf 91.82→92.13（+0.31pp，平台非尖峰）。
+static constexpr double kCeW1 = 1.0, kCeW2 = 1.13, kCeW3 = 0.61;
+
 // ============================================================
 // 模型状态
 // ============================================================
@@ -1009,7 +1016,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     double lse0;
     logits_normalizer(ctx_logits.data(), vs, m0, lse0);
     for (int i = 0; i < n_cands; i++) {
-        ce_sum[i] = ce_target(ctx_logits.data(), cands[i][0], m0, lse0);
+        ce_sum[i] = kCeW1 * ce_target(ctx_logits.data(), cands[i][0], m0, lse0);
     }
     auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
     double ms_ce1 =
@@ -1040,7 +1047,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
             for (int s = 0; s < M; s++) {
                 int ci = idx2[s];
                 float* l = llama_get_logits_ith(g_ctx, s);
-                if (l) ce_sum[ci] += cross_entropy(l, vs, cands[ci][1]);
+                if (l) ce_sum[ci] += kCeW2 * cross_entropy(l, vs, cands[ci][1]);
                 else   ce_sum[ci] = -1e10;
             }
         } else {
@@ -1075,7 +1082,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
             for (int s = 0; s < K; s++) {
                 int ci = idx3[s];
                 float* l = llama_get_logits_ith(g_ctx, s);
-                if (l) ce_sum[ci] += cross_entropy(l, vs, cands[ci][2]);
+                if (l) ce_sum[ci] += kCeW3 * cross_entropy(l, vs, cands[ci][2]);
                 else   ce_sum[ci] = -1e10;
             }
         } else {
@@ -1104,18 +1111,10 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
 
     // ---- 输出分数 ----
     auto ts_sc_0 = std::chrono::high_resolution_clock::now();
-    // 4+ token 候选只算了前 3 项 CE: 截断让长词免掉尾部 (负的) CE → 长词被高估。
-    // 按平均 CE 外推缺失尾部 (λ=0.6, eval_long_cand 细扫 0.3-0.7:
-    // 真实尾部 CE/头部 CE 实测 mean 0.58(len4)/0.62(len5+), 0.5-0.7 平台
-    // ~94% 首选一致率, 0.6 方向平衡 up5/down5; 无额外 decode):
-    //   score = -ce_sum - (ce_sum/3) * (n_tokens-3) * 0.6
+    // 加权 CE 和取负（kCeW1/2/3 见配置区注释；4+ token 候选只算前三项，
+    // 尾部外推 2026-09-16 证伪删除：λ=0 全曲线最优，取消零损失）
     for (int i = 0; i < n_cands; i++) {
-        double score = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
-        if (score > -1e9 && (int)cands[i].size() > 3) {
-            double avg_ce = ce_sum[i] / 3.0;
-            score = -ce_sum[i] - avg_ce * ((int)cands[i].size() - 3) * 0.6;
-        }
-        scores_out[i] = score;
+        scores_out[i] = ce_sum[i] > -1e9 ? -ce_sum[i] : -1e10;
     }
 
     // 注意: prep 状态不消耗——同一 ctx 期间可重复命中
@@ -1127,7 +1126,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         std::chrono::duration<double, std::milli>(t_end - ts_sc_0).count();
     // 日志限频: 每 10 次记一次, 慢请求 (总耗时 > 100ms) 始终记录
     // 计时: wait=锁等待 S1=ctx decode(0 on prep) CE1=P(cand0|ctx)
-    //       KV=KV copy S2=decode cand0 S3=decode cand1 score=打分+外推
+    //       KV=KV copy S2=decode cand0 S3=decode cand1 score=加权求和
     if (++g_score_log_cnt % 10 == 1 || total_ms > 100)
         log_msg("score: wait=%.0fms S1=%.0fms CE1=%.0fms KV=%.0fms S2=%.0fms "
                 "S3=%.0fms score=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d",
