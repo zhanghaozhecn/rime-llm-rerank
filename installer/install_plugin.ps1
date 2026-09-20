@@ -403,7 +403,7 @@ function Run-InstallerGui {
   $form.MaximizeBox = $false
 
   $lblIntro = New-Object System.Windows.Forms.Label
-  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= 缺模型时从 ModelScope 下载（断点续传；目标 = 模型路径框，留空 = 默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。切换版本：重装小狼毫 + 恢复原始方案配置。"
+  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= 缺模型时从 ModelScope 下载（断点续传；目标 = 模型路径框，留空 = 默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。切换版本：重装小狼毫 + 跑另一版安装器（方案配置先剥后插，自动转换，无需恢复原始配置）。"
   $lblIntro.Location = New-Object System.Drawing.Point(15, 12)
   $lblIntro.Size = New-Object System.Drawing.Size(660, 40)
   $lblIntro.ForeColor = [System.Drawing.Color]::DimGray

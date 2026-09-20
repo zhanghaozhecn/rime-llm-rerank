@@ -6,7 +6,7 @@
 |------|------|
 | 首选率（10 tok / 5 候选） | **93.4%**（单字 96.8%） |
 | 感知延迟 | **~43 ms**（CPU，预解码后） |
-| 内存占用 | ~497 MB |
+| 常驻内存 | ~1 GB（模型加载后实测；模型权重 ~500 MB + 推理缓存） |
 | 模型 | Qwen3.5-0.8B Q4_K_M（508 MB，GGUF） |
 | 选重率 | 可降至原方案（字典序）的 **1/3** |
 | 依赖 | 零（纯本地 CPU 推理） |
@@ -15,46 +15,39 @@
 
 ---
 
-# 一、研究主要结论
+# 一、用户说明
 
-**方法**：对同码候选做 `argmax P(wᵢ | ctx)` 的交叉熵评分（只排序、不生成、编码无关、本地 CPU）。三项核心技术：
+## 插件版还是源码版？
 
-1. **分层并行解码**——所有候选共享同一段上文，上文只解码一次、首 token 同帧出分，N 候选 ≤ 3 次 `llama_decode`（朴素逐候选 274ms → 生产 43ms）。约束：每序列增量 1 token（Qwen3.5 的 SSM 跨序列干扰）。
-2. **预解码 + KV 代次机制**——commit 后异步预解码上文，按键时只算候选部分（感知延迟减半）；代次计数杜绝编辑流中旧缓存误用。
-3. **CE 位置权重**——前 3 token CE 按 (1.0, 1.13, 0.61) 加权求和；4+ 字候选只算前三项（尾部外推经 20k 样本端到端扫描证伪后删除：λ=0 全曲线最优）。
+两版功能等效（同引擎同模型），**二选一**；切换 = 重装小狼毫 + 运行另一版安装器（方案配置自动转换，无需手动还原）。
 
-**实验结论**：
-
-- 首选率 93.4%（10 tok / 5 cand，20000 样本）；单字 96.8%。tok 10→20 饱和、cand 5→9 仅 +0.5pp 但延迟翻倍——10/5 为性价比最优点。
-- 模型规模：2B 仅 +0.3pp 但延迟 3×、体积 2.6×——**0.8B 即最优**。
-- 词频对数融合 `freq_beta=1.5`（fused = LLM分 + β·log(1+eff)，eff 为 Rime 时间衰减计数）：本机打字真实窗回放事前口径较纯 LLM +0.4pp，词频无上限可翻盘（凸组合时代词频结构性封顶 0.25）。
-- GPU 版放弃（CUDA graph 重编译/省电波动/特定输入卡死）；模型能力上限 ~94.3%。
-
-完整研究文档（方法细节、tok×cand 全量扫参表、词频融合研究）在本地研究资料库 `D:\llm-rerank-research\`（评测工具链与语料同在其中）。
-
----
-
-# 二、用户说明
+| | 插件版（本仓库） | [源码版](https://github.com/zhanghaozhecn/rime-llm-ime) |
+|------|------|------|
+| 形态 | lua + DLL，跑在**官方小狼毫**上 | 源码级集成的整包（weasel + librime 改建） |
+| 安装 | 需先装官方小狼毫，再跑安装器四按钮 | 单个 setup.exe，全新机器一键 |
+| 光标上文 | COM + UIA + 历史（轮询快照） | TSF 光标采集 + COM（事件驱动，含导航键重采） |
+| 适合 | 想保留官方小狼毫、动手最少 | 想要 TSF 级上文 / 全新机器最简安装 |
 
 ## 前置条件
 
+- Windows 10 或更高（更早版本未验证）
 - 小狼毫（Weasel）0.17.x 已安装，且 `rime.dll` 为官方原版（含 Lua 支持）
 - 使用四码定长方案（拼读双拼、五笔、郑码、仓颉等）
-- 下载模型 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500 MB），默认路径 `%APPDATA%\Rime\`（RIME 用户文件夹；自定义位置用 `model_path` 指定）
+- 磁盘约 600 MB：模型 `Qwen3.5-0.8B-Q4_K_M.gguf`（508 MB，默认放 `%APPDATA%\Rime\`，RIME 用户文件夹；自定义位置用 `model_path` 指定，安装器可代下载）+ 插件数 MB
 
 ## 一键部署（推荐）
 
 **插件版安装器**（本仓库 `installer\` 目录；源码版 2026-08-27 起改用 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的 setup.exe 安装包，不再带 PS 安装器）。界面为**四个按钮**：**复制文件**（停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务）、**下载模型**（ModelScope 断点续传，目标 = 模型路径框，留空 = 默认）与**方案配置加 / 去 LLM**（只改选中的方案文件，幂等，完成后自动重新部署）；模型路径输入框留空 = 默认 `%APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf`（2026-08-31 澄清：RIME 用户文件夹根），填写则写入配置生效行。不碰注册表。
 
-**前提**：已安装官方小狼毫；方案配置已含 LLM 组件行（拼读双拼方案自带——`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`；其他方案参照"手动安装"第三步自行添加）。
+**前提**：已安装官方小狼毫。方案组件行**无需预先准备**——第 6 步"方案配置加 LLM"会自动幂等插入（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）；手动添加参照"手动安装"第三步。
 
 1. `git clone` 本仓库到目标电脑（或下载仓库 zip 解压——插件版文件在 `user\`，已入库）
-2. **双击 `installer\install_plugin.bat`**（自动请求管理员权限）
+2. **双击 `installer\install_plugin.bat`**（自动请求管理员权限；SmartScreen 弹"Windows 已保护你的电脑"时选"更多信息 → 仍要运行"——安装器未做代码签名）
 3. 选择方案文件（下拉列出 `%APPDATA%\Rime\*.schema.yaml`，可浏览外部 yaml 自动拷入）；模型路径留空 = 默认
 4. 缺模型时点击 **下载模型**：从 ModelScope 下载到模型路径（约 500MB，断点续传——中断/失败后重新点击自动续传）
 5. 点击 **复制文件**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → 启服务
 6. 点击 **方案配置加 LLM**：schema 幂等插入组件行（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）→ 自动重新部署（**方案配置去 LLM** 按钮为逆操作，剥离这些行/节）
-7. 验证：首选候选 comment 出现 `AI` 标记；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
+7. 验证：打满 4 码，首选候选 comment 出现 `AI·` 徽章（`AI·COM` / `AI·UIA` / `AI·历史`，上文来源自动判定）；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
 
 **切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 源码版跑 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的安装包 / 插件版跑本仓库安装器（其**方案配置加 LLM** 会先剥离另一版组件行再插入，跨版自动转换，无需恢复原始方案配置）。
 
@@ -175,16 +168,35 @@ bin/bench_threads.exe [模型路径]
 
 ## 关闭与卸载
 
-- **临时关闭**：把安装目录 `rime_llm*.dll` 改后缀（如 `.dll.bak`），重新部署即恢复字典序；或 schema 中 `enabled: false`（不加载 DLL 不推理）。LLM 插件仅占 ~497 MB 内存，对现代电脑影响不大，建议常驻。
-- **完全卸载**：GUI 安装器"还原插件版"（自动剥离 schema 组件与配置节 + 重新部署，不删文件）；残留文件手动清理：安装目录 `rime_llm*.dll` + `llama.dll` + `ggml*.dll`、`%APPDATA%\Rime\lua\` 下两个 lua。
+- **临时关闭**：schema 中 `enabled: false`（不加载 DLL 不推理，改后下一次按键生效）；或把安装目录 `rime_llm.dll` 改后缀（如 `.dll.bak`）后重新部署，恢复字典序。LLM 常驻内存 ~1 GB，对现代电脑影响不大，建议常开。
+- **完全卸载**：GUI 安装器"方案配置去 LLM"（自动剥离 schema 组件与配置节 + 重新部署），再手动删除安装目录 `rime_llm.dll` 与 `%APPDATA%\Rime\lua\` 下两个 lua（llm_filter.lua / llm_processor.lua）。
 
 ## 常见问题
 
-- **Q: 装了没效果？** 确认 ① schema 组件位置正确（filter 在 uniquifier 后、固顶 filter 前）② `enabled: true` ③ 重新部署过 ④ 模型路径存在。打满 4 码后首选候选 comment 应有 `AI` 标记。
+- **Q: 装了没效果？** 确认 ① schema 组件位置正确（filter 在 uniquifier 后、固顶 filter 前）② `enabled: true` ③ 重新部署过 ④ 模型路径存在。打满 4 码后首选候选 comment 应有 `AI·` 徽章。
 - **Q: 候选变乱序/被顶掉？** 检查固顶词 filter（pin_fix_filter 等）是否在 `lua_filter@*llm_filter` **之后**——先固顶后重排，固顶词会被 LLM 顶掉。
 - **Q: 每击键延迟明显？** 运行 `bin/bench_threads.exe` 实测线程数；确认 `max_tokens`/`max_candidates` 未调高；确认预解码生效（事件日志延迟应 ~36 ms 而非 ~80 ms）。
 - **Q: 编辑器里插入的英文/数字算上文吗？** 算。上文中允许字母存在，仅去空白；外挂无法感知光标前完整文本，英文数字是合法上文（见代码注释）。
 - **Q: 日志在哪？** `%APPDATA%\Rime\rime_llm_events.txt`（lua 事件，含上文来源）；`%APPDATA%\Rime\rime_llm_log.txt`（C++ 推理日志，限频记录）。
+
+---
+
+# 二、研究主要结论
+
+**方法**：对同码候选做 `argmax P(wᵢ | ctx)` 的交叉熵评分（只排序、不生成、编码无关、本地 CPU）。三项核心技术：
+
+1. **分层并行解码**——所有候选共享同一段上文，上文只解码一次、首 token 同帧出分，N 候选 ≤ 3 次 `llama_decode`（朴素逐候选 274ms → 生产 43ms）。约束：每序列增量 1 token（Qwen3.5 的 SSM 跨序列干扰）。
+2. **预解码 + KV 代次机制**——commit 后异步预解码上文，按键时只算候选部分（感知延迟减半）；代次计数杜绝编辑流中旧缓存误用。
+3. **CE 位置权重**——前 3 token CE 按 (1.0, 1.13, 0.61) 加权求和；4+ 字候选只算前三项（尾部外推经 20k 样本端到端扫描证伪后删除：λ=0 全曲线最优）。
+
+**实验结论**：
+
+- 首选率 93.4%（10 tok / 5 cand，20000 样本）；单字 96.8%。tok 10→20 饱和、cand 5→9 仅 +0.5pp 但延迟翻倍——10/5 为性价比最优点。
+- 模型规模：2B 仅 +0.3pp 但延迟 3×、体积 2.6×——**0.8B 即最优**。
+- 词频对数融合 `freq_beta=1.5`（fused = LLM分 + β·log(1+eff)，eff 为 Rime 时间衰减计数）：本机打字真实窗回放事前口径较纯 LLM +0.4pp，词频无上限可翻盘（凸组合时代词频结构性封顶 0.25）。
+- GPU 版放弃（CUDA graph 重编译/省电波动/特定输入卡死）；模型能力上限 ~94.3%。
+
+完整研究文档（方法细节、tok×cand 全量扫参表、词频融合研究）在本地研究资料库 `D:\llm-rerank-research\`（评测工具链与语料同在其中）。
 
 ---
 
@@ -212,11 +224,10 @@ C++ rime_llm.dll: llama.cpp C API, Lua 5.4 嵌入 (luaopen_rime_llm)
 
 ```
 rime-llm-rerank\
-├── user\                      # 发布安装文件
+├── user\                      # 发布安装文件（共 3 个；llama/ggml 已静态链接进 DLL）
 │   ├── llm_filter.lua          #   候选重排 filter（打分/缓存/日志/AI 标记）
 │   ├── llm_processor.lua       #   上屏历史收集 + 预解码 processor
-│   ├── rime_llm.dll           #   预编译插件
-│   └── *.dll                  #   llama.cpp 依赖 DLL（CPU 版）
+│   └── rime_llm.dll           #   预编译插件（单文件，无运行时依赖 DLL）
 ├── cpp\                       # 源码（CMakeLists.txt 构建）
 │   ├── rime_llm.cpp           #   生产插件（评分核心，坑见注释）
 │   ├── bench_threads.cpp      #   CPU 线程数测定（bin\ 预编译版源码）
