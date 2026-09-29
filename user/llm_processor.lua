@@ -7,7 +7,8 @@ local prev_hist = {}     -- 上次 history 快照
 local history = {}       -- 当前上屏词序列
 local commit_base = 0    -- 上文基座: 只认 commit_history 中 base 之后的新词
                          -- (编辑键后旧词永久忽略——librime 无法清 commit_history)
-local com_ctx_enabled = true  -- llm_rerank/com_context（默认 true，每键刷新）
+local com_ctx_enabled = true  -- COM/UIA 光标上文旁路总开关（2026-09-29 定案：
+                              -- 不做配置项、无关闭态；排障直接改此值）
 local SPLIT = "|"
 local TAB = "\t"
 local BSP = "←"
@@ -177,7 +178,6 @@ local function processor(key, env)
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
     local enabled = sc:get_bool("llm_rerank/enabled") or false
-    com_ctx_enabled = sc:get_bool("llm_rerank/com_context") ~= false
     if not enabled then
         llm_prep = nil  -- 释放已加载的 DLL 引用
     else
@@ -396,8 +396,8 @@ local function get_context()
     -- 三层上文（2026-09-10 全功能）：COM（Word/WPS 文字文档模型）→
     -- UIA TextPattern（通用现代应用）→ 上屏历史（兜底）。前两层由 DLL
     -- llm_context() 完成（前台门控 + 快照新鲜度 + 来源进程校验都在 C++，
-    -- 按键路径零阻塞）；失败/关闭回落历史。com_context=false 仅用历史
-    -- （与源码版同名参数语义一致，热切换=下一键生效）
+    -- 按键路径零阻塞）；失败回落历史。旁路无常关配置（2026-09-29 定案删
+    -- com_context 配置项；排障改文件头 com_ctx_enabled 重部署）
     if com_ctx_enabled and llm_prep and llm_prep.llm_context then
         local ok, t, src = pcall(llm_prep.llm_context)
         if ok and type(t) == "string" and #t > 0 then

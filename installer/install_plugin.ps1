@@ -2,7 +2,12 @@
 # 历史：原拆分 install_plugin.ps1（入口壳）+ common.ps1（两版共用逻辑）是为
 # 跨仓同步——2026-08-27 源码版改用 setup.exe 安装包后共用已名存实亡，
 # 2026-09-04 按用户定案合并为本仓库单文件，源码版动作与双版分支随之删除。
-# GUI：双击 install_plugin.bat（提权）→ 复制文件 / 下载模型 / 方案配置加·去 LLM（四按钮）
+# GUI：双击 install_plugin.bat（提权）→ TabControl 两页：
+#   『安装』页 = 复制文件 / 下载模型 / 方案配置加·去 LLM（四按钮）+ 日志
+#   『参数配置』页 = 源码版 WeaselLLMSetup 界面同步（2026-09-29）：源码版同款
+#     分组参数编辑器（触发条件/推理规模/候选排序融合公式行/排障），读写选中
+#     方案 llm_rerank 节，保存后自动重新部署（插件版参数在 schema 节、改后
+#     需部署生效——与源码版 llm_rerank.yaml 热重载不同）
 # CLI：-CliAction status|install|copy-files|schema-add|schema-remove|download-model
 #      -SchemaName pdsp.schema.yaml -ModelPath d:\gguf_models\xxx.gguf（可选，写入配置）
 # 设计（2026-08-25 定稿）：安装器只做 文件操作 + schema 加/去 LLM 组件行（幂等）。
@@ -95,6 +100,9 @@ function Clean-OldBinaries([string]$dir, $Log) {
 }
 
 function Invoke-Redeploy([string]$installDir, $Log) {
+  # 测试钩子：沙箱 GUI/CLI 自动化静默跳过（机制同源码版
+  # WEASEL_LLM_SETUP_NO_REDEPLOY；测试子进程继承环境变量一并生效）
+  if ($env:LLM_INSTALLER_NO_REDEPLOY) { & $Log "  （测试模式：跳过重新部署）"; return }
   $deployer = Join-Path $installDir "WeaselDeployer.exe"
   if (Test-Path $deployer) {
     & $Log "  触发重新部署（WeaselDeployer /deploy）…"
@@ -119,15 +127,131 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 function Read-Schema([string]$path) { [IO.File]::ReadAllLines($path, [Text.Encoding]::UTF8) }
 function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $lines, $Utf8NoBom) }
 
+# ── 参数编辑（『参数配置』页 + schema-add 参数保留共用）──────────
+# 键集与默认值 = user\llm_filter.lua / llm_processor.lua 的 cfg；
+# model_path 不在参数表（安装页模型路径框 / 加 LLM 写入），更新节时原样保留。
+# com_context 已删（2026-09-29 定案：旁路无常关配置，排障改 llm_processor.lua
+# 头部 com_ctx_enabled）——方案里残留的旧行在 GUI 保存/重跑加 LLM 重建节时剥除。
+$PARAM_DEFAULTS = [ordered]@{
+  enabled = $false
+  min_code_len = 4; max_code_len = 0; min_tokens = 1
+  max_tokens = 10; max_candidates = 5; cpu_cores = 4
+  freq_beta = 1.5; expected_length_weight = 0.2; debug_fusion = $false
+}
+$PARAM_INT_KEYS  = @("min_code_len","max_code_len","min_tokens","max_tokens","max_candidates","cpu_cores")
+$PARAM_DBL_KEYS  = @("freq_beta","expected_length_weight")
+$PARAM_BOOL_KEYS = @("debug_fusion")
+
+function Format-F2([double]$x) {
+  [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:F2}", $x)
+}
+function Convert-ParamDouble([string]$s, [ref]$out) {
+  [double]::TryParse($s, [System.Globalization.NumberStyles]::Float,
+                     [System.Globalization.CultureInfo]::InvariantCulture, $out)
+}
+
+# 读方案 llm_rerank 节的裸 key:value（注释行/行尾注释剔除、引号去壳；
+# 无节返回 $null）。值一律字符串，类型解析由调用方按键做。
+# 注意：键必须在行匹配后立刻取局部变量——后面的引号判断 -match 会覆盖
+# $Matches（且该正则无捕获组，$Matches[1] 变 null → 哈希索引抛错，
+# 2026-09-29 沙箱测试 trace 抓出：带引号 model_path 一行即炸整节读取）
+function Read-LlmParams([string]$schemaPath) {
+  $inCfg = $false; $p = $null
+  foreach ($ln in (Read-Schema $schemaPath)) {
+    if (-not $inCfg) {
+      if ($ln -match '^llm_rerank:') { $inCfg = $true; $p = @{} }
+      continue
+    }
+    if ($ln -match '^\S') { break }
+    if ($ln -match '^\s+([A-Za-z_][A-Za-z0-9_]*):(.*)$') {
+      $key = $Matches[1]
+      $v = $Matches[2].Trim()
+      $v = $v -replace '\s+#.*$', ''
+      if ($v -match '^".*"$') { $v = $v.Trim('"') }
+      if ($v -ne '') { $p[$key] = $v }
+    }
+  }
+  return $p
+}
+
+# 用参数表重写 llm_rerank 节（原位替换，组件行不动；节必须已存在）。
+# modelPath 非空写生效行，空写注释占位（与 Get-LlmCfgLines 同款）。
+function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPath) {
+  $lines = Read-Schema $schemaPath
+  $start = -1
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^llm_rerank:') { $start = $i; break }
+  }
+  if ($start -lt 0) { throw "方案内没有 llm_rerank 配置节——请先执行『方案配置加 LLM』" }
+  $end = $start + 1
+  while ($end -lt $lines.Count -and $lines[$end] -notmatch '^\S') { $end++ }
+  # 注意：@() 数组元素里 "str" + $(if ...) 会被拆成两个元素（实测，2026-09-29
+  # 沙箱测试抓出：enabled: 与 false 分家两行）——拼接一律用字符串内插 $()
+  $sec = @(
+    "llm_rerank:",
+    "  enabled: $(if ($p.enabled) { 'true' } else { 'false' })",
+    "  min_code_len: $($p.min_code_len)",
+    "  max_code_len: $($p.max_code_len) # 0=不限制",
+    "  min_tokens: $($p.min_tokens)",
+    "  max_tokens: $($p.max_tokens)",
+    "  max_candidates: $($p.max_candidates)",
+    "  cpu_cores: $($p.cpu_cores)",
+    "  freq_beta: $(Format-F2 ([double]$p.freq_beta))",
+    "  expected_length_weight: $(Format-F2 ([double]$p.expected_length_weight))",
+    "  debug_fusion: $(if ($p.debug_fusion) { 'true' } else { 'false' })"
+  )
+  if ($modelPath) { $sec += "  model_path: " + (Convert-ToYamlPath $modelPath) }
+  else { $sec += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen3.5-0.8B-Q4_K_M.gguf>" }
+  $out = @()
+  if ($start -gt 0) { $out += $lines[0..($start - 1)] }
+  $out += $sec
+  if ($end -lt $lines.Count) { $out += $lines[$end..($lines.Count - 1)] }
+  Write-Schema $schemaPath $out
+}
+
+# prior（Read-LlmParams 结果）按类型并入默认表；enabled 不并入——
+# 加 LLM 视为重新启用意图，节内恒写 true（关闭用参数页/去 LLM）
+function Merge-LlmParams($prior) {
+  $d = @{}
+  foreach ($k in $PARAM_DEFAULTS.Keys) { $d[$k] = $PARAM_DEFAULTS[$k] }
+  if ($prior) {
+    foreach ($k in $PARAM_INT_KEYS) {
+      if ($prior.ContainsKey($k)) {
+        $n = 0
+        if ([int]::TryParse($prior[$k], [ref]$n)) { $d[$k] = $n }
+      }
+    }
+    foreach ($k in $PARAM_DBL_KEYS) {
+      if ($prior.ContainsKey($k)) {
+        $x = 0.0
+        if (Convert-ParamDouble $prior[$k] ([ref]$x)) { $d[$k] = $x }
+      }
+    }
+    foreach ($k in $PARAM_BOOL_KEYS) {
+      if ($prior.ContainsKey($k)) { $d[$k] = ($prior[$k] -ieq "true") }
+    }
+  }
+  return $d
+}
+
 # llm_rerank 配置节；modelPath 非空时写为生效行（反斜杠→正斜杠，含空格则加引号），
-# 留空则保持注释示例（运行时默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）
-function Get-LlmCfgLines([string]$modelPath) {
+# 留空则保持注释示例（运行时默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）。
+# prior = 重跑加 LLM 时方案里已有的参数（Read-LlmParams 结果）——先剥后插
+# 重建节时逐键保留，防止重跑把用户自定义参数重置回默认（model_path 同思路）。
+function Get-LlmCfgLines([string]$modelPath, $prior) {
+  $d = Merge-LlmParams $prior
   $l = @(
-    "", "llm_rerank:", "  enabled: true", "  min_code_len: 4",
-    "  # max_code_len: 0",
-    "  # expected_length_weight: 0.2", "  # freq_beta: 1.5",
-    "  # min_tokens: 1", "  # max_tokens: 10", "  # max_candidates: 5",
-    "  # cpu_cores: 4"
+    "", "llm_rerank:",
+    "  enabled: true",
+    "  min_code_len: $($d.min_code_len)",
+    "  max_code_len: $($d.max_code_len) # 0=不限制",
+    "  min_tokens: $($d.min_tokens)",
+    "  max_tokens: $($d.max_tokens)",
+    "  max_candidates: $($d.max_candidates)",
+    "  cpu_cores: $($d.cpu_cores)",
+    "  freq_beta: $(Format-F2 ([double]$d.freq_beta))",
+    "  expected_length_weight: $(Format-F2 ([double]$d.expected_length_weight))",
+    "  debug_fusion: $(if ($d.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
   else { $l += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen3.5-0.8B-Q4_K_M.gguf>" }
@@ -153,7 +277,8 @@ function Add-ModelPathToExisting([System.Collections.Generic.List[string]]$out, 
 }
 
 # 插件版组件行：processors 最前 lua_processor + uniquifier 后 lua_filter + llm_rerank 节
-function Edit-SchemaPlugin([string]$schemaPath, [string]$modelPath, $Log) {
+# prior = 方案中已有参数（Read-LlmParams 结果），重建配置节时逐键保留
+function Edit-SchemaPlugin([string]$schemaPath, [string]$modelPath, $Log, $prior) {
   $lines = Read-Schema $schemaPath
   if (($lines | Where-Object { $_ -match '^\s*-\s+llm_filter\s*$' }).Count -gt 0) {
     throw "方案里已有源码版组件（- llm_filter）——插件版与源码版二选一，请先重装小狼毫并恢复原始方案配置"
@@ -194,7 +319,7 @@ function Edit-SchemaPlugin([string]$schemaPath, [string]$modelPath, $Log) {
     else { throw "未找到 filters 块或 uniquifier，无法插入组件" }
   }
   if (-not $hasCfg) {
-    Get-LlmCfgLines $modelPath | ForEach-Object { [void]$out.Add($_) }
+    Get-LlmCfgLines $modelPath $prior | ForEach-Object { [void]$out.Add($_) }
     & $Log "  + llm_rerank: 配置节（enabled: true）"; $changed = $true
   } elseif ($modelPath) {
     if (Add-ModelPathToExisting $out $modelPath $Log) { $changed = $true }
@@ -287,12 +412,14 @@ function Schema-AddAction([string]$schemaName, [string]$modelPath, $Log) {
   & $Log ("  方案: " + $schemaPath)
   # 先剥离再添加（2026-08-26 定案）：无论原状是无 LLM / 本版 / 另一版配置，
   # 先统一剥净再全新插入（另一版组件行被 Edit-SchemaRemove 一并剥掉，无冲突）。
-  # 模型路径本次未填时，保留方案中原有的生效 model_path（剥离会删整个节）
+  # 模型路径本次未填时，保留方案中原有的生效 model_path（剥离会删整个节）；
+  # 参数同理——先读后剥，重建节时逐键保留（2026-09-29 参数页上线，防重跑重置）
   $keepModel = Get-ActiveModelPath $schemaPath
+  $prior = Read-LlmParams $schemaPath
   Edit-SchemaRemove $schemaPath $Log
   $useModel = if ($modelPath) { $modelPath } else { $keepModel }
   if ($useModel) { & $Log ("  模型: " + $useModel) }
-  Edit-SchemaPlugin $schemaPath $useModel $Log
+  Edit-SchemaPlugin $schemaPath $useModel $Log $prior
   $installDir = Find-WeaselDir
   if ($installDir) { Invoke-Redeploy $installDir $Log }
   else { & $Log "  [警告] 未找到小狼毫目录，跳过自动重新部署（请托盘手动重新部署）" }
@@ -394,86 +521,213 @@ function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$mode
 }
 
 # ── GUI 框架（含全部历史修复：防弹窗重入/多信号判定/管理员警告）──
+# 2026-09-29 改版（源码版 WeaselLLMSetup 界面同步）：TabControl 两页，
+# 方案文件下拉为两页共用。布局铁律（源码版叠字事故同款）：任何两控件
+# 矩形不得相交；Label 一律 AutoSize=false 固定宽度。
 function Run-InstallerGui {
   $form = New-Object System.Windows.Forms.Form
   $form.Text = "LLM 重排安装器 — 插件版"
-  $form.Size = New-Object System.Drawing.Size(700, 400)
+  $form.ClientSize = New-Object System.Drawing.Size(684, 514)
   $form.StartPosition = "CenterScreen"
   $form.FormBorderStyle = "FixedDialog"
   $form.MaximizeBox = $false
+  $fontBold = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Bold)
 
-  $lblIntro = New-Object System.Windows.Forms.Label
-  $lblIntro.Text = "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= 缺模型时从 ModelScope 下载（断点续传；目标 = 模型路径框，留空 = 默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。切换版本：重装小狼毫 + 跑另一版安装器（方案配置先剥后插，自动转换，无需恢复原始配置）。"
-  $lblIntro.Location = New-Object System.Drawing.Point(15, 12)
-  $lblIntro.Size = New-Object System.Drawing.Size(660, 40)
+  # 控件工厂：AutoSize=false —— Label 默认宽度会被缩到文字宽，
+  # 破坏公式行"+"右对齐列与编辑框同列对齐（固定宽度才可核对不相交）
+  function Add-Ctl([string]$type, [string]$text, $parent, $x, $y, $w, $h) {
+    $c = New-Object ("System.Windows.Forms." + $type)
+    $c.Text = $text
+    $c.Location = New-Object System.Drawing.Point($x, $y)
+    $c.AutoSize = $false
+    $c.Size = New-Object System.Drawing.Size($w, $h)
+    $parent.Controls.Add($c)
+    return $c
+  }
+  function Add-Hdr($parent, [string]$text, $x, $y, $w) {
+    $c = Add-Ctl "Label" $text $parent $x $y $w 18
+    $c.Font = $fontBold
+    return $c
+  }
+
+  # ── 共用顶栏：方案文件（『安装』『参数配置』两页共用上下文）──
+  [void](Add-Ctl "Label" "方案文件:" $form 12 16 70 20)
+  $cmbSchema = Add-Ctl "ComboBox" "" $form 85 13 400 21
+  $cmbSchema.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+  $btnRefresh = Add-Ctl "Button" "刷新" $form 492 12 80 23
+  $btnBrowse = Add-Ctl "Button" "浏览..." $form 578 12 94 23
+
+  $tabs = New-Object System.Windows.Forms.TabControl
+  $tabs.Location = New-Object System.Drawing.Point(8, 42)
+  $tabs.Size = New-Object System.Drawing.Size(668, 464)
+  $tabInstall = New-Object System.Windows.Forms.TabPage("安装")
+  $tabParams = New-Object System.Windows.Forms.TabPage("参数配置")
+  [void]$tabs.TabPages.Add($tabInstall)
+  [void]$tabs.TabPages.Add($tabParams)
+  $form.Controls.Add($tabs)
+
+  # ── 『安装』页：原四按钮动作流 ────────────────
+  $lblIntro = Add-Ctl "Label" "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= ModelScope 断点续传（目标 = 模型路径框，留空 = 默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。参数在『参数配置』页写入选中方案；切换版本 = 重装小狼毫 + 跑另一版安装器（方案配置先剥后插，自动转换）。" $tabInstall 10 8 648 64
   $lblIntro.ForeColor = [System.Drawing.Color]::DimGray
-  $form.Controls.Add($lblIntro)
-
-  $lblSchema = New-Object System.Windows.Forms.Label
-  $lblSchema.Text = "方案文件:"; $lblSchema.Location = New-Object System.Drawing.Point(15, 58)
-  $lblSchema.Size = New-Object System.Drawing.Size(70, 20); $form.Controls.Add($lblSchema)
-
-  $cmbSchema = New-Object System.Windows.Forms.ComboBox
-  $cmbSchema.Location = New-Object System.Drawing.Point(90, 55)
-  $cmbSchema.Size = New-Object System.Drawing.Size(400, 21)
-  $cmbSchema.DropDownStyle = "DropDownList"
-  $form.Controls.Add($cmbSchema)
-
-  $btnRefresh = New-Object System.Windows.Forms.Button
-  $btnRefresh.Text = "刷新"; $btnRefresh.Location = New-Object System.Drawing.Point(500, 54)
-  $btnRefresh.Size = New-Object System.Drawing.Size(80, 23); $form.Controls.Add($btnRefresh)
-
-  $btnBrowse = New-Object System.Windows.Forms.Button
-  $btnBrowse.Text = "浏览..."; $btnBrowse.Location = New-Object System.Drawing.Point(588, 54)
-  $btnBrowse.Size = New-Object System.Drawing.Size(85, 23); $form.Controls.Add($btnBrowse)
-
-  $lblModel = New-Object System.Windows.Forms.Label
-  $lblModel.Text = "模型路径:"; $lblModel.Location = New-Object System.Drawing.Point(15, 88)
-  $lblModel.Size = New-Object System.Drawing.Size(70, 20); $form.Controls.Add($lblModel)
-
-  $txtModel = New-Object System.Windows.Forms.TextBox
-  $txtModel.Location = New-Object System.Drawing.Point(90, 85)
-  $txtModel.Size = New-Object System.Drawing.Size(583, 21)
-  $form.Controls.Add($txtModel)
-
-  $btnFiles = New-Object System.Windows.Forms.Button
-  $btnFiles.Text = "复制文件"
-  $btnFiles.Location = New-Object System.Drawing.Point(12, 115)
-  $btnFiles.Size = New-Object System.Drawing.Size(150, 36)
-  $form.Controls.Add($btnFiles)
-
-  $btnModel = New-Object System.Windows.Forms.Button
-  $btnModel.Text = "下载模型"
-  $btnModel.Location = New-Object System.Drawing.Point(170, 115)
-  $btnModel.Size = New-Object System.Drawing.Size(150, 36)
-  $form.Controls.Add($btnModel)
-
-  $btnAdd = New-Object System.Windows.Forms.Button
-  $btnAdd.Text = "方案配置加 LLM"
-  $btnAdd.Location = New-Object System.Drawing.Point(328, 115)
-  $btnAdd.Size = New-Object System.Drawing.Size(172, 36)
-  $form.Controls.Add($btnAdd)
-
-  $btnRemove = New-Object System.Windows.Forms.Button
-  $btnRemove.Text = "方案配置去 LLM"
-  $btnRemove.Location = New-Object System.Drawing.Point(506, 115)
-  $btnRemove.Size = New-Object System.Drawing.Size(162, 36)
-  $form.Controls.Add($btnRemove)
-
-  $lblStatus = New-Object System.Windows.Forms.Label
-  $lblStatus.Location = New-Object System.Drawing.Point(15, 158)
-  $lblStatus.Size = New-Object System.Drawing.Size(660, 18)
+  [void](Add-Ctl "Label" "模型路径:" $tabInstall 10 86 70 20)
+  $txtModel = Add-Ctl "TextBox" "" $tabInstall 85 83 560 21
+  $btnFiles = Add-Ctl "Button" "复制文件" $tabInstall 10 114 152 36
+  $btnModel = Add-Ctl "Button" "下载模型" $tabInstall 168 114 152 36
+  $btnAdd = Add-Ctl "Button" "方案配置加 LLM" $tabInstall 326 114 164 36
+  $btnRemove = Add-Ctl "Button" "方案配置去 LLM" $tabInstall 496 114 158 36
+  $lblStatus = Add-Ctl "Label" "" $tabInstall 10 160 648 18
   $lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
-  $form.Controls.Add($lblStatus)
-
-  $txtLog = New-Object System.Windows.Forms.TextBox
-  $txtLog.Location = New-Object System.Drawing.Point(15, 180)
-  $txtLog.Size = New-Object System.Drawing.Size(655, 180)
-  $txtLog.Multiline = $true; $txtLog.ReadOnly = $true
+  $txtLog = Add-Ctl "TextBox" "" $tabInstall 10 182 648 238
+  $txtLog.Multiline = $true
+  $txtLog.ReadOnly = $true
   # 自动折行：长路径 / 模型 URL 超出框宽时不截断隐藏（无需横向滚动条）
-  $txtLog.ScrollBars = "Vertical"; $txtLog.WordWrap = $true
+  $txtLog.ScrollBars = "Vertical"
+  $txtLog.WordWrap = $true
   $txtLog.Font = New-Object System.Drawing.Font("Consolas", 9)
-  $form.Controls.Add($txtLog)
+
+  # ── 『参数配置』页：源码版 WeaselLLMSetup 同款分组（触发条件/推理规模/
+  # 候选排序融合/排障），β·log(1+eff) 与 elw·span·匹配词长 挖空同列 x=122。
+  # 读写选中方案 llm_rerank 节；模型路径不在本页（安装页配置），保存时原样保留。
+  $p2 = $tabParams
+  [void](Add-Hdr $p2 "参数写入选中方案的 llm_rerank 配置节；保存后自动重新部署生效（模型路径在『安装』页配置）" 10 6 645)
+  $chkEnabled = Add-Ctl "CheckBox" "启用 LLM 重排" $p2 10 28 260 24
+  [void](Add-Hdr $p2 "触发条件 —— 何时打分" 10 54 320)
+  [void](Add-Ctl "Label" "最小编码长度" $p2 10 78 108 20)
+  $txtMinCode = Add-Ctl "TextBox" "" $p2 122 74 52 22
+  [void](Add-Ctl "Label" "最大编码长度（0=不限）" $p2 210 78 168 20)
+  $txtMaxCode = Add-Ctl "TextBox" "" $p2 384 74 52 22
+  [void](Add-Ctl "Label" "最少上文 token" $p2 10 106 108 20)
+  $txtMinTok = Add-Ctl "TextBox" "" $p2 122 102 52 22
+  [void](Add-Hdr $p2 "推理规模 —— 每次算多少、多快" 10 132 360)
+  [void](Add-Ctl "Label" "上文 token 上限" $p2 10 156 108 20)
+  $txtMaxTok = Add-Ctl "TextBox" "" $p2 122 152 52 22
+  [void](Add-Ctl "Label" "候选数上限" $p2 210 156 96 20)
+  $txtMaxCand = Add-Ctl "TextBox" "" $p2 384 152 52 22
+  [void](Add-Ctl "Label" "CPU 线程数" $p2 10 184 108 20)
+  $txtCores = Add-Ctl "TextBox" "" $p2 122 180 52 22
+  [void](Add-Hdr $p2 "候选排序融合 —— 分数怎么合成" 10 210 380)
+  [void](Add-Ctl "Label" "融合分 = score + " $p2 10 234 108 20)
+  $txtBeta = Add-Ctl "TextBox" "" $p2 122 230 52 22
+  [void](Add-Ctl "Label" "·log(1+eff)" $p2 178 234 90 20)
+  $lblPlus = Add-Ctl "Label" "+" $p2 10 262 108 20
+  $lblPlus.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+  $txtElw = Add-Ctl "TextBox" "" $p2 122 258 52 22
+  [void](Add-Ctl "Label" "·span·匹配词长" $p2 178 262 130 20)
+  [void](Add-Ctl "Label" "β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）" $p2 10 290 490 18)
+  [void](Add-Ctl "Label" "elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成" $p2 10 310 520 18)
+  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion（逐候选融合明细写用户文件夹 rime_llm_debug.txt）" $p2 10 336 630 24
+  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 10 368 100 28
+  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 120 368 110 28
+  $lblParamStatus = Add-Ctl "Label" "" $p2 245 374 400 18
+  $lblParamStatus.ForeColor = [System.Drawing.Color]::DarkBlue
+
+  # 参数字段注册表（键 = llm_rerank 键名）；默认值回填（= lua cfg 默认）
+  $paramEdits = @{
+    min_code_len = $txtMinCode
+    max_code_len = $txtMaxCode
+    min_tokens = $txtMinTok
+    max_tokens = $txtMaxTok
+    max_candidates = $txtMaxCand
+    cpu_cores = $txtCores
+    freq_beta = $txtBeta
+    expected_length_weight = $txtElw
+  }
+  foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
+  $txtBeta.Text = Format-F2 ([double]$PARAM_DEFAULTS["freq_beta"])
+  $txtElw.Text = Format-F2 ([double]$PARAM_DEFAULTS["expected_length_weight"])
+
+  function Read-ParamsToUi {
+    if ($cmbSchema.SelectedItem -eq $null) { return }
+    $name = $cmbSchema.SelectedItem.ToString()
+    $path = Join-Path $RIME_USER $name
+    $sec = $null
+    try { if (Test-Path $path) { $sec = Read-LlmParams $path } } catch { }
+    $v = @{}
+    foreach ($k in $PARAM_DEFAULTS.Keys) { $v[$k] = $PARAM_DEFAULTS[$k] }
+    if ($sec) {
+      foreach ($k in $PARAM_INT_KEYS) {
+        if ($sec.ContainsKey($k)) {
+          $n = 0
+          if ([int]::TryParse($sec[$k], [ref]$n)) { $v[$k] = $n }
+        }
+      }
+      foreach ($k in $PARAM_DBL_KEYS) {
+        if ($sec.ContainsKey($k)) {
+          $d = 0.0
+          if (Convert-ParamDouble $sec[$k] ([ref]$d)) { $v[$k] = $d }
+        }
+      }
+      foreach ($k in $PARAM_BOOL_KEYS) {
+        if ($sec.ContainsKey($k)) { $v[$k] = ($sec[$k] -ieq "true") }
+      }
+      if ($sec.ContainsKey("enabled")) { $v.enabled = ($sec["enabled"] -ieq "true") }
+    }
+    foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$v[$k] }
+    $txtBeta.Text = Format-F2 ([double]$v.freq_beta)
+    $txtElw.Text = Format-F2 ([double]$v.expected_length_weight)
+    $chkEnabled.Checked = $v.enabled
+    $chkDebug.Checked = $v.debug_fusion
+    if ($sec) {
+      $lblParamStatus.Text = "已加载 $name 的参数"
+      $lblParamStatus.ForeColor = [System.Drawing.Color]::DarkBlue
+    } else {
+      $lblParamStatus.Text = "$name 未接入 LLM —— 显示默认值；接入用『安装』页『方案配置加 LLM』"
+      $lblParamStatus.ForeColor = [System.Drawing.Color]::Firebrick
+    }
+  }
+
+  function Save-ParamsFromUi {
+    if ($cmbSchema.SelectedItem -eq $null) {
+      $lblParamStatus.Text = "请先在顶部选择方案文件"
+      return
+    }
+    $name = $cmbSchema.SelectedItem.ToString()
+    $path = Join-Path $RIME_USER $name
+    if (-not (Test-Path $path)) {
+      $lblParamStatus.Text = "方案文件不存在: $path"
+      return
+    }
+    $p = @{}
+    foreach ($k in $PARAM_INT_KEYS) {
+      $n = 0
+      if (-not [int]::TryParse($paramEdits[$k].Text.Trim(), [ref]$n)) {
+        $lblParamStatus.Text = "『$k』不是有效整数：$($paramEdits[$k].Text)"
+        return
+      }
+      $p[$k] = $n
+    }
+    foreach ($k in $PARAM_DBL_KEYS) {
+      $d = 0.0
+      if (-not (Convert-ParamDouble $paramEdits[$k].Text.Trim() ([ref]$d))) {
+        $lblParamStatus.Text = "『$k』不是有效数字：$($paramEdits[$k].Text)"
+        return
+      }
+      if ($d -lt 0) {
+        $lblParamStatus.Text = "『$k』不能为负（0 = 关闭）"
+        return
+      }
+      $p[$k] = $d
+    }
+    $p.enabled = $chkEnabled.Checked
+    $p.debug_fusion = $chkDebug.Checked
+    try {
+      $modelPath = Get-ActiveModelPath $path   # 模型路径本页不管理——原样保留
+      Update-LlmSection $path $p $modelPath
+    } catch {
+      $lblParamStatus.Text = "[失败] " + $_.Exception.Message
+      $lblParamStatus.ForeColor = [System.Drawing.Color]::Firebrick
+      return
+    }
+    $lblParamStatus.Text = "已保存到 $name，正在重新部署…"
+    $form.Refresh()
+    $installDir = Find-WeaselDir
+    if ($installDir) {
+      Invoke-Redeploy $installDir { param($t) $txtLog.AppendText($t + "`r`n") }
+      $lblParamStatus.Text = "已保存并触发重新部署——部署完成后参数生效"
+    } else {
+      $lblParamStatus.Text = "已保存；未找到小狼毫目录，请托盘手动重新部署"
+    }
+  }
 
   function Refresh-Ui {
     $cmbSchema.Items.Clear()
@@ -603,8 +857,15 @@ function Run-InstallerGui {
     Start-Work "schema-remove" $cmbSchema.SelectedItem.ToString() ""
   })
 
+  # 『参数配置』页：读取 / 保存（读写选中方案 llm_rerank 节；状态行走标签不弹窗）
+  $cmbSchema.Add_SelectedIndexChanged({ Read-ParamsToUi })
+  $btnParamRead.Add_Click({ Read-ParamsToUi })
+  $btnParamSave.Add_Click({ Save-ParamsFromUi })
+
   $form.Add_Shown({
     Refresh-Ui
+    # 测试钩子：自动化测试直接落在参数页（TabControl 无跨进程可靠的通知消息）
+    if ($env:LLM_INSTALLER_TAB2) { $tabs.SelectedIndex = 1 }
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
                ).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
