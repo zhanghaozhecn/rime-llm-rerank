@@ -186,22 +186,41 @@ public class W {
   # （实测同一页内"CPU 线程数"框被判不可见，页内控件还会与另一页互相串扰）；
   # 改为按**屏幕坐标**过滤：参数页从 y+42 起，页内首个参数框 y 偏移 ≥ 60。
   function Get-ParamEdits {
-    # 最可靠判据：控件**父窗口** = 『参数配置』TabPage（另一页的参数框父窗口不同）。
+    # 最可靠判据：控件**祖辈里含**『参数配置』TabPage（另一页的控件不满足；
+    # 2026-09-30 起参数框嵌在 GroupBox 里，父窗口不再直接是页 → 需向上追溯）。
     # 坐标/可见性都不可靠：跨进程读 WinForms 页可见性会把隐藏的"未以管理员运行"
-    # 警告 Edit 也算进来，且两页控件在同一个顶层窗口下（2026-09-30 实测）。
-    @(Get-Ctls | Where-Object { $_.cls -match '\.Edit\.' -and $_.parent -eq $script:ParamsTab } |
-      Sort-Object y, x)
+    # 警告 Edit 也算进来，且两页控件挂在同一个顶层窗口下（实测）。
+    @(Get-Ctls | Where-Object {
+        if ($_.cls -notmatch '\.Edit\.') { return $false }
+        $p = $_.parent
+        for ($i = 0; $i -lt 4 -and $p -ne [IntPtr]::Zero; $i++) {
+          if ($p -eq $script:ParamsTab) { return $true }
+          $p = [W]::GetParent($p)
+        }
+        return $false
+      } | Sort-Object y, x)
   }
   function Set-Edit($e, [string]$v) { [void][W]::SendMsgStr($e.h, 0x000C, [IntPtr]::Zero, $v) }  # WM_SETTEXT
 
   Write-Host "== G1: 未接入方案读参数（默认值）=="
   # 『参数配置』页（TAB2 钩子已激活它）= 类名匹配页窗口、屏幕 y 更大的那个
-  $script:ParamsTab = (Get-Ctls | Where-Object { $_.cls -match '\.Window\.\d+\.' } |
-                       Sort-Object y | Select-Object -Last 1).h
+  # 『参数配置』页 = 可见的那个 TabPage（TAB2 钩子已激活它）；另一页 vis=False。
+  # 注意：两页屏幕坐标几乎相同，按 y 排序取"更大/更小"不可靠（实测取到过隐藏页）。
+  $script:ParamsTab = (Get-Ctls | Where-Object { $_.cls -match '\.Window\.\d+\.' -and $_.vis -and $_.text -eq '参数配置' } |
+                       Select-Object -First 1).h
+  if ($env:LLM_TEST_DUMP) {
+    Get-Ctls | Where-Object { $_.cls -match '\.Window\.\d+\.' } | Sort-Object y, x | ForEach-Object {
+      Write-Host ("  PAGE h={0} text='{1}' y={2} x={3} vis={4}" -f $_.h, ($_.text -replace "`r?`n", ' / '), $_.y, $_.x, $_.vis)
+    }
+    foreach ($c in (Get-Ctls | Where-Object { $_.cls -match '\.Edit\.' } | Sort-Object y, x)) {
+      Write-Host ("  edit text='{0}' y={1} x={2} parent={3}" -f ($c.text -replace "`r?`n", ' / '), $c.y, $c.x, $c.parent)
+    }
+  }
   Click-Btn (Find-Button "读取参数")
   Assert "状态含 未接入" (Any-Text "未接入 LLM")
   $e = Get-ParamEdits
-  Assert ("参数框数 = 6（实测 $($e.Count)：$(($e | ForEach-Object { $_.text }) -join '|')）") ($e.Count -eq 6)  Assert "code_pattern = .{4}" ((Get-WText $e[0].h) -eq ".{4}")
+  Assert ("参数框数 = 6（实测 $($e.Count)：$(($e | ForEach-Object { $_.text }) -join '|')）") ($e.Count -eq 6)
+  Assert "code_pattern = .{4}" ((Get-WText $e[0].h) -eq ".{4}")
   Assert "max_tokens = 10" ((Get-WText $e[1].h) -eq "10")
   Assert "max_candidates = 5" ((Get-WText $e[2].h) -eq "5")
   Assert "cpu_cores = 4" ((Get-WText $e[3].h) -eq "4")

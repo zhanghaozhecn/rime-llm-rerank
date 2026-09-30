@@ -545,11 +545,18 @@ function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$mode
 function Run-InstallerGui {
   $form = New-Object System.Windows.Forms.Form
   $form.Text = "LLM 重排安装器 — 插件版"
-  $form.ClientSize = New-Object System.Drawing.Size(684, 514)
+  $form.ClientSize = New-Object System.Drawing.Size(700, 560)
   $form.StartPosition = "CenterScreen"
   $form.FormBorderStyle = "FixedDialog"
   $form.MaximizeBox = $false
+  # 字体/缩放交给系统（AutoScaleMode=Font 时 WinForms 按系统 DPI 缩放，控件不糊）
+  $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
   $fontBold = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Bold)
+  $fontHint = New-Object System.Drawing.Font($form.Font.FontFamily, [float]($form.Font.Size - 0.75))
+  # 状态色（原 DarkBlue/Firebrick 偏刺眼，改柔和且语义清晰）
+  $colInfo = [System.Drawing.Color]::FromArgb(0, 90, 158)
+  $colOk = [System.Drawing.Color]::FromArgb(0, 120, 60)
+  $colErr = [System.Drawing.Color]::FromArgb(178, 34, 34)
 
   # 控件工厂：AutoSize=false —— Label 默认宽度会被缩到文字宽，
   # 破坏公式行"+"右对齐列与编辑框同列对齐（固定宽度才可核对不相交）
@@ -562,24 +569,57 @@ function Run-InstallerGui {
     $parent.Controls.Add($c)
     return $c
   }
-  function Add-Hdr($parent, [string]$text, $x, $y, $w) {
-    $c = Add-Ctl "Label" $text $parent $x $y $w 18
-    $c.Font = $fontBold
+  # 原生分组框：把参数按用途装进去（替代"加粗裸文字"标题）
+  function Add-Group($parent, [string]$title, $x, $y, $w, $h) {
+    $g = New-Object System.Windows.Forms.GroupBox
+    $g.Text = $title
+    $g.Location = New-Object System.Drawing.Point($x, $y)
+    $g.Size = New-Object System.Drawing.Size($w, $h)
+    $g.AutoSize = $false
+    $parent.Controls.Add($g)
+    return $g
+  }
+  # 灰色小字说明（"这组干什么/这个参数怎么填"）
+  function Add-Hint($parent, [string]$text, $x, $y, $w) {
+    $c = Add-Ctl "Label" $text $parent $x $y $w 16
+    $c.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+    $c.Font = $fontHint
     return $c
   }
 
   # ── 共用顶栏：方案文件（『安装』『参数配置』两页共用上下文）──
   [void](Add-Ctl "Label" "方案文件:" $form 12 16 70 20)
-  $cmbSchema = Add-Ctl "ComboBox" "" $form 85 13 400 21
+  $cmbSchema = Add-Ctl "ComboBox" "" $form 85 13 418 21
   $cmbSchema.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-  $btnRefresh = Add-Ctl "Button" "刷新" $form 492 12 80 23
-  $btnBrowse = Add-Ctl "Button" "浏览..." $form 578 12 94 23
+  $btnRefresh = Add-Ctl "Button" "刷新" $form 510 12 80 23
+  $btnBrowse = Add-Ctl "Button" "浏览..." $form 596 12 92 23
 
+  # WinForms TabControl 自带 1px 立体黑边（用户反馈"黑边框很丑"）。
+  # 官方没有去掉它的属性 → 自绘页签：FlatButtons + OwnerDrawFixed，
+  # 用 PowerShell 脚本块画（不 Add-Type，避免 pwsh 7 的程序集名解析问题），
+  # 页签 = 浅灰底扁平标签（选中白底蓝字），内容区由白色 TabPage 承担，黑边即消失。
   $tabs = New-Object System.Windows.Forms.TabControl
   $tabs.Location = New-Object System.Drawing.Point(8, 42)
-  $tabs.Size = New-Object System.Drawing.Size(668, 464)
+  $tabs.Size = New-Object System.Drawing.Size(684, 510)
+  $tabs.Appearance = [System.Windows.Forms.TabAppearance]::FlatButtons
+  $tabs.DrawMode = [System.Windows.Forms.TabDrawMode]::OwnerDrawFixed
+  $tabs.Add_DrawItem({
+    param($s, $e)
+    $r = $s.GetTabRect($e.Index)
+    $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+    $bg = if ($sel) { [System.Drawing.Color]::White } else { [System.Drawing.Color]::FromArgb(238, 238, 238) }
+    $e.Graphics.FillRectangle((New-Object System.Drawing.SolidBrush $bg), $r)
+    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(205, 205, 205))
+    $e.Graphics.DrawLine($pen, $r.Left, $r.Bottom - 1, $r.Right, $r.Bottom - 1)
+    $fg = if ($sel) { [System.Drawing.Color]::FromArgb(0, 90, 158) } else { [System.Drawing.Color]::FromArgb(70, 70, 70) }
+    $flags = [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter
+    [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $s.TabPages[$e.Index].Text, $s.Font, $r, $fg, $flags)
+    $pen.Dispose()
+  })
   $tabInstall = New-Object System.Windows.Forms.TabPage("安装")
   $tabParams = New-Object System.Windows.Forms.TabPage("参数配置")
+  $tabInstall.BackColor = [System.Drawing.Color]::White
+  $tabParams.BackColor = [System.Drawing.Color]::White
   [void]$tabs.TabPages.Add($tabInstall)
   [void]$tabs.TabPages.Add($tabParams)
   $form.Controls.Add($tabs)
@@ -594,7 +634,7 @@ function Run-InstallerGui {
   $btnAdd = Add-Ctl "Button" "方案配置加 LLM" $tabInstall 326 114 164 36
   $btnRemove = Add-Ctl "Button" "方案配置去 LLM" $tabInstall 496 114 158 36
   $lblStatus = Add-Ctl "Label" "" $tabInstall 10 160 648 18
-  $lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
+  $lblStatus.ForeColor = $colInfo
   $txtLog = Add-Ctl "TextBox" "" $tabInstall 10 182 648 238
   $txtLog.Multiline = $true
   $txtLog.ReadOnly = $true
@@ -603,38 +643,45 @@ function Run-InstallerGui {
   $txtLog.WordWrap = $true
   $txtLog.Font = New-Object System.Drawing.Font("Consolas", 9)
 
-  # ── 『参数配置』页：源码版 WeaselLLMSetup 同款分组（触发条件/推理规模/
-  # 候选排序融合/排障），β·log(1+eff) 与 elw·span·匹配词长 挖空同列 x=122。
+  # ── 『参数配置』页：与源码版同构（原生分组框 + 一句说明 + 参数自解释）。
+  # 2026-09-30 改版（用户反馈"丑、自解释性不强"）：BS_GROUPBOX 风格的
+  # GroupBox 分组、灰色小字说明、参数带单位/示例、状态色改柔和。
   # 读写选中方案 llm_rerank 节；模型路径不在本页（安装页配置），保存时原样保留。
   $p2 = $tabParams
-  [void](Add-Hdr $p2 "参数写入选中方案的 llm_rerank 配置节；保存后自动重新部署生效（模型路径在『安装』页配置）" 10 6 645)
-  $chkEnabled = Add-Ctl "CheckBox" "启用 LLM 重排" $p2 10 28 260 24
-  [void](Add-Hdr $p2 "触发条件 —— 何时打分" 10 54 320)
-  [void](Add-Ctl "Label" "编码匹配（正则，全串）" $p2 10 78 160 20)
-  $txtCodePat = Add-Ctl "TextBox" "" $p2 175 74 120 22
-  [void](Add-Ctl "Label" "4 码 .{4}｜4 码以上 .{4,}｜3-4 码 .{3,4}｜[abcde]{4}｜空 = 不限" $p2 10 98 645 18)
-  [void](Add-Hdr $p2 "推理规模 —— 每次算多少、多快" 10 124 360)
-  [void](Add-Ctl "Label" "上文 token 上限" $p2 10 148 108 20)
-  $txtMaxTok = Add-Ctl "TextBox" "" $p2 122 144 52 22
-  [void](Add-Ctl "Label" "候选数上限" $p2 210 148 96 20)
-  $txtMaxCand = Add-Ctl "TextBox" "" $p2 384 144 52 22
-  [void](Add-Ctl "Label" "CPU 线程数" $p2 10 176 108 20)
-  $txtCores = Add-Ctl "TextBox" "" $p2 122 172 52 22
-  [void](Add-Hdr $p2 "候选排序融合 —— 分数怎么合成" 10 202 380)
-  [void](Add-Ctl "Label" "融合分 = score + " $p2 10 226 108 20)
-  $txtBeta = Add-Ctl "TextBox" "" $p2 122 222 52 22
-  [void](Add-Ctl "Label" "·log(1+eff)" $p2 178 226 90 20)
-  $lblPlus = Add-Ctl "Label" "+" $p2 10 254 108 20
+  [void](Add-Ctl "Label" "参数写入选中方案的 llm_rerank 配置节；保存后自动重新部署生效（模型路径在『安装』页）" $p2 12 8 660 18)
+  $chkEnabled = Add-Ctl "CheckBox" "启用 LLM 重排" $p2 16 30 260 24
+  # ── 触发条件 ──
+  $g1 = Add-Group $p2 "触发条件 —— 哪些编码才交给 LLM 重排" 12 58 660 84
+  [void](Add-Ctl "Label" "编码匹配:" $g1 14 26 62 20)
+  $txtCodePat = Add-Ctl "TextBox" "" $g1 78 22 240 22
+  Add-Hint $g1 "正则（全串匹配）：.{4} 仅 4 码　.{4,} 4 码以上　.{3,4} 3-4 码　[abcde]{4} 指定首码　空 = 不限" 14 50 636 | Out-Null
+  # ── 推理规模 ──
+  $g2 = Add-Group $p2 "推理规模 —— 每次按键算多少、用几个线程" 12 150 660 104
+  [void](Add-Ctl "Label" "上文 token 上限:" $g2 14 26 132 20)
+  $txtMaxTok = Add-Ctl "TextBox" "" $g2 150 22 54 22
+  [void](Add-Ctl "Label" "参与打分的候选数:" $g2 230 26 132 20)
+  $txtMaxCand = Add-Ctl "TextBox" "" $g2 366 22 54 22
+  [void](Add-Ctl "Label" "CPU 线程数:" $g2 14 56 132 20)
+  $txtCores = Add-Ctl "TextBox" "" $g2 150 52 54 22
+  Add-Hint $g2 "候选数一般不用改；线程数 ≤ 本机物理核（默认 4，可用 bin\bench_threads.exe 实测）" 230 56 418 18 | Out-Null
+  # ── 候选排序融合（公式挖空：β/elw 同列 x=150）──
+  $g3 = Add-Group $p2 "候选排序融合 —— 最终分数怎么合成" 12 262 660 128
+  [void](Add-Ctl "Label" "融合分 = score +" $g3 14 26 130 20)
+  $txtBeta = Add-Ctl "TextBox" "" $g3 150 22 54 22
+  [void](Add-Ctl "Label" "·log(1+eff)" $g3 212 26 100 20)
+  Add-Hint $g3 "β = 词频权重，0 = 关闭（越常上屏的词加分越多，可翻盘 LLM 分差）" 14 50 636 16 | Out-Null
+  $lblPlus = Add-Ctl "Label" "+" $g3 14 74 130 20
   $lblPlus.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-  $txtElw = Add-Ctl "TextBox" "" $p2 122 250 52 22
-  [void](Add-Ctl "Label" "·span·匹配词长" $p2 178 254 130 20)
-  [void](Add-Ctl "Label" "β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）" $p2 10 282 490 18)
-  [void](Add-Ctl "Label" "elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成" $p2 10 302 520 18)
-  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion（逐候选融合明细写用户文件夹 rime_llm_debug.txt）" $p2 10 328 630 24
-  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 10 360 100 28
-  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 120 360 110 28
-  $lblParamStatus = Add-Ctl "Label" "" $p2 245 366 400 18
-  $lblParamStatus.ForeColor = [System.Drawing.Color]::DarkBlue
+  $txtElw = Add-Ctl "TextBox" "" $g3 150 70 54 22
+  [void](Add-Ctl "Label" "·span·匹配词长" $g3 212 74 130 20)
+  Add-Hint $g3 "elw = 预期词长权重，0 = 关闭（仅两码一字方案：词长 = 码长÷2 的候选加成）" 14 98 636 16 | Out-Null
+  # ── 排障 + 操作 ──
+  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion（逐块评分明细写用户文件夹；排障用，平时关闭）" $p2 16 398 640 22
+  Add-Hint $p2 "开启后持续写 rime_llm_debug.txt，排障完建议关闭" 34 420 620 16 | Out-Null
+  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 16 444 100 28
+  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 124 444 110 28
+  $lblParamStatus = Add-Ctl "Label" "" $p2 246 450 426 18
+  $lblParamStatus.ForeColor = $colInfo
 
   # 参数字段注册表（键 = llm_rerank 键名）；默认值回填（= lua cfg 默认）
   $paramEdits = @{
@@ -687,10 +734,10 @@ function Run-InstallerGui {
     $chkDebug.Checked = $v.debug_fusion
     if ($sec) {
       $lblParamStatus.Text = "已加载 $name 的参数"
-      $lblParamStatus.ForeColor = [System.Drawing.Color]::DarkBlue
+      $lblParamStatus.ForeColor = $colInfo
     } else {
       $lblParamStatus.Text = "$name 未接入 LLM —— 显示默认值；接入用『安装』页『方案配置加 LLM』"
-      $lblParamStatus.ForeColor = [System.Drawing.Color]::Firebrick
+      $lblParamStatus.ForeColor = $colErr
     }
   }
 
@@ -736,7 +783,7 @@ function Run-InstallerGui {
       Update-LlmSection $path $p $modelPath
     } catch {
       $lblParamStatus.Text = "[失败] " + $_.Exception.Message
-      $lblParamStatus.ForeColor = [System.Drawing.Color]::Firebrick
+      $lblParamStatus.ForeColor = $colErr
       return
     }
     $lblParamStatus.Text = "已保存到 $name，正在重新部署…"
@@ -760,7 +807,7 @@ function Run-InstallerGui {
     $dir = Find-WeaselDir
     $lblStatus.Text = ("安装文件: " + $(if ($PluginReady) { "就绪" } else { "缺失" }) + "  |  小狼毫: " +
                        $(if ($dir) { $dir } else { "未找到（请先安装官方小狼毫）" }))
-    $lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
+    $lblStatus.ForeColor = $colInfo
     $btnFiles.Enabled = ($PluginReady -and $dir)
     $btnModel.Enabled = $true
     $btnAdd.Enabled = ($cmbSchema.Items.Count -gt 0)
@@ -892,7 +939,7 @@ function Run-InstallerGui {
     if (-not $isAdmin) {
       $txtLog.AppendText("[警告] 当前未以管理员运行。请关闭本窗口，用 install_plugin.bat 启动。`r`n")
       $lblStatus.Text = "[警告] 未以管理员运行，请用 install_plugin.bat 启动"
-      $lblStatus.ForeColor = [System.Drawing.Color]::Firebrick
+      $lblStatus.ForeColor = $colErr
     }
   })
 
