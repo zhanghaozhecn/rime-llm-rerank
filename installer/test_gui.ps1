@@ -1,4 +1,4 @@
-﻿# test_gui.ps1 — 插件版安装器 GUI/CLI 自动化测试（沙箱隔离）
+# test_gui.ps1 — 插件版安装器 GUI/CLI 自动化测试（沙箱隔离）
 #
 # 隔离：$env:APPDATA 重定向到沙箱目录，GUI/CLI 子进程继承——所有 schema
 # 读写物理落在沙箱，杜绝误伤活配置（2026-09-29 源码版 GUI 测试事故同款
@@ -85,7 +85,7 @@ llm_rerank:
   Assert "freq_beta 保留 2.25" (($f | Where-Object { $_ -match '^\s+freq_beta: 2\.25\s*$' }).Count -eq 1)
   Assert "elw 保留 0.35" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.35\s*$' }).Count -eq 1)
   Assert "max_tokens 保留 12" (($f | Where-Object { $_ -match '^\s+max_tokens: 12\s*$' }).Count -eq 1)
-  Assert "min_tokens 保留 2" (($f | Where-Object { $_ -match '^\s+min_tokens: 2\s*$' }).Count -eq 1)
+  Assert "残留 min_tokens 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'min_tokens' }).Count -eq 0)
   Assert "cpu_cores 保留 6" (($f | Where-Object { $_ -match '^\s+cpu_cores: 6\s*$' }).Count -eq 1)
   Assert "残留 com_context 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
   Assert "debug_fusion 保留 true" (($f | Where-Object { $_ -match '^\s+debug_fusion: true\s*$' }).Count -eq 1)
@@ -174,8 +174,9 @@ public class W {
     $t = (Get-Ctls | Where-Object { $_.vis } | ForEach-Object { $_.text }) -join "`n"
     return $t.Contains($needle)
   }
-  # TAB2 激活时可见 EDIT 恰为 8 个参数框；按 (y,x) 排序 = 布局常量序：
-  # [0]最小编码 [1]最大编码 [2]最少上文 [3]上文上限 [4]候选上限 [5]线程 [6]β [7]elw
+  # TAB2 激活时可见 EDIT 恰为 7 个参数框；按 (y,x) 排序 = 布局常量序：
+  # [0]最小编码 [1]最大编码 [2]上文上限 [3]候选上限 [4]线程 [5]β [6]elw
+  # （min_tokens 已从用户配置面移除，2026-09-30——不再是参数框）
   function Get-ParamEdits {
     @(Get-Ctls | Where-Object { $_.vis -and $_.cls -match "\.EDIT" } | Sort-Object y, x)
   }
@@ -185,15 +186,14 @@ public class W {
   Click-Btn (Find-Button "读取参数")
   Assert "状态含 未接入" (Any-Text "未接入 LLM")
   $e = Get-ParamEdits
-  Assert "可见编辑框数 = 8" ($e.Count -eq 8)
+  Assert "可见编辑框数 = 7" ($e.Count -eq 7)
   Assert "min_code_len = 4" ((Get-WText $e[0].h) -eq "4")
   Assert "max_code_len = 0" ((Get-WText $e[1].h) -eq "0")
-  Assert "min_tokens = 1" ((Get-WText $e[2].h) -eq "1")
-  Assert "max_tokens = 10" ((Get-WText $e[3].h) -eq "10")
-  Assert "max_candidates = 5" ((Get-WText $e[4].h) -eq "5")
-  Assert "cpu_cores = 4" ((Get-WText $e[5].h) -eq "4")
-  Assert "freq_beta = 1.50" ((Get-WText $e[6].h) -eq "1.50")
-  Assert "elw = 0.20" ((Get-WText $e[7].h) -eq "0.20")
+  Assert "max_tokens = 10" ((Get-WText $e[2].h) -eq "10")
+  Assert "max_candidates = 5" ((Get-WText $e[3].h) -eq "5")
+  Assert "cpu_cores = 4" ((Get-WText $e[4].h) -eq "4")
+  Assert "freq_beta = 1.50" ((Get-WText $e[5].h) -eq "1.50")
+  Assert "elw = 0.20" ((Get-WText $e[6].h) -eq "0.20")
   # 复选框状态不在此断言：BM_GETCHECK 跨进程读不到 WinForms 主题复选框的
   # 内部态（渲染/保存均正确，2026-09-29 截图+落盘双验证）——复选框断言
   # 统一走 BM_CLICK 切换 + 保存落盘（G4 读入态保持 / G7 点击翻转）
@@ -234,15 +234,13 @@ llm_rerank:
   Click-Btn (Find-Button "读取参数")
   Assert "状态含 已加载" (Any-Text "已加载")
   Assert "min_code_len = 3" ((Get-WText $e[0].h) -eq "3")
-  Assert "min_tokens = 2" ((Get-WText $e[2].h) -eq "2")
-  Assert "max_tokens = 12" ((Get-WText $e[3].h) -eq "12")
-  Assert "cpu_cores = 6" ((Get-WText $e[5].h) -eq "6")
-  Assert "freq_beta = 2.25" ((Get-WText $e[6].h) -eq "2.25")
-  Assert "elw = 0.35" ((Get-WText $e[7].h) -eq "0.35")
+  Assert "max_tokens = 12" ((Get-WText $e[2].h) -eq "12")
+  Assert "cpu_cores = 6" ((Get-WText $e[4].h) -eq "6")
+  Assert "freq_beta = 2.25" ((Get-WText $e[5].h) -eq "2.25")
+  Assert "elw = 0.35" ((Get-WText $e[6].h) -eq "0.35")
 
-  Write-Host "== G4: 保存（β→0.80、最少上文→2；复选框按读入态原样落盘）=="
-  Set-Edit $e[6] "0.80"
-  Set-Edit $e[2] "2"
+  Write-Host "== G4: 保存（β→0.80；复选框按读入态原样落盘；min_tokens 死键被剥）=="
+  Set-Edit $e[5] "0.80"
   Click-Btn (Find-Button "保存并生效")
   Assert "状态含 已保存并触发重新部署" (Any-Text "已保存并触发重新部署")
   $f = Get-Content $test -Encoding UTF8
@@ -250,7 +248,7 @@ llm_rerank:
   Assert "debug_fusion: true（读入态保持）" (($f | Where-Object { $_ -match '^\s+debug_fusion: true\s*$' }).Count -eq 1)
   Assert "残留 com_context 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
   Assert "freq_beta: 0.80" (($f | Where-Object { $_ -match '^\s+freq_beta: 0\.80\s*$' }).Count -eq 1)
-  Assert "min_tokens: 2" (($f | Where-Object { $_ -match '^\s+min_tokens: 2\s*$' }).Count -eq 1)
+  Assert "残留 min_tokens 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'min_tokens' }).Count -eq 0)
   Assert "elw 保留 0.35" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.35\s*$' }).Count -eq 1)
   Assert "max_tokens 保留 12" (($f | Where-Object { $_ -match '^\s+max_tokens: 12\s*$' }).Count -eq 1)
   Assert "model_path 保留" (($f | Where-Object { $_ -match '^\s+model_path: d:/gguf_models/zz_test\.gguf\s*$' }).Count -eq 1)
@@ -266,11 +264,11 @@ llm_rerank:
   Assert "文件逐字节一致" ($h1 -eq $h2)
 
   Write-Host "== G6: 非法输入 β=abc → 拒绝保存 =="
-  Set-Edit $e[6] "abc"
+  Set-Edit $e[5] "abc"
   Click-Btn (Find-Button "保存并生效")
   Assert "状态含 不是有效数字" (Any-Text "不是有效数字")
   Assert "文件未改动" ((Get-FileHash $test -Algorithm MD5).Hash -eq $h2)
-  Set-Edit $e[6] "0.80"   # 恢复合法值——G7 复选框相位要靠保存落盘验证
+  Set-Edit $e[5] "0.80"   # 恢复合法值——G7 复选框相位要靠保存落盘验证
 
   Write-Host "== G7: 复选框 BM_CLICK 切换 + 保存落盘 =="
   [void][W]::SendMsg((Find-Check "启用 LLM 重排"), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # true→false
@@ -283,8 +281,7 @@ llm_rerank:
 
   Write-Host "== G8: 重读回环（保存值回到界面）=="
   Click-Btn (Find-Button "读取参数")
-  Assert "beta 字段 = 0.80" ((Get-WText $e[6].h) -eq "0.80")
-  Assert "min_tokens 字段 = 2" ((Get-WText $e[2].h) -eq "2")
+  Assert "beta 字段 = 0.80" ((Get-WText $e[5].h) -eq "0.80")
 }
 finally {
   Get-Process pwsh, powershell -ErrorAction SilentlyContinue |

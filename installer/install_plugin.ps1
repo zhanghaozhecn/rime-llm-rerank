@@ -1,4 +1,4 @@
-﻿# install_plugin.ps1 — 插件版安装器（单文件；GUI / CLI）
+# install_plugin.ps1 — 插件版安装器（单文件；GUI / CLI）
 # 历史：原拆分 install_plugin.ps1（入口壳）+ common.ps1（两版共用逻辑）是为
 # 跨仓同步——2026-08-27 源码版改用 setup.exe 安装包后共用已名存实亡，
 # 2026-09-04 按用户定案合并为本仓库单文件，源码版动作与双版分支随之删除。
@@ -132,13 +132,15 @@ function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $
 # model_path 不在参数表（安装页模型路径框 / 加 LLM 写入），更新节时原样保留。
 # com_context 已删（2026-09-29 定案：旁路无常关配置，排障改 llm_processor.lua
 # 头部 com_ctx_enabled）——方案里残留的旧行在 GUI 保存/重跑加 LLM 重建节时剥除。
+# min_tokens 已删（2026-09-30 定案：最少上文 token 恒为 1，代码默认保留、不给用户改）
+# ——同样只在重建节时剥除，不做专门清理。
 $PARAM_DEFAULTS = [ordered]@{
   enabled = $false
-  min_code_len = 4; max_code_len = 0; min_tokens = 1
+  min_code_len = 4; max_code_len = 0
   max_tokens = 10; max_candidates = 5; cpu_cores = 4
   freq_beta = 1.5; expected_length_weight = 0.2; debug_fusion = $false
 }
-$PARAM_INT_KEYS  = @("min_code_len","max_code_len","min_tokens","max_tokens","max_candidates","cpu_cores")
+$PARAM_INT_KEYS  = @("min_code_len","max_code_len","max_tokens","max_candidates","cpu_cores")
 $PARAM_DBL_KEYS  = @("freq_beta","expected_length_weight")
 $PARAM_BOOL_KEYS = @("debug_fusion")
 
@@ -192,7 +194,6 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
     "  enabled: $(if ($p.enabled) { 'true' } else { 'false' })",
     "  min_code_len: $($p.min_code_len)",
     "  max_code_len: $($p.max_code_len) # 0=不限制",
-    "  min_tokens: $($p.min_tokens)",
     "  max_tokens: $($p.max_tokens)",
     "  max_candidates: $($p.max_candidates)",
     "  cpu_cores: $($p.cpu_cores)",
@@ -245,7 +246,6 @@ function Get-LlmCfgLines([string]$modelPath, $prior) {
     "  enabled: true",
     "  min_code_len: $($d.min_code_len)",
     "  max_code_len: $($d.max_code_len) # 0=不限制",
-    "  min_tokens: $($d.min_tokens)",
     "  max_tokens: $($d.max_tokens)",
     "  max_candidates: $($d.max_candidates)",
     "  cpu_cores: $($d.cpu_cores)",
@@ -596,36 +596,33 @@ function Run-InstallerGui {
   $txtMinCode = Add-Ctl "TextBox" "" $p2 122 74 52 22
   [void](Add-Ctl "Label" "最大编码长度（0=不限）" $p2 210 78 168 20)
   $txtMaxCode = Add-Ctl "TextBox" "" $p2 384 74 52 22
-  [void](Add-Ctl "Label" "最少上文 token" $p2 10 106 108 20)
-  $txtMinTok = Add-Ctl "TextBox" "" $p2 122 102 52 22
-  [void](Add-Hdr $p2 "推理规模 —— 每次算多少、多快" 10 132 360)
-  [void](Add-Ctl "Label" "上文 token 上限" $p2 10 156 108 20)
-  $txtMaxTok = Add-Ctl "TextBox" "" $p2 122 152 52 22
-  [void](Add-Ctl "Label" "候选数上限" $p2 210 156 96 20)
-  $txtMaxCand = Add-Ctl "TextBox" "" $p2 384 152 52 22
-  [void](Add-Ctl "Label" "CPU 线程数" $p2 10 184 108 20)
-  $txtCores = Add-Ctl "TextBox" "" $p2 122 180 52 22
-  [void](Add-Hdr $p2 "候选排序融合 —— 分数怎么合成" 10 210 380)
-  [void](Add-Ctl "Label" "融合分 = score + " $p2 10 234 108 20)
-  $txtBeta = Add-Ctl "TextBox" "" $p2 122 230 52 22
-  [void](Add-Ctl "Label" "·log(1+eff)" $p2 178 234 90 20)
-  $lblPlus = Add-Ctl "Label" "+" $p2 10 262 108 20
+  [void](Add-Hdr $p2 "推理规模 —— 每次算多少、多快" 10 104 360)
+  [void](Add-Ctl "Label" "上文 token 上限" $p2 10 128 108 20)
+  $txtMaxTok = Add-Ctl "TextBox" "" $p2 122 124 52 22
+  [void](Add-Ctl "Label" "候选数上限" $p2 210 128 96 20)
+  $txtMaxCand = Add-Ctl "TextBox" "" $p2 384 124 52 22
+  [void](Add-Ctl "Label" "CPU 线程数" $p2 10 156 108 20)
+  $txtCores = Add-Ctl "TextBox" "" $p2 122 152 52 22
+  [void](Add-Hdr $p2 "候选排序融合 —— 分数怎么合成" 10 182 380)
+  [void](Add-Ctl "Label" "融合分 = score + " $p2 10 206 108 20)
+  $txtBeta = Add-Ctl "TextBox" "" $p2 122 202 52 22
+  [void](Add-Ctl "Label" "·log(1+eff)" $p2 178 206 90 20)
+  $lblPlus = Add-Ctl "Label" "+" $p2 10 234 108 20
   $lblPlus.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-  $txtElw = Add-Ctl "TextBox" "" $p2 122 258 52 22
-  [void](Add-Ctl "Label" "·span·匹配词长" $p2 178 262 130 20)
-  [void](Add-Ctl "Label" "β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）" $p2 10 290 490 18)
-  [void](Add-Ctl "Label" "elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成" $p2 10 310 520 18)
-  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion（逐候选融合明细写用户文件夹 rime_llm_debug.txt）" $p2 10 336 630 24
-  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 10 368 100 28
-  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 120 368 110 28
-  $lblParamStatus = Add-Ctl "Label" "" $p2 245 374 400 18
+  $txtElw = Add-Ctl "TextBox" "" $p2 122 230 52 22
+  [void](Add-Ctl "Label" "·span·匹配词长" $p2 178 234 130 20)
+  [void](Add-Ctl "Label" "β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）" $p2 10 262 490 18)
+  [void](Add-Ctl "Label" "elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成" $p2 10 282 520 18)
+  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion（逐候选融合明细写用户文件夹 rime_llm_debug.txt）" $p2 10 308 630 24
+  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 10 340 100 28
+  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 120 340 110 28
+  $lblParamStatus = Add-Ctl "Label" "" $p2 245 346 400 18
   $lblParamStatus.ForeColor = [System.Drawing.Color]::DarkBlue
 
   # 参数字段注册表（键 = llm_rerank 键名）；默认值回填（= lua cfg 默认）
   $paramEdits = @{
     min_code_len = $txtMinCode
     max_code_len = $txtMaxCode
-    min_tokens = $txtMinTok
     max_tokens = $txtMaxTok
     max_candidates = $txtMaxCand
     cpu_cores = $txtCores

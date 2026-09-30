@@ -1,4 +1,4 @@
-﻿-- llm_filter.lua — LLM candidate rerank filter
+-- llm_filter.lua — LLM candidate rerank filter
 -- 由 schema llm_rerank.enabled 控制：true | false
 -- false 时不加载 DLL，不推理，候选原样透传
 
@@ -8,7 +8,8 @@ local llm_loaded_for = nil  -- enabled value when llm was loaded
 local cfg = {
     min_code_len     = 4,
     max_code_len     = 0,   -- 0 = 不限制（编码长度上限，超出不推理）
-    min_tokens       = 1,
+    -- min_tokens 不再暴露给用户：固定走 C++ 默认 1（2026-09-30 定案——
+    -- 最少上文 token 依据前期研究与长期实机使用恒为 1，无调整必要）
     max_tokens       = 10,  -- 截取的上文 token 数（与 C++ 默认/源码版/README 统一，2026-09-02）
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
@@ -64,7 +65,7 @@ local function load_llm(env)
         -- 未配置时留给 C++ 默认（RIME 用户目录根，2026-08-31）
         if mp and mp ~= "" then cpp.model_path = mp end
         cpp.max_ctx    = cfg.max_tokens
-        cpp.min_tokens = cfg.min_tokens
+        -- min_tokens 不设置：固定用 C++ 默认 1（用户配置面已移除，2026-09-30）
         if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end
         -- 日志目录: RIME 用户目录 (未设置时 C++ 回退 %TEMP%)
         local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
@@ -90,8 +91,7 @@ local function init_config(env)
     if v then cfg.max_candidates = v end
     v = sc:get_int("llm_rerank/cpu_cores")
     if v then cfg.cpu_cores = v end
-    v = sc:get_int("llm_rerank/min_tokens")
-    if v then cfg.min_tokens = v end
+    -- min_tokens 不再从 schema 读取（2026-09-30 用户配置面移除；固定 C++ 默认 1）
     local dbg = sc:get_bool("llm_rerank/debug_fusion")
     if dbg ~= nil then cfg.debug_fusion = dbg end
 end
