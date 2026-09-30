@@ -551,12 +551,36 @@ function Run-InstallerGui {
   $form.MaximizeBox = $false
   # 字体/缩放交给系统（AutoScaleMode=Font 时 WinForms 按系统 DPI 缩放，控件不糊）
   $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
-  $fontBold = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Bold)
-  $fontHint = New-Object System.Drawing.Font($form.Font.FontFamily, [float]($form.Font.Size - 0.75))
   # 状态色（原 DarkBlue/Firebrick 偏刺眼，改柔和且语义清晰）
   $colInfo = [System.Drawing.Color]::FromArgb(0, 90, 158)
   $colOk = [System.Drawing.Color]::FromArgb(0, 120, 60)
   $colErr = [System.Drawing.Color]::FromArgb(178, 34, 34)
+
+  # ── 悬停提示（2026-09-30 用户定案）──
+  # 配置说明**不再直出界面**：改为"一个配置项一行 + 行末『?』徽标"，
+  # 鼠标悬停才显示该项说明。界面因此只剩参数本身，密度高且自解释。
+  $script:tip = New-Object System.Windows.Forms.ToolTip
+  $script:tip.InitialDelay = 300
+  $script:tip.ReshowDelay = 100
+  $script:tip.AutoPopDelay = 30000
+  $script:tip.ShowAlways = $true
+  # 说明文案（与源码版 WeaselLLMSetup 同款措辞，两版界面保持一致）。
+  # 长文案**手工断行**：WinForms ToolTip 不设最大宽度，单行会长到出屏
+  # （2026-09-30 实测 code_pattern 单行 1366px 顶到屏幕边缘）。
+  $tipEnabled = "总开关：开 = 加载模型参与候选重排；关 = 卸载模型释放内存。`n保存后立即生效，无需重新部署。"
+  $tipModel = "GGUF 模型文件路径（留空 = 用户文件夹里的默认名）。`n下拉列出用户文件夹与本机 gguf_models 下的模型；`n换模型保存后会自动卸载并重载。"
+  $tipCodePat = "触发条件：编码串全串正则匹配，只有匹配上的编码才交给 LLM 重排`n（写法与 Rime speller/auto_select_pattern 一致）。`n默认 .{4} = 恰 4 码。例：`n　.{4,} 4 码以上　　.{3,4} 3~4 码`n　[abcde]{4} 指定首码　　空 = 不限制`n含 \ 的写法要用单引号，如 '\d{4}'。"
+  $tipMaxTok = "上文长度上限：取光标前多少个 token 作为重排依据（默认 10）。`n越大越准，但每次都更慢。"
+  $tipMaxCand = "每次按键参与 LLM 打分的候选数上限（默认 5）。`n一般不用改——调大更准但更慢。"
+  $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n可用 bin\bench_threads.exe 实测最优值。"
+  $tipBeta = "用户词频权重 β（默认 1.5，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成`n越常上屏的词加分越多；加分在 log 域，可翻盘 LLM 的分差。"
+  $tipElw = "预期词长权重 elw（默认 0.2，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成`n按 词长 = 码长÷2 给候选加成，只对两码一字的方案有意义；`n成熟机器建议 0。"
+  $tipDebug = "诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt`n（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。"
+  $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n保存后自动重新部署生效。"
+  $tipBtnFiles = "复制文件：停服务 → 清理旧二进制 → 替换 rime_llm.dll 与 lua → 启服务。"
+  $tipBtnModel = "下载模型：ModelScope 断点续传`n（目标 = 上面的模型路径框，留空 = 用户文件夹默认名）。"
+  $tipBtnAdd = "方案配置加 LLM：把 lua_processor/lua_filter 与 llm_rerank 节写进选中方案`n并自动重新部署（先剥旧版组件行再插入，可跨版转换）。"
+  $tipBtnRemove = "方案配置去 LLM：剥掉选中方案里的 llm_filter 组件行与 llm_rerank 节，`n并自动重新部署。"
 
   # 控件工厂：AutoSize=false —— Label 默认宽度会被缩到文字宽，
   # 破坏公式行"+"右对齐列与编辑框同列对齐（固定宽度才可核对不相交）
@@ -579,13 +603,40 @@ function Run-InstallerGui {
     $parent.Controls.Add($g)
     return $g
   }
-  # 灰色小字说明（"这组干什么/这个参数怎么填"）
-  function Add-Hint($parent, [string]$text, $x, $y, $w) {
-    $c = Add-Ctl "Label" $text $parent $x $y $w 16
-    $c.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
-    $c.Font = $fontHint
+  # 「?」徽标：18×18 自绘小圆 + 问号。说明只在悬停时弹出（ToolTip）。
+  # 自绘走 Add_Paint 脚本块（沿用页签自绘的老办法，不用 Add-Type——
+  # pwsh 7 里 Add-Type System.Drawing 会连环 CS0012，2026-09-30 踩过）。
+  # 坑：Label 自己的文字在 Paint 事件**之前**画 → 圆底会把文字盖掉，
+  # 故徽标文字由本函数自己 DrawString（Label.Text 仍留 "?"，供自动化/读屏识别）。
+  # x 一律取分组框 ClientSize 右端，避免不同主题的边框宽度把徽标挤出可视区。
+  $script:helpFont = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+  $script:helpBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(45, 78, 120))
+  function Add-Help($parent, [string]$tip, $x, $y) {
+    $c = Add-Ctl "Label" "?" $parent $x $y 18 18
+    $c.BackColor = [System.Drawing.Color]::Transparent
+    $c.ForeColor = [System.Drawing.Color]::FromArgb(45, 78, 120)
+    $c.Font = $script:helpFont
+    $c.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $c.Cursor = [System.Windows.Forms.Cursors]::Help
+    $c.Add_Paint({
+      param($s, $e)
+      $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+      $fill = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(228, 235, 244))
+      $edge = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(150, 172, 200))
+      $e.Graphics.FillEllipse($fill, 0.5, 0.5, ($s.Width - 1.5), ($s.Height - 1.5))
+      $e.Graphics.DrawEllipse($edge, 0.5, 0.5, ($s.Width - 1.5), ($s.Height - 1.5))
+      $fmt = New-Object System.Drawing.StringFormat
+      $fmt.Alignment = [System.Drawing.StringAlignment]::Center
+      $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+      $rect = New-Object System.Drawing.RectangleF(0, 0, $s.Width, $s.Height)
+      $e.Graphics.DrawString("?", $script:helpFont, $script:helpBrush, $rect, $fmt)
+      $fmt.Dispose(); $edge.Dispose(); $fill.Dispose()
+    })
+    $script:tip.SetToolTip($c, $tip)
     return $c
   }
+  # 行内「?」徽标 x：分组框客户区右端再退 24（18 宽徽标 + 6 余量）
+  function Help-X($g) { $g.ClientSize.Width - 24 }
 
   # ── 共用顶栏：方案文件（『安装』『参数配置』两页共用上下文）──
   [void](Add-Ctl "Label" "方案文件:" $form 12 16 70 20)
@@ -624,18 +675,22 @@ function Run-InstallerGui {
   [void]$tabs.TabPages.Add($tabParams)
   $form.Controls.Add($tabs)
 
-  # ── 『安装』页：原四按钮动作流 ────────────────
-  $lblIntro = Add-Ctl "Label" "『复制文件』= 停服务→替换二进制→启服务；『下载模型』= ModelScope 断点续传（目标 = 模型路径框，留空 = 默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）；『方案配置加/去 LLM』只改选中方案并自动重新部署（模型路径填写则写入配置）。参数在『参数配置』页写入选中方案；切换版本 = 重装小狼毫 + 跑另一版安装器（方案配置先剥后插，自动转换）。" $tabInstall 10 8 648 64
-  $lblIntro.ForeColor = [System.Drawing.Color]::DimGray
-  [void](Add-Ctl "Label" "模型路径:" $tabInstall 10 86 70 20)
-  $txtModel = Add-Ctl "TextBox" "" $tabInstall 85 83 560 21
-  $btnFiles = Add-Ctl "Button" "复制文件" $tabInstall 10 114 152 36
-  $btnModel = Add-Ctl "Button" "下载模型" $tabInstall 168 114 152 36
-  $btnAdd = Add-Ctl "Button" "方案配置加 LLM" $tabInstall 326 114 164 36
-  $btnRemove = Add-Ctl "Button" "方案配置去 LLM" $tabInstall 496 114 158 36
-  $lblStatus = Add-Ctl "Label" "" $tabInstall 10 160 648 18
+  # ── 『安装』页：四个动作按钮（说明改悬停提示，界面不再直出长段文字）──
+  [void](Add-Ctl "Label" "模型路径:" $tabInstall 10 18 70 20)
+  $txtModel = Add-Ctl "TextBox" "" $tabInstall 85 15 540 21
+  $script:tip.SetToolTip($txtModel, $tipModel)
+  Add-Help $tabInstall $tipModel 648 17 | Out-Null
+  $btnFiles = Add-Ctl "Button" "复制文件" $tabInstall 10 48 152 36
+  $btnModel = Add-Ctl "Button" "下载模型" $tabInstall 168 48 152 36
+  $btnAdd = Add-Ctl "Button" "方案配置加 LLM" $tabInstall 326 48 164 36
+  $btnRemove = Add-Ctl "Button" "方案配置去 LLM" $tabInstall 496 48 158 36
+  $script:tip.SetToolTip($btnFiles, $tipBtnFiles)
+  $script:tip.SetToolTip($btnModel, $tipBtnModel)
+  $script:tip.SetToolTip($btnAdd, $tipBtnAdd)
+  $script:tip.SetToolTip($btnRemove, $tipBtnRemove)
+  $lblStatus = Add-Ctl "Label" "" $tabInstall 10 94 648 18
   $lblStatus.ForeColor = $colInfo
-  $txtLog = Add-Ctl "TextBox" "" $tabInstall 10 182 648 238
+  $txtLog = Add-Ctl "TextBox" "" $tabInstall 10 118 648 352
   $txtLog.Multiline = $true
   $txtLog.ReadOnly = $true
   # 自动折行：长路径 / 模型 URL 超出框宽时不截断隐藏（无需横向滚动条）
@@ -643,44 +698,70 @@ function Run-InstallerGui {
   $txtLog.WordWrap = $true
   $txtLog.Font = New-Object System.Drawing.Font("Consolas", 9)
 
-  # ── 『参数配置』页：与源码版同构（原生分组框 + 一句说明 + 参数自解释）。
-  # 2026-09-30 改版（用户反馈"丑、自解释性不强"）：BS_GROUPBOX 风格的
-  # GroupBox 分组、灰色小字说明、参数带单位/示例、状态色改柔和。
+  # ── 『参数配置』页：与源码版同构（一个配置项一行 + 行末「?」悬停说明）。
+  # 2026-09-30 第二次改版（用户定案）：**说明不再直出**——每行只留
+  # 标签 + 输入框 + 「?」徽标，按下徽标列右对齐；说明进 ToolTip。
   # 读写选中方案 llm_rerank 节；模型路径不在本页（安装页配置），保存时原样保留。
   $p2 = $tabParams
   [void](Add-Ctl "Label" "参数写入选中方案的 llm_rerank 配置节；保存后自动重新部署生效（模型路径在『安装』页）" $p2 12 8 660 18)
-  $chkEnabled = Add-Ctl "CheckBox" "启用 LLM 重排" $p2 16 30 260 24
-  # ── 触发条件 ──
-  $g1 = Add-Group $p2 "触发条件 —— 哪些编码才交给 LLM 重排" 12 58 660 84
-  [void](Add-Ctl "Label" "编码匹配:" $g1 14 26 62 20)
-  $txtCodePat = Add-Ctl "TextBox" "" $g1 78 22 240 22
-  Add-Hint $g1 "正则（全串匹配）：.{4} 仅 4 码　.{4,} 4 码以上　.{3,4} 3-4 码　[abcde]{4} 指定首码　空 = 不限" 14 50 636 | Out-Null
-  # ── 推理规模 ──
-  $g2 = Add-Group $p2 "推理规模 —— 每次按键算多少、用几个线程" 12 150 660 104
-  [void](Add-Ctl "Label" "上文 token 上限:" $g2 14 26 132 20)
-  $txtMaxTok = Add-Ctl "TextBox" "" $g2 150 22 54 22
-  [void](Add-Ctl "Label" "参与打分的候选数:" $g2 230 26 132 20)
-  $txtMaxCand = Add-Ctl "TextBox" "" $g2 366 22 54 22
-  [void](Add-Ctl "Label" "CPU 线程数:" $g2 14 56 132 20)
-  $txtCores = Add-Ctl "TextBox" "" $g2 150 52 54 22
-  Add-Hint $g2 "候选数一般不用改；线程数 ≤ 本机物理核（默认 4，可用 bin\bench_threads.exe 实测）" 230 56 418 18 | Out-Null
-  # ── 候选排序融合（公式挖空：β/elw 同列 x=150）──
-  $g3 = Add-Group $p2 "候选排序融合 —— 最终分数怎么合成" 12 262 660 128
-  [void](Add-Ctl "Label" "融合分 = score +" $g3 14 26 130 20)
-  $txtBeta = Add-Ctl "TextBox" "" $g3 150 22 54 22
-  [void](Add-Ctl "Label" "·log(1+eff)" $g3 212 26 100 20)
-  Add-Hint $g3 "β = 词频权重，0 = 关闭（越常上屏的词加分越多，可翻盘 LLM 分差）" 14 50 636 16 | Out-Null
-  $lblPlus = Add-Ctl "Label" "+" $g3 14 74 130 20
-  $lblPlus.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-  $txtElw = Add-Ctl "TextBox" "" $g3 150 70 54 22
-  [void](Add-Ctl "Label" "·span·匹配词长" $g3 212 74 130 20)
-  Add-Hint $g3 "elw = 预期词长权重，0 = 关闭（仅两码一字方案：词长 = 码长÷2 的候选加成）" 14 98 636 16 | Out-Null
+  $chkEnabled = Add-Ctl "CheckBox" "启用 LLM 重排" $p2 16 30 200 24
+  $script:tip.SetToolTip($chkEnabled, $tipEnabled)
+  Add-Help $p2 $tipEnabled 648 33 | Out-Null
+
+  # ── 触发条件（单行）──
+  $g1 = Add-Group $p2 "触发条件" 12 60 660 66
+  [void](Add-Ctl "Label" "编码匹配:" $g1 14 24 76 20)
+  $txtCodePat = Add-Ctl "TextBox" "" $g1 92 21 240 22
+  $script:tip.SetToolTip($txtCodePat, $tipCodePat)
+  Add-Help $g1 $tipCodePat (Help-X $g1) 23 | Out-Null
+
+  # ── 推理规模 + 候选排序融合：五个参数各一行，标签列用同一个实测宽度
+  # （2026-09-30 第二次定案：融合分不再平铺公式——那两个权重也按普通配置项
+  #  列出，公式移进「?」悬停说明，避免"公式反而更难懂"）──
+  $lwP = 0
+  foreach ($t in @("上文 token 上限:", "参与打分的候选数:", "CPU 线程数:",
+                   "用户词频权重:", "预期词长权重:")) {
+    $w = ([System.Windows.Forms.TextRenderer]::MeasureText($t, $form.Font)).Width + 8
+    if ($w -gt $lwP) { $lwP = $w }
+  }
+  $g2 = Add-Group $p2 "推理规模" 12 136 660 122
+  $rowY = 22
+  [void](Add-Ctl "Label" "上文 token 上限:" $g2 14 $rowY ($lwP + 4) 20)
+  $txtMaxTok = Add-Ctl "TextBox" "" $g2 (14 + $lwP + 10) ($rowY - 3) 64 22
+  $script:tip.SetToolTip($txtMaxTok, $tipMaxTok)
+  Add-Help $g2 $tipMaxTok (Help-X $g2) ($rowY - 1) | Out-Null
+  $rowY += 32
+  [void](Add-Ctl "Label" "参与打分的候选数:" $g2 14 $rowY ($lwP + 4) 20)
+  $txtMaxCand = Add-Ctl "TextBox" "" $g2 (14 + $lwP + 10) ($rowY - 3) 64 22
+  $script:tip.SetToolTip($txtMaxCand, $tipMaxCand)
+  Add-Help $g2 $tipMaxCand (Help-X $g2) ($rowY - 1) | Out-Null
+  $rowY += 32
+  [void](Add-Ctl "Label" "CPU 线程数:" $g2 14 $rowY ($lwP + 4) 20)
+  $txtCores = Add-Ctl "TextBox" "" $g2 (14 + $lwP + 10) ($rowY - 3) 64 22
+  $script:tip.SetToolTip($txtCores, $tipCores)
+  Add-Help $g2 $tipCores (Help-X $g2) ($rowY - 1) | Out-Null
+
+  # ── 候选排序融合（两个权重各一行）──
+  $g3 = Add-Group $p2 "候选排序融合" 12 268 660 92
+  $rowY = 22
+  [void](Add-Ctl "Label" "用户词频权重:" $g3 14 $rowY ($lwP + 4) 20)
+  $txtBeta = Add-Ctl "TextBox" "" $g3 (14 + $lwP + 10) ($rowY - 3) 64 22
+  $script:tip.SetToolTip($txtBeta, $tipBeta)
+  Add-Help $g3 $tipBeta (Help-X $g3) ($rowY - 1) | Out-Null
+  $rowY += 32
+  [void](Add-Ctl "Label" "预期词长权重:" $g3 14 $rowY ($lwP + 4) 20)
+  $txtElw = Add-Ctl "TextBox" "" $g3 (14 + $lwP + 10) ($rowY - 3) 64 22
+  $script:tip.SetToolTip($txtElw, $tipElw)
+  Add-Help $g3 $tipElw (Help-X $g3) ($rowY - 1) | Out-Null
+
   # ── 排障 + 操作 ──
-  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion（逐块评分明细写用户文件夹；排障用，平时关闭）" $p2 16 398 640 22
-  Add-Hint $p2 "开启后持续写 rime_llm_debug.txt，排障完建议关闭" 34 420 620 16 | Out-Null
-  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 16 444 100 28
-  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 124 444 110 28
-  $lblParamStatus = Add-Ctl "Label" "" $p2 246 450 426 18
+  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion" $p2 16 372 260 22
+  $script:tip.SetToolTip($chkDebug, $tipDebug)
+  Add-Help $p2 $tipDebug 648 374 | Out-Null
+  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 16 402 100 28
+  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 124 402 110 28
+  $script:tip.SetToolTip($btnParamSave, $tipSave)
+  $lblParamStatus = Add-Ctl "Label" "" $p2 246 408 426 18
   $lblParamStatus.ForeColor = $colInfo
 
   # 参数字段注册表（键 = llm_rerank 键名）；默认值回填（= lua cfg 默认）

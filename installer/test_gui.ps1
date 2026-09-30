@@ -218,6 +218,14 @@ public class W {
   }
   Click-Btn (Find-Button "读取参数")
   Assert "状态含 未接入" (Any-Text "未接入 LLM")
+  # G0（2026-09-30 用户定案）：参数说明**不再直出**界面——一个配置项一行，
+  # 行末「?」徽标（Text="?"，悬停弹 ToolTip）。此处守住"说明不直出 + 徽标在"。
+  $labels = @(Get-Ctls | Where-Object { $_.cls -match '\.Static\.' } | ForEach-Object { $_.text })
+  $labelAll = $labels -join "`n"
+  Assert "参数页无直出说明（无 正则（全串匹配））" (-not $labelAll.Contains("正则（全串匹配）"))
+  Assert "参数页无直出说明（无 0 = 关闭）" (-not $labelAll.Contains("0 = 关闭"))
+  Assert "参数页无直出说明（无 一般不用改）" (-not $labelAll.Contains("一般不用改"))
+  Assert "「?」徽标 ≥ 6 个" ((@($labels | Where-Object { $_ -eq "?" }).Count) -ge 6)
   $e = Get-ParamEdits
   Assert ("参数框数 = 6（实测 $($e.Count)：$(($e | ForEach-Object { $_.text }) -join '|')）") ($e.Count -eq 6)
   Assert "code_pattern = .{4}" ((Get-WText $e[0].h) -eq ".{4}")
