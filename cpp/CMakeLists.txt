@@ -55,7 +55,8 @@ if(MSVC)
 
     # Thread count sweep benchmark (用户 cpu_cores 实测工具；重排效果研究评测器
     # sim_rerank/test_core/bench_sweep2/bench_single_char 已迁研究库
-    # D:\llm-rerank-research\cpp\，2026-09-02)
+    # ..\llm-rerank-research\cpp\（同级研究库，构建产物在其 build_sim\），2026-09-02)
+    # 本仓库构建树 = cpp\build\（2026-09-30 重组后改名，原 build_sim 名字留给研究库）
     add_executable(bench_thr bench_threads.cpp)
     target_include_directories(bench_thr PRIVATE
         "${LLAMA_ROOT}/include"

@@ -1,4 +1,4 @@
-﻿# RIME LLM 候选重排（rime-llm-rerank）
+# RIME LLM 候选重排（rime-llm-rerank）
 
 使用本地部署的小型 LLM 为任意 RIME **四码定长**输入方案（五笔、郑码、仓颉、拼读双拼等）提供打字时的智能候选排序。LLM 与编码方案无关——它只看到最终的中文候选词列表，利用上文的语义把正确词排到候选第一位，减少手动选重。
 
@@ -195,7 +195,7 @@ bin/bench_threads.exe [模型路径]
 - 词频对数融合 `freq_beta=1.5`（fused = LLM分 + β·log(1+eff)，eff 为 Rime 时间衰减计数）：本机打字真实窗回放事前口径较纯 LLM +0.4pp，词频无上限可翻盘（凸组合时代词频结构性封顶 0.25）。
 - GPU 版放弃（CUDA graph 重编译/省电波动/特定输入卡死）；模型能力上限 ~94.3%。
 
-完整研究文档（方法细节、tok×cand 全量扫参表、词频融合研究）在本地研究资料库 `D:\llm-rerank-research\`（评测工具链与语料同在其中）。
+完整研究文档（方法细节、tok×cand 全量扫参表、词频融合研究）在本地研究资料库 `llm-rerank-research\`（与本仓库同级目录；评测工具链与语料同在其中）。
 
 ---
 
@@ -227,9 +227,10 @@ rime-llm-rerank\
 │   ├── llm_filter.lua          #   候选重排 filter（打分/缓存/日志/AI 标记）
 │   ├── llm_processor.lua       #   上屏历史收集 + 预解码 processor
 │   └── rime_llm.dll           #   预编译插件（单文件，无运行时依赖 DLL）
-├── cpp\                       # 源码（CMakeLists.txt 构建）
+├── cpp\                       # 源码（CMakeLists.txt 构建；本地构建树 build\，gitignore）
 │   ├── rime_llm.cpp           #   生产插件（评分核心，坑见注释）
 │   ├── bench_threads.cpp      #   CPU 线程数测定（bin\ 预编译版源码）
+│   ├── test_ctx_host.c        #   lua 桥冒烟（相对路径自定位，cl 直编见 build_test_ctx_host.bat）
 │   └── lua/                   #   Lua 5.4 嵌入源码
 ├── bin\bench_threads.exe      # 预编译线程测定工具
 └── installer\                 # 插件版安装器（单文件逻辑 + 提权入口）
@@ -240,8 +241,8 @@ rime-llm-rerank\
 ```
 
 > **研究工具链与语料不在本仓库**：评测 python 工具、样本语料、研究评测器（sim_rerank /
-> test_core / bench_sweep2 / bench_single_char 等）在本地研究资料库 `D:\llm-rerank-research\`
-> （完整研究文档同在该处；评测器随工具链在研究库 `cpp\` 自行构建）。
+> test_core / bench_sweep2 / bench_single_char 等）在本地研究资料库 `llm-rerank-research\`
+> （与本仓库同级目录；完整研究文档同在该处，评测器随工具链在研究库 `cpp\` 自行构建）。
 
 ## 核心算法要点
 
@@ -249,17 +250,22 @@ rime-llm-rerank\
 
 ## 编译
 
-需要 Visual Studio Build Tools 2022 + CMake + Ninja + llama.cpp 源码。
+需要 Visual Studio 2022（含 Build Tools）+ CMake + llama.cpp 源码（本机镜像 `D:\llama.cpp-mirror\`）。
 
-编译前修改 `CMakeLists.txt` 中的 `LLAMA_ROOT`（llama.cpp 路径）。**CPU 版**：
+编译前确认 `CMakeLists.txt` 中的 `LLAMA_ROOT`。**CPU 版**（2026-09-30 实测口径，构建树 = `cpp\build\`）：
 
 ```powershell
 cd cpp
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -S . -B build_cpu
-ninja -C build_cpu rime_llm
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release --target rime_llm
 ```
 
-post-build 自动复制 DLL 到 `user\`。部署前需先**退出小狼毫**（右键托盘 → 退出），复制 DLL 及其依赖，再重新启动、重新部署。
+post-build 自动复制 DLL 到 `user\`，产物同时留在 `build\Release\rime_llm.dll`。部署前需先**退出小狼毫**
+（右键托盘 → 退出），复制 DLL 及其依赖，再重新启动、重新部署。
+
+> lua 桥冒烟：`cpp\build_test_ctx_host.bat` 编出 `test_ctx_host.exe`（在 `cpp\` 直接运行，内部按相对路径
+> 取 `build\Release\rime_llm.dll` 与 `..\user\*.lua`，无需任何绝对路径）。
+> 线程数测定工具用 `cpp\build_bench_threads.bat`（cl 直编，输出 `bench_threads.exe`；预编译版在 `bin\`）。
 
 > GPU 版（`rime_llm_cuda.cpp`）源码与构建仅本地留存，不发布。
 > **cl 直编含中文源码必须加 `/utf-8`**（GBK 误读会把换行吞进注释，曾致 JSON 输出缺逗号）。

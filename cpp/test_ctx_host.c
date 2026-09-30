@@ -4,13 +4,25 @@
  * vs 触发+kick（线程活跃）各测 score ×5 —— 定位后台线程对推理耗时的影响。
  * score 直调无 lua filter 缓存，C++ 侧同 ctx 连续调用走 prep 命中形态（S2 主导）。
  * 编译：build_test_ctx_host.bat（cl + cpp/lua 内嵌源码）
+ * 路径：库与 lua 一律用**相对路径**，运行前把 cwd 切到 exe 所在目录（cpp\）——
+ *       无需任何绝对路径，仓库整体搬目录/换盘符后照样跑。
  */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
+
+/* 把工作目录切到 exe 所在目录（cpp\）——与 build_test_ctx_host.bat 的 cd /d %~dp0 同口径 */
+static void chdir_to_exe_dir(void) {
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    char * slash = strrchr(path, '\\');
+    if (slash) { *slash = '\0'; SetCurrentDirectoryA(path); }
+}
 
 static int fail(const char * what) {
     fprintf(stderr, "[FAIL] %s\n", what);
@@ -44,12 +56,13 @@ static int wait_ready(lua_State * L, int max_ms) {
 }
 
 int main(void) {
+    chdir_to_exe_dir();   /* cwd = cpp\（相对路径基准） */
     lua_State * L = luaL_newstate();
     if (!L) return fail("luaL_newstate");
     luaL_openlibs(L);
 
     if (run(L,
-        "package.cpath = [[D:/rime-llm-rerank/cpp/build_sim/Release/?.dll]]\n"
+        "package.cpath = [[build/Release/?.dll]]\n"
         "local m = require('rime_llm')\n"
         "print('[host] funcs:', type(m.llm_context), type(m.kick_context))\n"))
         return 1;
@@ -103,7 +116,7 @@ int main(void) {
 
     if (run(L,
         "for _, f in ipairs({'llm_filter.lua', 'llm_processor.lua'}) do\n"
-        "  local chunk, err = loadfile('D:/rime-llm-rerank/user/' .. f)\n"
+        "  local chunk, err = loadfile('../user/' .. f)\n"
         "  print('[host] syntax', f, chunk and 'OK' or err)\n"
         "end\n"))
         return 1;

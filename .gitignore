@@ -1,16 +1,18 @@
 # 构建产物
 cpp/build/
-cpp/build_sim/
 cpp/*.exe
 cpp/*.obj
 cpp/bench_threads_result.txt
 bench_threads_result.txt
+bin/bench_threads_result.txt
 
 # 本地私有（不发布）
 AGENTS.md
 docs/
 memory/
 cpp/build_eval_s3.bat
+.vscode/
+.zcodeignore
 
 # GPU 版（仅本地留存）
 cpp/rime_llm_cuda.cpp
