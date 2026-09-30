@@ -118,6 +118,30 @@ int main(void) {
         "for _, f in ipairs({'llm_filter.lua', 'llm_processor.lua'}) do\n"
         "  local chunk, err = loadfile('../user/' .. f)\n"
         "  print('[host] syntax', f, chunk and 'OK' or err)\n"
+        "end\n"
+        /* 探测 rime-lua 暴露的全局匹配函数（编码模式匹配用哪个引擎的实测依据） */
+        "for _, n in ipairs({'regex_match','regex_search','regex_replace','utf8'}) do\n"
+        "  print('[host] global', n, type(_G[n]))\n"
+        "end\n"
+        /* match_code 语义探针（2026-09-30 编码模式匹配） */
+        "local mc = package.loaded.rime_llm.match_code\n"
+        "print('[host] match_code type:', type(mc))\n"
+        "local function t(pat, code)\n"
+        "  local ok, r = pcall(mc, pat, code)\n"
+        "  print(string.format('[host]   %-14s vs %-7s -> %s', pat, code, ok and tostring(r) or ('ERR ' .. tostring(r))))\n"
+        "end\n"
+        "if type(mc) == 'function' then\n"
+        "  t('.{4}', 'abcd')      -- 期望 true\n"
+        "  t('.{4}', 'abcde')     -- 期望 false（4 码以外不匹配）\n"
+        "  t('.{4,}', 'abcd')     -- 期望 true\n"
+        "  t('.{4,}', 'abcde')    -- 期望 true\n"
+        "  t('.{3,4}', 'abc')     -- 期望 true\n"
+        "  t('.{3,4}', 'abcde')   -- 期望 false\n"
+        "  t('[abcde]{4}', 'abcd')-- 期望 true\n"
+        "  t('[abcde]{4}', 'abcf')-- 期望 false\n"
+        "  t('.+', 'a')           -- 期望 true\n"
+        "  t('', 'a')             -- 期望 true（空=总是匹配）\n"
+        "  t('(', 'a')            -- 非法模式 -> 回退默认 .{4}\n"
         "end\n"))
         return 1;
 

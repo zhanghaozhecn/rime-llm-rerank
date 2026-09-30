@@ -134,15 +134,19 @@ function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $
 # 头部 com_ctx_enabled）——方案里残留的旧行在 GUI 保存/重跑加 LLM 重建节时剥除。
 # min_tokens 已删（2026-09-30 定案：最少上文 token 恒为 1，代码默认保留、不给用户改）
 # ——同样只在重建节时剥除，不做专门清理。
+# min_code_len / max_code_len 已废弃（2026-09-30 定案：改为 code_pattern 正则匹配，
+# 语义同 Rime speller/auto_select_pattern 的全串匹配）——旧行同样在重建节时剥除。
 $PARAM_DEFAULTS = [ordered]@{
   enabled = $false
-  min_code_len = 4; max_code_len = 0
+  code_pattern = '.{4}'   # 仅 4 码；4 码以上 .{4,} / 3-4 码 .{3,4} / 指定字母 [abcde]{4}
   max_tokens = 10; max_candidates = 5; cpu_cores = 4
   freq_beta = 1.5; expected_length_weight = 0.2; debug_fusion = $false
 }
-$PARAM_INT_KEYS  = @("min_code_len","max_code_len","max_tokens","max_candidates","cpu_cores")
+$PARAM_INT_KEYS  = @("max_tokens","max_candidates","cpu_cores")
 $PARAM_DBL_KEYS  = @("freq_beta","expected_length_weight")
 $PARAM_BOOL_KEYS = @("debug_fusion")
+# 字符串型参数（不做数值解析，原样写回；空串合法 = 总是匹配）
+$PARAM_STR_KEYS  = @("code_pattern")
 
 function Format-F2([double]$x) {
   [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:F2}", $x)
@@ -169,7 +173,9 @@ function Read-LlmParams([string]$schemaPath) {
       $key = $Matches[1]
       $v = $Matches[2].Trim()
       $v = $v -replace '\s+#.*$', ''
-      if ($v -match '^".*"$') { $v = $v.Trim('"') }
+      # 引号去壳：双引号（历史 model_path 风格）与单引号（code_pattern 正则风格，
+      # 2026-09-30）都要剥——只剥双引号会让正则值带壳，读回界面/逐键保留全错
+      if ($v -match '^".*"$' -or $v -match "^'.*'$") { $v = $v.Substring(1, $v.Length - 2) }
       if ($v -ne '') { $p[$key] = $v }
     }
   }
@@ -192,8 +198,7 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
   $sec = @(
     "llm_rerank:",
     "  enabled: $(if ($p.enabled) { 'true' } else { 'false' })",
-    "  min_code_len: $($p.min_code_len)",
-    "  max_code_len: $($p.max_code_len) # 0=不限制",
+    "  code_pattern: $(Convert-ToYamlScalar $p.code_pattern)",
     "  max_tokens: $($p.max_tokens)",
     "  max_candidates: $($p.max_candidates)",
     "  cpu_cores: $($p.cpu_cores)",
@@ -231,6 +236,9 @@ function Merge-LlmParams($prior) {
     foreach ($k in $PARAM_BOOL_KEYS) {
       if ($prior.ContainsKey($k)) { $d[$k] = ($prior[$k] -ieq "true") }
     }
+    foreach ($k in $PARAM_STR_KEYS) {
+      if ($prior.ContainsKey($k)) { $d[$k] = [string]$prior[$k] }
+    }
   }
   return $d
 }
@@ -244,8 +252,7 @@ function Get-LlmCfgLines([string]$modelPath, $prior) {
   $l = @(
     "", "llm_rerank:",
     "  enabled: true",
-    "  min_code_len: $($d.min_code_len)",
-    "  max_code_len: $($d.max_code_len) # 0=不限制",
+    "  code_pattern: $(Convert-ToYamlScalar $d.code_pattern)",
     "  max_tokens: $($d.max_tokens)",
     "  max_candidates: $($d.max_candidates)",
     "  cpu_cores: $($d.cpu_cores)",
@@ -261,6 +268,17 @@ function Convert-ToYamlPath([string]$p) {
   $q = $p -replace '\\', '/'
   if ($q -match '\s') { $q = '"' + $q + '"' }
   return $q
+}
+# 任意标量（非路径）：含 YAML 特殊首字符/空格/注释符/反斜杠时加引号。
+# code_pattern 常含 { } [ ] . \ 等——其中 {[ 是 YAML 流式集合起始符，
+# 且**双引号标量里 \d 这类非法转义会直接报错**，故一律用单引号
+# （内部单引号写两遍转义），正则原样保留。
+function Convert-ToYamlScalar([string]$s) {
+  if ($null -eq $s) { return "''" }
+  if ($s -eq '' -or $s -match '^\s|\s$' -or $s -match '[\\\{\[\]\}:,\#&*!\|>%@`"'']') {
+    return "'" + ($s -replace "'", "''") + "'"
+  }
+  return $s
 }
 # 方案已有 llm_rerank 节时补写 model_path（节内已有生效行则不动）
 function Add-ModelPathToExisting([System.Collections.Generic.List[string]]$out, [string]$modelPath, $Log) {
@@ -592,43 +610,42 @@ function Run-InstallerGui {
   [void](Add-Hdr $p2 "参数写入选中方案的 llm_rerank 配置节；保存后自动重新部署生效（模型路径在『安装』页配置）" 10 6 645)
   $chkEnabled = Add-Ctl "CheckBox" "启用 LLM 重排" $p2 10 28 260 24
   [void](Add-Hdr $p2 "触发条件 —— 何时打分" 10 54 320)
-  [void](Add-Ctl "Label" "最小编码长度" $p2 10 78 108 20)
-  $txtMinCode = Add-Ctl "TextBox" "" $p2 122 74 52 22
-  [void](Add-Ctl "Label" "最大编码长度（0=不限）" $p2 210 78 168 20)
-  $txtMaxCode = Add-Ctl "TextBox" "" $p2 384 74 52 22
-  [void](Add-Hdr $p2 "推理规模 —— 每次算多少、多快" 10 104 360)
-  [void](Add-Ctl "Label" "上文 token 上限" $p2 10 128 108 20)
-  $txtMaxTok = Add-Ctl "TextBox" "" $p2 122 124 52 22
-  [void](Add-Ctl "Label" "候选数上限" $p2 210 128 96 20)
-  $txtMaxCand = Add-Ctl "TextBox" "" $p2 384 124 52 22
-  [void](Add-Ctl "Label" "CPU 线程数" $p2 10 156 108 20)
-  $txtCores = Add-Ctl "TextBox" "" $p2 122 152 52 22
-  [void](Add-Hdr $p2 "候选排序融合 —— 分数怎么合成" 10 182 380)
-  [void](Add-Ctl "Label" "融合分 = score + " $p2 10 206 108 20)
-  $txtBeta = Add-Ctl "TextBox" "" $p2 122 202 52 22
-  [void](Add-Ctl "Label" "·log(1+eff)" $p2 178 206 90 20)
-  $lblPlus = Add-Ctl "Label" "+" $p2 10 234 108 20
+  [void](Add-Ctl "Label" "编码匹配（正则，全串）" $p2 10 78 160 20)
+  $txtCodePat = Add-Ctl "TextBox" "" $p2 175 74 120 22
+  [void](Add-Ctl "Label" "4 码 .{4}｜4 码以上 .{4,}｜3-4 码 .{3,4}｜[abcde]{4}｜空 = 不限" $p2 10 98 645 18)
+  [void](Add-Hdr $p2 "推理规模 —— 每次算多少、多快" 10 124 360)
+  [void](Add-Ctl "Label" "上文 token 上限" $p2 10 148 108 20)
+  $txtMaxTok = Add-Ctl "TextBox" "" $p2 122 144 52 22
+  [void](Add-Ctl "Label" "候选数上限" $p2 210 148 96 20)
+  $txtMaxCand = Add-Ctl "TextBox" "" $p2 384 144 52 22
+  [void](Add-Ctl "Label" "CPU 线程数" $p2 10 176 108 20)
+  $txtCores = Add-Ctl "TextBox" "" $p2 122 172 52 22
+  [void](Add-Hdr $p2 "候选排序融合 —— 分数怎么合成" 10 202 380)
+  [void](Add-Ctl "Label" "融合分 = score + " $p2 10 226 108 20)
+  $txtBeta = Add-Ctl "TextBox" "" $p2 122 222 52 22
+  [void](Add-Ctl "Label" "·log(1+eff)" $p2 178 226 90 20)
+  $lblPlus = Add-Ctl "Label" "+" $p2 10 254 108 20
   $lblPlus.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-  $txtElw = Add-Ctl "TextBox" "" $p2 122 230 52 22
-  [void](Add-Ctl "Label" "·span·匹配词长" $p2 178 234 130 20)
-  [void](Add-Ctl "Label" "β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）" $p2 10 262 490 18)
-  [void](Add-Ctl "Label" "elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成" $p2 10 282 520 18)
-  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion（逐候选融合明细写用户文件夹 rime_llm_debug.txt）" $p2 10 308 630 24
-  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 10 340 100 28
-  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 120 340 110 28
-  $lblParamStatus = Add-Ctl "Label" "" $p2 245 346 400 18
+  $txtElw = Add-Ctl "TextBox" "" $p2 122 250 52 22
+  [void](Add-Ctl "Label" "·span·匹配词长" $p2 178 254 130 20)
+  [void](Add-Ctl "Label" "β = 词频系数（0=关闭）；elw = 预期词长权重（0=关闭）" $p2 10 282 490 18)
+  [void](Add-Ctl "Label" "elw 仅两码一字方案生效：词长=码长/2 的候选获得 span×elw 加成" $p2 10 302 520 18)
+  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion（逐候选融合明细写用户文件夹 rime_llm_debug.txt）" $p2 10 328 630 24
+  $btnParamRead = Add-Ctl "Button" "读取参数" $p2 10 360 100 28
+  $btnParamSave = Add-Ctl "Button" "保存并生效" $p2 120 360 110 28
+  $lblParamStatus = Add-Ctl "Label" "" $p2 245 366 400 18
   $lblParamStatus.ForeColor = [System.Drawing.Color]::DarkBlue
 
   # 参数字段注册表（键 = llm_rerank 键名）；默认值回填（= lua cfg 默认）
   $paramEdits = @{
-    min_code_len = $txtMinCode
-    max_code_len = $txtMaxCode
+    code_pattern = $txtCodePat
     max_tokens = $txtMaxTok
     max_candidates = $txtMaxCand
     cpu_cores = $txtCores
     freq_beta = $txtBeta
     expected_length_weight = $txtElw
   }
+  foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
   foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
   $txtBeta.Text = Format-F2 ([double]$PARAM_DEFAULTS["freq_beta"])
   $txtElw.Text = Format-F2 ([double]$PARAM_DEFAULTS["expected_length_weight"])
@@ -657,9 +674,13 @@ function Run-InstallerGui {
       foreach ($k in $PARAM_BOOL_KEYS) {
         if ($sec.ContainsKey($k)) { $v[$k] = ($sec[$k] -ieq "true") }
       }
+      foreach ($k in $PARAM_STR_KEYS) {
+        if ($sec.ContainsKey($k)) { $v[$k] = [string]$sec[$k] }
+      }
       if ($sec.ContainsKey("enabled")) { $v.enabled = ($sec["enabled"] -ieq "true") }
     }
     foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$v[$k] }
+    foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$v[$k] }
     $txtBeta.Text = Format-F2 ([double]$v.freq_beta)
     $txtElw.Text = Format-F2 ([double]$v.expected_length_weight)
     $chkEnabled.Checked = $v.enabled
@@ -685,6 +706,9 @@ function Run-InstallerGui {
       return
     }
     $p = @{}
+    foreach ($k in $PARAM_STR_KEYS) {
+      $p[$k] = [string]$paramEdits[$k].Text.Trim()
+    }
     foreach ($k in $PARAM_INT_KEYS) {
       $n = 0
       if (-not [int]::TryParse($paramEdits[$k].Text.Trim(), [ref]$n)) {

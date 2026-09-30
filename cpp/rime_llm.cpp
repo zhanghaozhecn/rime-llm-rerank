@@ -36,6 +36,7 @@ extern "C" {
 #include <cstdarg>
 #include <cstdlib>
 #include <algorithm>
+#include <regex>
 
 // ============================================================
 // 配置默认值
@@ -1371,6 +1372,60 @@ static int lua_click_happened(lua_State * L) {
 }
 
 // ============================================================
+// 编码模式匹配（2026-09-30 取代 min_code_len/max_code_len 区间）
+// ============================================================
+// match_code(pattern, code) -> bool
+//   全串匹配（与 Rime 自身 speller/auto_select_pattern 的语义一致，
+//   其实现为 boost::regex_match）。这里用 std::regex（MSVC 标准库，
+//   零新依赖）承载同一套 ECMAScript 语法——用户写的 .{4} / .{4,} /
+//   .{3,4} / [abcde]{4} 在 boost 与 std::regex 下等价。
+//   语义约定：
+//     - 模式为空或 nil → 视为「总是匹配」（回退默认 .{4} 由调用方决定）
+//     - 模式非法（编译异常）→ 回退默认模式并记日志，不抛给 lua
+//     - 匹配对象是**输入编码串**（非候选词）
+//   性能：仅当模式字符串变化时重新编译（用户改配置才触发）。
+static const char *kDefaultCodePattern = ".{4}";  // 恰 4 码 = 原 min_code_len=4
+
+static int lua_match_code(lua_State * L) {
+    const char * pat = luaL_optstring(L, 1, NULL);
+    const char * code = luaL_optstring(L, 2, "");
+    if (!pat || !*pat) {          // 空模式 = 总是匹配
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    static std::string  last_pat;
+    static std::regex   re;
+    static bool         re_valid = false;
+    if (last_pat != pat || (!re_valid && last_pat.empty())) {
+        last_pat = pat;
+        try {
+            re = std::regex(pat, std::regex::ECMAScript);
+            re_valid = true;
+        } catch (const std::regex_error & e) {
+            log_msg("[match_code] invalid pattern '%s' (%s) -> fallback '%s'",
+                    pat, e.what(), kDefaultCodePattern);
+            try {
+                last_pat = kDefaultCodePattern;
+                re = std::regex(kDefaultCodePattern, std::regex::ECMAScript);
+                re_valid = true;
+            } catch (...) {
+                re_valid = false;
+            }
+        }
+    }
+    bool ok = false;
+    if (re_valid) {
+        try {
+            ok = std::regex_match(std::string(code), re);
+        } catch (...) {
+            ok = false;
+        }
+    }
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+// ============================================================
 // __index / __newindex
 // ============================================================
 static int lua_index(lua_State * L) {
@@ -1445,6 +1500,13 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
 
     lua_pushcfunction(L, lua_click_happened);
     lua_setfield(L, -2, "click_happened");
+
+    // 编码模式匹配（2026-09-30）：取代 min_code_len/max_code_len 区间，
+    // 与 Rime 自身 auto_select_pattern 同语义（全串匹配）
+    lua_pushcfunction(L, lua_match_code);
+    lua_setfield(L, -2, "match_code");
+    lua_pushstring(L, kDefaultCodePattern);
+    lua_setfield(L, -2, "default_code_pattern");
 
     // 可写属性（model_path/max_ctx/n_threads/n_ctx/n_seq_max/min_tokens）
     // 严禁在此预填充为原始字段——Lua 的 __newindex 只对表中不存在的键

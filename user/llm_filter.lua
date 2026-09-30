@@ -6,10 +6,15 @@ local llm = nil
 local llm_loaded_for = nil  -- enabled value when llm was loaded
 
 local cfg = {
-    min_code_len     = 4,
-    max_code_len     = 0,   -- 0 = 不限制（编码长度上限，超出不推理）
-    -- min_tokens 不再暴露给用户：固定走 C++ 默认 1（2026-09-30 定案——
-    -- 最少上文 token 依据前期研究与长期实机使用恒为 1，无调整必要）
+    -- 编码匹配模式（2026-09-30 取代 min_code_len/max_code_len）：
+    -- 全串匹配输入编码串，语法同 Rime 自身 speller/auto_select_pattern。
+    --   仅 4 码 = '.{4}'｜4 码以上 = '.{4,}'｜3-4 码 = '.{3,4}'｜
+    --   指定首码的 4 码 = '[abcde]{4}'｜任意长度 = '.+'
+    -- 引擎：DLL 的 std::regex（ECMAScript）；不可用时回退 Lua 模式
+    -- （Lua 模式里 %d/%a 等转义与正则 \d/\w 不同，详见 README）。
+    code_pattern     = '.{4}',
+    -- min_code_len / max_code_len 已废弃（用户配置面移除，2026-09-30）：
+    -- 等价写法 = code_pattern '.{4}'
     max_tokens       = 10,  -- 截取的上文 token 数（与 C++ 默认/源码版/README 统一，2026-09-02）
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
@@ -47,8 +52,24 @@ local function get_config_number(sc, key)
     return nil
 end
 
-local function get_scores(cands)
-    if not llm or not llm.get_scores then return nil end
+-- 编码模式匹配（2026-09-30）：全串匹配，语义同 Rime speller/auto_select_pattern。
+-- 优先 DLL 的 std::regex（ECMAScript，与源码版 boost::regex 同套语法）；
+-- 老版本 DLL 无 match_code 时回退 Lua 模式（用 find 的全串匹配 + 首尾锚定）。
+-- 空模式 = 总是匹配（与源码版一致）。
+local function match_code_pattern(code)
+    local pat = cfg.code_pattern
+    if not pat or pat == "" then return true end
+    if llm and llm.match_code then
+        local ok, r = pcall(llm.match_code, pat, code)
+        if ok then return r and true or false end
+        -- pcall 失败（模式非法）→ 落到下面的 Lua 模式回退
+    end
+    local ok, s, e = pcall(string.find, code, pat)
+    if not ok or not s then return false end
+    return s == 1 and e == #code   -- 全串匹配（Lua find 允许中段命中）
+end
+
+local function get_scores(cands)    if not llm or not llm.get_scores then return nil end
     local ok, scores = pcall(function() return llm.get_scores() end)
     if not ok or type(scores) ~= "table" then return nil end
     for _, text in ipairs(cands) do
@@ -77,11 +98,11 @@ end
 
 local function init_config(env)
     local sc = env.engine.schema.config
-    local v = sc:get_int("llm_rerank/min_code_len")
-    if v then cfg.min_code_len = v end
-    v = sc:get_int("llm_rerank/max_code_len")
-    if v then cfg.max_code_len = v end
-    v = get_config_number(sc, "llm_rerank/expected_length_weight")
+    -- 编码匹配模式（2026-09-30 取代 min/max_code_len）：get_string 未配置返回
+    -- nil，配置了空串则视为"总是匹配"（与源码版一致）
+    local pat = sc:get_string("llm_rerank/code_pattern")
+    if pat ~= nil then cfg.code_pattern = pat end
+    local v = get_config_number(sc, "llm_rerank/expected_length_weight")
     if v ~= nil then cfg.expected_length_weight = math.max(0, v) end
     v = get_config_number(sc, "llm_rerank/freq_beta")
     if v ~= nil then cfg.freq_beta = math.max(0, v) end
@@ -116,7 +137,7 @@ return function(translation, env)
 
     -- 候选窗快照: (input, 前 max_candidates 个候选) 供 llm_processor 上屏时
     -- 关联真实候选窗写入训练语料 (与 LLM 打分范围一致)。所有路径统一记录,
-    -- 含 off/未加载/min_code_len 未达的透传路径——候选窗是 RIME 实际显示的集合,
+    -- 含 off/未加载/编码不匹配 code_pattern 的透传路径——候选窗是 RIME 实际显示的集合,
     -- 即使不评分也构成训练样本 (LLM 要学的是在真实窗内把正确词排第一)。
     local win = {}
     for i, c in ipairs(all) do
@@ -139,10 +160,11 @@ return function(translation, env)
         for _, c in ipairs(all) do yield(c) end; return
     end
 
-    if #input < cfg.min_code_len then
-        for _, c in ipairs(all) do yield(c) end; return
-    end
-    if cfg.max_code_len > 0 and #input > cfg.max_code_len then
+    -- 触发条件：编码串是否匹配 code_pattern（2026-09-30 取代 min/max_code_len 区间）
+    -- 全串匹配（同 Rime auto_select_pattern 语义）。优先用 DLL 的 std::regex
+    -- （与源码版 boost::regex 同一套 ECMAScript 语法）；DLL 不提供该函数时
+    -- 回退 Lua 模式——两种写法对 .{4} / .{4,} / .{3,4} / [abcde]{4} 等价。
+    if not match_code_pattern(input) then
         for _, c in ipairs(all) do yield(c) end; return
     end
 
