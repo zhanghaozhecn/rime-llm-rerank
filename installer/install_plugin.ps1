@@ -4,9 +4,10 @@
 # 2026-09-04 按用户定案合并为本仓库单文件，源码版动作与双版分支随之删除。
 # GUI：双击 install_plugin.bat（提权）→ **单页**（2026-09-30 用户定案：与源码版
 #   WeaselLLMSetup 尽量一致、并去掉"加/去 LLM 在另一页"的割裂）：
-#     方案接入（方案下拉 + 刷新/导入…/接入 LLM/剥离）→ 总控（启用 + 模型路径 +
-#     模型状态）→ 触发条件 → 推理规模 → 候选排序融合 → 诊断日志 → 安装（复制文件 /
-#     下载模型）→ 保存并生效 / 关闭 / 打开用户文件夹。
+#     方案接入（方案下拉）→ 总控（启用 + 模型路径 + 下载模型 + 模型状态）→ 触发条件 →
+#     推理规模 → 候选排序融合 → 诊断日志 → 安装（复制文件）→ 保存并生效 / 剥离 / 关闭。
+# 底色：表单 BackColor = White（2026-10-01 用户定案：**两版底色统一为白**；
+#   WinForms 的 BackColor 是环境属性，GroupBox/Label/CheckBox 未显式设色时会跟着继承）。
 #   界面**不留日志框**：正常只更新状态行；出错写 installer\install_error.log
 #   （GUI 程序所在目录）并弹一次框给出日志路径。
 #   参数读写选中方案的 llm_rerank 配置节，保存后自动重新部署（两版配置节相同）。
@@ -663,6 +664,9 @@ function Run-InstallerGui {
   $form.StartPosition = "CenterScreen"
   $form.FormBorderStyle = "FixedDialog"
   $form.MaximizeBox = $false
+  # 底色 = 白（2026-10-01 用户定案：两版底色统一）。WinForms 的 BackColor 是**环境属性**，
+  # 未显式设色的子控件（GroupBox / Label / CheckBox）会继承 → 一处置白即可全白。
+  $form.BackColor = [System.Drawing.Color]::White
   # 字体/缩放交给系统（AutoScaleMode=Font 时 WinForms 按系统 DPI 缩放，控件不糊）
   $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
   # 状态色（原 DarkBlue/Firebrick 偏刺眼，改柔和且语义清晰）
@@ -695,7 +699,6 @@ function Run-InstallerGui {
   $tipStrip = "剥离：把选中方案里的 LLM 组件行与 llm_rerank 配置节整个删掉`n（方案回到『未接入』状态），并自动重新部署。`n日常只想改参数请用『保存并生效』。"
   $tipFiles = "复制文件：停服务 → 清理旧二进制 → 替换 rime_llm.dll 与 lua → 启服务。"
   $tipDownload = "下载模型：ModelScope 断点续传（curl -C -），落点 = 左边的模型路径框`n（留空 = 用户文件夹里的默认名 Qwen3.5-0.8B-Q4_K_M.gguf）。`n失败会保留 .download 分片，再点一次即续传。"
-  $tipOpenDir = "打开小狼毫用户文件夹（%APPDATA%\Rime）——方案、模型与日志都在这里。"
 
   # 控件工厂：AutoSize=false —— Label 默认宽度会被缩到文字宽，
   # 破坏公式行"+"右对齐列与编辑框同列对齐（固定宽度才可核对不相交）
@@ -753,6 +756,40 @@ function Run-InstallerGui {
   # 行内「?」徽标 x：分组框客户区右端再退 24（18 宽徽标 + 6 余量）
   function Help-X($g) { $g.ClientSize.Width - 24 }
 
+  # ── 按钮配色（2026-10-01 用户定案：按钮换背景色、更显眼）──────────────
+  # WinForms 主题按钮**忽略** BackColor（UseVisualStyleBackColor=true 时不生效）
+  # → 一律 FlatStyle=Flat + UseVisualStyleBackColor=false 才能上色。
+  # 主按钮（保存并生效）= 深蓝白字；其余按钮 = 浅蓝深字；
+  # 三态（常态/悬停/按下）各一套色。色值与源码版 WeaselLLMSetup.cpp
+  # 的 kBtnAccent* / kBtnSoft* **逐值一致**，两版界面保持同款。
+  $colBtnBg     = [System.Drawing.Color]::FromArgb(232, 240, 250)
+  $colBtnBgHot  = [System.Drawing.Color]::FromArgb(214, 229, 246)
+  $colBtnBgDown = [System.Drawing.Color]::FromArgb(196, 216, 240)
+  $colBtnEdge   = [System.Drawing.Color]::FromArgb(157, 187, 220)
+  $colBtnFg     = [System.Drawing.Color]::FromArgb(31, 78, 121)
+  $colPriBg     = [System.Drawing.Color]::FromArgb(45, 108, 192)
+  $colPriBgHot  = [System.Drawing.Color]::FromArgb(62, 128, 214)
+  $colPriBgDown = [System.Drawing.Color]::FromArgb(30, 84, 156)
+  $colPriEdge   = [System.Drawing.Color]::FromArgb(24, 70, 130)
+  function Style-Btn($b, [bool]$primary) {
+    $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $b.UseVisualStyleBackColor = $false
+    $b.FlatAppearance.BorderSize = 1
+    if ($primary) {
+      $b.BackColor = $colPriBg
+      $b.ForeColor = [System.Drawing.Color]::White
+      $b.FlatAppearance.BorderColor = $colPriEdge
+      $b.FlatAppearance.MouseOverBackColor = $colPriBgHot
+      $b.FlatAppearance.MouseDownBackColor = $colPriBgDown
+    } else {
+      $b.BackColor = $colBtnBg
+      $b.ForeColor = $colBtnFg
+      $b.FlatAppearance.BorderColor = $colBtnEdge
+      $b.FlatAppearance.MouseOverBackColor = $colBtnBgHot
+      $b.FlatAppearance.MouseDownBackColor = $colBtnBgDown
+    }
+  }
+
   # 错误日志（2026-09-30 用户定案：界面不留日志框，**只在出错时**写文件到
   # GUI 程序所在目录 = installer\，便于用户回传；正常流程只更新状态行）
   $script:ErrLog = Join-Path $PSScriptRoot "install_error.log"
@@ -794,6 +831,8 @@ function Run-InstallerGui {
   $cmbModel.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
   $btnModelBrowse = Add-Ctl "Button" "浏览…" $g1 392 50 74 24
   $btnDownload = Add-Ctl "Button" "下载模型" $g1 470 50 128 24
+  Style-Btn $btnModelBrowse $false
+  Style-Btn $btnDownload $false
   $script:tip.SetToolTip($cmbModel, $tipModel)
   $script:tip.SetToolTip($btnModelBrowse, "选择已有的 .gguf 模型文件。")
   $script:tip.SetToolTip($btnDownload, $tipDownload)
@@ -854,20 +893,34 @@ function Run-InstallerGui {
   #    模型下载归「总控」的模型路径行（2026-10-01 用户定案：下载 = 配置动作，两版一致）
   $g5 = Add-Group $form "安装" $GX 556 $GW 76
   $btnFiles = Add-Ctl "Button" "复制文件" $g5 14 24 152 30
+  Style-Btn $btnFiles $false
   $script:tip.SetToolTip($btnFiles, $tipFiles)
   $lblInstallStatus = Add-Ctl "Label" "" $g5 174 30 460 18
   $lblInstallStatus.ForeColor = $colInfo
 
-  # ── 操作行：保存 / 剥离 / 关闭 / 打开用户文件夹（剥离 = 保存的破坏性补充，2026-10-01 起并排）──
-  $btnParamSave = Add-Ctl "Button" "保存并生效" $form 16 640 110 32
-  $btnStrip = Add-Ctl "Button" "剥离" $form 130 640 76 32
-  $btnClose = Add-Ctl "Button" "关闭" $form 214 640 76 32
+  # ── 操作行：保存 / 剥离 / 关闭（剥离 = 保存的破坏性补充，2026-10-01 起并排）──
+  #    2026-10-01 用户定案：本行按钮**同宽**（按最长的"保存并生效"实测，随字体/DPI 自适应）
+  #    + 统一配色（主按钮深蓝白字，其余浅蓝深字）；『打开用户文件夹』已按用户要求删除
+  #    （要看用户文件夹走小狼毫托盘右键的「用户文件夹」）
+  $btnRowTexts = @("保存并生效", "剥离", "关闭")
+  $btnRowW = 0
+  foreach ($t in $btnRowTexts) {
+    $w = ([System.Windows.Forms.TextRenderer]::MeasureText($t, $form.Font)).Width + 26
+    if ($w -gt $btnRowW) { $btnRowW = $w }
+  }
+  $btnRowGap = 8
+  $btnParamSave = Add-Ctl "Button" "保存并生效" $form 16 640 $btnRowW 32
+  $btnStrip = Add-Ctl "Button" "剥离" $form (16 + $btnRowW + $btnRowGap) 640 $btnRowW 32
+  $btnClose = Add-Ctl "Button" "关闭" $form (16 + 2 * ($btnRowW + $btnRowGap)) 640 $btnRowW 32
+  Style-Btn $btnParamSave $true
+  Style-Btn $btnStrip $false
+  Style-Btn $btnClose $false
+  # 回车 = 保存并生效（源码版同语义：DM_GETDEFID 回答 IDC_SAVE）
+  $form.AcceptButton = $btnParamSave
   $script:tip.SetToolTip($btnParamSave, $tipSave)
   $script:tip.SetToolTip($btnStrip, $tipStrip)
   $lblParamStatus = Add-Ctl "Label" "" $form 16 678 668 18
   $lblParamStatus.ForeColor = $colInfo
-  $btnOpenDir = Add-Ctl "Button" "打开用户文件夹" $form 558 640 126 32
-  $script:tip.SetToolTip($btnOpenDir, $tipOpenDir)
   $lblFooter = Add-Ctl "Label" ("保存后自动重新部署生效　|　本机逻辑核 " + [Environment]::ProcessorCount + "　|　出错日志：install_error.log（本目录）") $form 16 700 668 16
   $lblFooter.ForeColor = [System.Drawing.Color]::DimGray
   $lblFooter.Font = New-Object System.Drawing.Font($form.Font.FontFamily, [float]($form.Font.Size - 0.75))
@@ -1376,16 +1429,6 @@ function Run-InstallerGui {
   })
   $btnParamSave.Add_Click({ Save-ParamsFromUi })
   $btnClose.Add_Click({ $form.Close() })
-  $btnOpenDir.Add_Click({
-    try {
-      if (-not (Test-Path $RIME_USER)) { New-Item -ItemType Directory -Path $RIME_USER -Force | Out-Null }
-      Start-Process explorer.exe $RIME_USER
-    } catch {
-      $lblParamStatus.Text = "[失败] 无法打开用户文件夹：" + $_.Exception.Message
-      $lblParamStatus.ForeColor = $colErr
-      Write-ErrLog "打开用户文件夹失败" ($_.Exception.ToString()) | Out-Null
-    }
-  })
   # 切方案 = 切配置（配置节在方案里）；重扫列表时的恢复选择被抑制。
   # ④ 有未保存改动时先问（否则切换会把界面改动静默丢掉）；选"否"把下拉拨回去
   $cmbSchema.Add_SelectedIndexChanged({
