@@ -28,3 +28,6 @@ __pycache__/
 installer/plugin/
 installer/*.zip
 installer/source/
+
+# 安装器错误日志（2026-09-30：界面不再有日志框，只在出错时写本文件）
+installer/install_error.log

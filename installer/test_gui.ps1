@@ -1,11 +1,10 @@
-# test_gui.ps1 — 插件版安装器 GUI/CLI 自动化测试（沙箱隔离）
+﻿# test_gui.ps1 — 插件版安装器 GUI/CLI 自动化测试（沙箱隔离）
 #
 # 隔离：$env:APPDATA 重定向到沙箱目录，GUI/CLI 子进程继承——所有 schema
 # 读写物理落在沙箱，杜绝误伤活配置（2026-09-29 源码版 GUI 测试事故同款
 # 教训：无隔离 + 下拉默认第一项 = 打在活方案上）。
 # 测试钩子（install_plugin.ps1 内置）：
 #   LLM_INSTALLER_NO_REDEPLOY=1  跳过重新部署（沙箱内无小狼毫可部署）
-#   LLM_INSTALLER_TAB2=1         GUI 启动直接落在『参数配置』页
 # 用 pwsh 7 运行：pwsh -File test_gui.ps1
 $ErrorActionPreference = "Stop"
 $entry = Join-Path $PSScriptRoot "install_plugin.ps1"
@@ -105,8 +104,8 @@ llm_rerank:
   Assert "组件行已删" ((($f | Select-String "lua_processor@|lua_filter@").Count) -eq 0)
 
   # ══ GUI 相位：参数配置页 ═══════════════════════════════
-  Write-Host "== GUI 启动（沙箱 + TAB2 钩子）=="
-  $env:LLM_INSTALLER_TAB2 = "1"
+  Write-Host "== GUI 启动（沙箱 APPDATA）=="
+  
   $proc = Start-Process -FilePath $psExe -ArgumentList @("-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "`"$entry`"") -PassThru
   $hw = [IntPtr]::Zero
   for ($t = 0; $t -lt 24; $t++) {
@@ -159,13 +158,40 @@ public class W {
         h = $h; cls = $cn.ToString(); text = (Get-WText $h)
         vis = [W]::IsWindowVisible($h)
         parent = [W]::GetParent($h)
-        x = $r.L; y = $r.T
+        x = $r.L; y = $r.T; w = ($r.R - $r.L); hh = ($r.B - $r.T)
       }
     }
     return $list
   }
   function Find-Button([string]$text) {
     (Get-Ctls | Where-Object { $_.vis -and $_.cls -match "BUTTON" -and $_.text -eq $text } | Select-Object -First 1).h
+  }
+  # 控件是否存在（按文本；跨进程 $null 与 [IntPtr]::Zero 不可比，故用计数判据）
+  function Has-Text([string]$text) {
+    @(Get-Ctls | Where-Object { $_.text -eq $text }).Count -gt 0
+  }
+  # ComboBox 列表项（跨进程：CB_GETCOUNT + CB_GETLBTEXT）
+  function Find-Combo {
+    (Get-Ctls | Where-Object { $_.cls -match '(?i)COMBOBOX' } | Select-Object -First 1).h
+  }
+  function Combo-Items([IntPtr]$h) {
+    $n = [int][W]::SendMsg($h, 0x0146, [IntPtr]::Zero, [IntPtr]::Zero)
+    $out = @()
+    for ($i = 0; $i -lt $n; $i++) {
+      $len = [int][W]::SendMsg($h, 0x0149, [IntPtr]$i, [IntPtr]::Zero)
+      if ($len -le 0) { continue }
+      $sb = New-Object System.Text.StringBuilder ($len + 2)
+      [void][W]::SendMsgBuf($h, 0x0148, [IntPtr]$i, $sb)
+      $out += $sb.ToString()
+    }
+    return $out
+  }
+  # 原生下拉框的键盘选择由控件自身处理并向父窗口发 CBN_SELCHANGE（WinForms 据此更新
+  # 托管 SelectedIndex）——故无需跨进程 SetFocus，直接投 VK_END 选最后一项即可
+  function Combo-SelectLast([IntPtr]$h) {
+    [void][W]::SendMsg($h, 0x0100, [IntPtr]0x23, [IntPtr]::Zero)   # WM_KEYDOWN VK_END
+    [void][W]::SendMsg($h, 0x0101, [IntPtr]0x23, [IntPtr]::Zero)   # WM_KEYUP
+    Start-Sleep -Milliseconds 700
   }
   function Find-Check([string]$needle) {
     (Get-Ctls | Where-Object { $_.vis -and $_.cls -match "BUTTON" -and $_.text -like ("*" + $needle + "*") } | Select-Object -First 1).h
@@ -180,52 +206,50 @@ public class W {
     $t = (Get-Ctls | Where-Object { $_.vis } | ForEach-Object { $_.text }) -join "`n"
     return $t.Contains($needle)
   }
-  # TAB2 激活时参数页的 EDIT 参数框（2026-09-30 起共 7 个）。按 (y,x) 排序 = 布局常量序：
-  # [0]编码匹配(code_pattern) [1]上文上限 [2]候选上限 [3]线程 [4]β [5]elw
-  # 注意：不能用 IsWindowVisible 判定——跨进程读 WinForms 页的可见性不可靠
-  # （实测同一页内"CPU 线程数"框被判不可见，页内控件还会与另一页互相串扰）；
-  # 改为按**屏幕坐标**过滤：参数页从 y+42 起，页内首个参数框 y 偏移 ≥ 60。
+  # 单页界面（2026-09-30 定案）参数框 = 三个参数分组框里的 EDIT。
+  # 判据：EDIT 的**直接父窗口文本** ∈ {触发条件, 推理规模, 候选排序融合}
+  #   —— 天然排除「模型路径」下拉框内嵌的 EDIT（其父是 ComboBox）。
+  # 跨进程读控件文本必须走 WM_GETTEXT（GetWindowText 对无 caption 的子控件
+  #   返回空串；见顶层 AGENTS 关键坑 10）。
   function Get-ParamEdits {
-    # 最可靠判据：控件**祖辈里含**『参数配置』TabPage（另一页的控件不满足；
-    # 2026-09-30 起参数框嵌在 GroupBox 里，父窗口不再直接是页 → 需向上追溯）。
-    # 坐标/可见性都不可靠：跨进程读 WinForms 页可见性会把隐藏的"未以管理员运行"
-    # 警告 Edit 也算进来，且两页控件挂在同一个顶层窗口下（实测）。
     @(Get-Ctls | Where-Object {
         if ($_.cls -notmatch '\.Edit\.') { return $false }
-        $p = $_.parent
-        for ($i = 0; $i -lt 4 -and $p -ne [IntPtr]::Zero; $i++) {
-          if ($p -eq $script:ParamsTab) { return $true }
-          $p = [W]::GetParent($p)
-        }
-        return $false
+        if ($_.parent -eq [IntPtr]::Zero) { return $false }
+        $ptxt = Get-WText $_.parent
+        return (@('触发条件', '推理规模', '候选排序融合') -contains $ptxt)
       } | Sort-Object y, x)
   }
   function Set-Edit($e, [string]$v) { [void][W]::SendMsgStr($e.h, 0x000C, [IntPtr]::Zero, $v) }  # WM_SETTEXT
+  # 显式重读参数（原来靠「读取参数」按钮；该按钮已随单页化删除）
+  function Reload-Params { Click-Btn (Find-Button "刷新") }
 
   Write-Host "== G1: 未接入方案读参数（默认值）=="
-  # 『参数配置』页（TAB2 钩子已激活它）= 类名匹配页窗口、屏幕 y 更大的那个
-  # 『参数配置』页 = 可见的那个 TabPage（TAB2 钩子已激活它）；另一页 vis=False。
-  # 注意：两页屏幕坐标几乎相同，按 y 排序取"更大/更小"不可靠（实测取到过隐藏页）。
-  $script:ParamsTab = (Get-Ctls | Where-Object { $_.cls -match '\.Window\.\d+\.' -and $_.vis -and $_.text -eq '参数配置' } |
-                       Select-Object -First 1).h
-  if ($env:LLM_TEST_DUMP) {
-    Get-Ctls | Where-Object { $_.cls -match '\.Window\.\d+\.' } | Sort-Object y, x | ForEach-Object {
-      Write-Host ("  PAGE h={0} text='{1}' y={2} x={3} vis={4}" -f $_.h, ($_.text -replace "`r?`n", ' / '), $_.y, $_.x, $_.vis)
-    }
-    foreach ($c in (Get-Ctls | Where-Object { $_.cls -match '\.Edit\.' } | Sort-Object y, x)) {
-      Write-Host ("  edit text='{0}' y={1} x={2} parent={3}" -f ($c.text -replace "`r?`n", ' / '), $c.y, $c.x, $c.parent)
-    }
-  }
-  Click-Btn (Find-Button "读取参数")
-  Assert "状态含 未接入" (Any-Text "未接入 LLM")
+  Assert "状态含 未接入" (Any-Text "未接入")
   # G0（2026-09-30 用户定案）：参数说明**不再直出**界面——一个配置项一行，
-  # 行末「?」徽标（Text="?"，悬停弹 ToolTip）。此处守住"说明不直出 + 徽标在"。
+  # 行末「?」徽标（Text="?"，悬停弹 ToolTip）。
   $labels = @(Get-Ctls | Where-Object { $_.cls -match '\.Static\.' } | ForEach-Object { $_.text })
   $labelAll = $labels -join "`n"
-  Assert "参数页无直出说明（无 正则（全串匹配））" (-not $labelAll.Contains("正则（全串匹配）"))
-  Assert "参数页无直出说明（无 0 = 关闭）" (-not $labelAll.Contains("0 = 关闭"))
-  Assert "参数页无直出说明（无 一般不用改）" (-not $labelAll.Contains("一般不用改"))
+  Assert "界面无直出说明（无 正则（全串匹配））" (-not $labelAll.Contains("正则（全串匹配）"))
+  Assert "界面无直出说明（无 0 = 关闭）" (-not $labelAll.Contains("0 = 关闭"))
+  Assert "界面无直出说明（无 一般不用改）" (-not $labelAll.Contains("一般不用改"))
   Assert "「?」徽标 ≥ 6 个" ((@($labels | Where-Object { $_ -eq "?" }).Count) -ge 6)
+  # 单页化 + 去日志 + 按钮归位（2026-09-30 用户定案）
+  Assert "无日志框（无大号多行 EDIT）" (@(Get-Ctls | Where-Object { $_.cls -match '\.Edit\.' -and $_.w -gt 400 -and $_.hh -gt 100 }).Count -eq 0)
+  Assert "「接入 LLM」与保存同页" ((Find-Button "接入 LLM") -ne [IntPtr]::Zero)
+  Assert "「剥离」与保存同页" ((Find-Button "剥离") -ne [IntPtr]::Zero)
+  Assert "「复制文件」在页" ((Find-Button "复制文件") -ne [IntPtr]::Zero)
+  Assert "「下载模型」在页" ((Find-Button "下载模型") -ne [IntPtr]::Zero)
+  Assert "旧「方案配置加 LLM」已移除" (-not (Has-Text "方案配置加 LLM"))
+  Assert "旧「方案配置去 LLM」已移除" (-not (Has-Text "方案配置去 LLM"))
+  Assert "旧「读取参数」已移除" (-not (Has-Text "读取参数"))
+  Assert "旧「导入…」已移除" (-not (Has-Text "导入…"))
+  # 方案下拉 = 用户文件夹 + 程序文件夹（预装方案带「（程序）」后缀）
+  $cmb = Find-Combo
+  $items = Combo-Items $cmb
+  Write-Host ("  方案下拉（{0} 项）: {1}" -f $items.Count, ($items -join ' | '))
+  Assert "方案下拉含沙箱用户文件夹方案" (@($items | Where-Object { $_ -eq 'zz_test_gui.schema.yaml' }).Count -eq 1)
+  $prog = @($items | Where-Object { $_ -like "*（程序）" })
+  Assert ("程序文件夹预装方案已列出（实测 $($prog.Count) 个）") ($prog.Count -ge 1)
   $e = Get-ParamEdits
   Assert ("参数框数 = 6（实测 $($e.Count)：$(($e | ForEach-Object { $_.text }) -join '|')）") ($e.Count -eq 6)
   Assert "code_pattern = .{4}" ((Get-WText $e[0].h) -eq ".{4}")
@@ -272,7 +296,7 @@ llm_rerank:
   debug_fusion: true
   model_path: "d:/gguf_models/zz_test.gguf"
 '@ | Out-File -FilePath $test -Encoding ascii
-  Click-Btn (Find-Button "读取参数")
+  Reload-Params
   Assert "状态含 已加载" (Any-Text "已加载")
   Assert "code_pattern = .{3,4}" ((Get-WText $e[0].h) -eq ".{3,4}")
   Assert "max_tokens = 12" ((Get-WText $e[1].h) -eq "12")
@@ -284,7 +308,7 @@ llm_rerank:
   Set-Edit $e[4] "0.80"
   Set-Edit $e[0] "[abcde]{4}"
   Click-Btn (Find-Button "保存并生效")
-  Assert "状态含 已保存并触发重新部署" (Any-Text "已保存并触发重新部署")
+  Assert "状态含 已保存…并触发重新部署" (Any-Text "并触发重新部署")
   $f = Get-Content $test -Encoding UTF8
   Assert "enabled: true（读入态保持）" (($f | Where-Object { $_ -match '^\s+enabled: true\s*$' }).Count -eq 1)
   Assert "debug_fusion: true（读入态保持）" (($f | Where-Object { $_ -match '^\s+debug_fusion: true\s*$' }).Count -eq 1)
@@ -325,16 +349,60 @@ llm_rerank:
   Assert "freq_beta 仍 0.80" (($f | Where-Object { $_ -match '^\s+freq_beta: 0\.80\s*$' }).Count -eq 1)
 
   Write-Host "== G8: 重读回环（保存值回到界面）=="
-  Click-Btn (Find-Button "读取参数")
+  Reload-Params
   Assert "beta 字段 = 0.80" ((Get-WText $e[4].h) -eq "0.80")
   Assert "code_pattern 字段 = [abcde]{4}" ((Get-WText $e[0].h) -eq "[abcde]{4}")
+
+  Write-Host "== G9: 只在出错时写 install_error.log（GUI 程序目录）=="
+  $logFile = Join-Path $PSScriptRoot "install_error.log"
+  if (Test-Path $logFile) { Remove-Item $logFile -Force }
+  Click-Btn (Find-Button "保存并生效")            # 正常保存
+  Assert "正常保存不写错误日志" (-not (Test-Path $logFile))
+  # 方案文件设为只读 → 保存必失败 → 状态行失败 + 写日志
+  Set-ItemProperty -Path $test -Name IsReadOnly -Value $true
+  Click-Btn (Find-Button "保存并生效")
+  Start-Sleep -Milliseconds 600
+  Assert "失败状态出现在状态行" (Any-Text "失败")
+  Assert "错误日志已生成" (Test-Path $logFile)
+  if (Test-Path $logFile) {
+    $lg = Get-Content $logFile -Raw -Encoding UTF8
+    Assert "日志含『保存参数失败』" ($lg -match "保存参数失败")
+    Write-Host ("  日志首行: " + ($lg -split "`r?`n")[0])
+  }
+  Set-ItemProperty -Path $test -Name IsReadOnly -Value $false
+
+  Write-Host "== G10: 程序文件夹预装方案可选中 + 接入自动复制到用户文件夹 =="
+  $progName = @($prog | Select-Object -Last 1) -replace '（程序）$', ''
+  $sharedDir = Join-Path (Get-ItemProperty 'HKLM:\SOFTWARE\Rime\Weasel' -Name WeaselRoot).WeaselRoot 'data'
+  $sharedFile = Join-Path $sharedDir $progName
+  $before = (Get-FileHash $sharedFile -Algorithm SHA256).Hash
+  Combo-SelectLast $cmb
+  $sel = (Get-Ctls | Where-Object { $_.cls -match '(?i)COMBOBOX' } | Select-Object -First 1).text
+  Assert ("已选中预装方案（实测 '$sel'）") ($sel -like "*（程序）")
+  Assert "选中预装方案时状态提示会先复制" (Any-Text "程序文件夹里的预装方案")
+  Click-Btn (Find-Button "接入 LLM")
+  $copiedFile = Join-Path (Join-Path $sandbox "Rime") $progName
+  $ok = $false
+  for ($t = 0; $t -lt 40 -and -not $ok; $t++) {
+    Start-Sleep -Milliseconds 500
+    if ((Test-Path $copiedFile) -and ((Get-Content $copiedFile -Raw -Encoding UTF8) -match 'llm_rerank:')) { $ok = $true }
+  }
+  Assert "预装方案已复制到用户文件夹并写入配置节" $ok
+  if (Test-Path $copiedFile) {
+    $cf = Get-Content $copiedFile -Encoding UTF8
+    Assert "复制件含 lua_processor 组件行" (($cf | Where-Object { $_ -match 'lua_processor@\*llm_processor' }).Count -eq 1)
+    Assert "复制件含 lua_filter 组件行" (($cf | Where-Object { $_ -match 'lua_filter@\*llm_filter' }).Count -eq 1)
+    Assert "复制件 enabled: true" (($cf | Where-Object { $_ -match '^\s+enabled: true\s*$' }).Count -eq 1)
+    Remove-Item $copiedFile -Force
+  }
+  Assert "程序文件夹原件未被改动" ((Get-FileHash $sharedFile -Algorithm SHA256).Hash -eq $before)
 }
 finally {
   Get-Process pwsh, powershell -ErrorAction SilentlyContinue |
     Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like "*LLM 重排安装器*" } |
     Stop-Process -Force -ErrorAction SilentlyContinue
   Remove-Item Env:LLM_INSTALLER_NO_REDEPLOY -ErrorAction SilentlyContinue
-  Remove-Item Env:LLM_INSTALLER_TAB2 -ErrorAction SilentlyContinue
+
   Remove-Item $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($script:fail -eq 0) { Write-Host "`nALL PASS" } else { Write-Host "`nFAILED: $($script:fail)"; exit 1 }
