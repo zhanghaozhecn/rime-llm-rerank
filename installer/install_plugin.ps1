@@ -28,13 +28,27 @@ Add-Type -AssemblyName System.Drawing
 # ── 路径探测（载荷 = 本仓库 user\）─────────────────
 $PluginSrc = Join-Path (Split-Path $PSScriptRoot -Parent) "user"   # 插件版仓库 user\
 $PluginReady = Test-Path (Join-Path $PluginSrc "rime_llm.dll")
-$RIME_USER = Join-Path $env:APPDATA "Rime"
+# Rime 用户文件夹，优先级：环境变量 RIME_LLM_USER_DIR（便携/测试显式指定）
+# → 注册表 HKCU\Software\Rime\Weasel\RimeUserDir（便携模式小狼毫写的就是它）
+# → %APPDATA%\Rime。2026-10-01：此前硬编码 APPDATA，便携部署下会指错目录。
+function Get-RimeUserDir {
+  if ($env:RIME_LLM_USER_DIR -and (Test-Path $env:RIME_LLM_USER_DIR)) { return $env:RIME_LLM_USER_DIR }
+  try {
+    $v = (Get-ItemProperty -Path 'HKCU:\Software\Rime\Weasel' -Name RimeUserDir -ErrorAction Stop).RimeUserDir
+    if ($v -and (Test-Path $v)) { return $v }
+  } catch { }
+  return (Join-Path $env:APPDATA "Rime")
+}
+$RIME_USER = Get-RimeUserDir
 $LUA_DIR = Join-Path $RIME_USER "lua"
 
 # ── 模型（下载按钮用；curl 为 Win10 1803+ 自带）──
 # 默认模型路径 = 用户文件夹（2026-08-27 用户定案：不假设存在 D: 分区；
 # 有 D 盘模型的机器在 GUI/schema 里显式填 D:\gguf_models\...）
-$DEFAULT_MODEL = Join-Path (Join-Path $env:APPDATA "Rime") "Qwen3.5-0.8B-Q4_K_M.gguf"
+# 与运行期默认保持一致：C++ 侧取 RIME 用户目录根（同上注册表优先）
+$DEFAULT_MODEL = Join-Path $RIME_USER "Qwen3.5-0.8B-Q4_K_M.gguf"
+# 完整模型的体量下限（与"下载完成转正"判据同一个数）：小于它 = 疑似半截/损坏
+$MODEL_MIN_BYTES = 100MB
 $MODEL_URL = "https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf"
 
 function Find-WeaselDir {
@@ -295,11 +309,11 @@ function Merge-LlmParams($prior) {
 # 留空则保持注释示例（运行时默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）。
 # prior = 重跑加 LLM 时方案里已有的参数（Read-LlmParams 结果）——先剥后插
 # 重建节时逐键保留，防止重跑把用户自定义参数重置回默认（model_path 同思路）。
-function Get-LlmCfgLines([string]$modelPath, $prior) {
+function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
   $d = Merge-LlmParams $prior
   $l = @(
     "", "llm_rerank:",
-    "  enabled: true",
+    "  enabled: $(if ($enabled) { 'true' } else { 'false' })",
     "  code_pattern: $(Convert-ToYamlScalar $d.code_pattern)",
     "  max_tokens: $($d.max_tokens)",
     "  max_candidates: $($d.max_candidates)",
@@ -343,8 +357,9 @@ function Add-ModelPathToExisting([System.Collections.Generic.List[string]]$out, 
 }
 
 # 插件版组件行：processors 最前 lua_processor + uniquifier 后 lua_filter + llm_rerank 节
-# prior = 方案中已有参数（Read-LlmParams 结果），重建配置节时逐键保留
-function Edit-SchemaPlugin([string]$schemaPath, [string]$modelPath, $Log, $prior) {
+# prior = 参数来源（Read-LlmParams 结果 或 界面参数表），重建配置节时逐键保留
+# enabled = 写进节的 enabled（GUI 保存 = 复选框状态；CLI 接入 = true）
+function Edit-SchemaPlugin([string]$schemaPath, [string]$modelPath, $Log, $prior, [bool]$enabled = $true) {
   $lines = Read-Schema $schemaPath
   if (($lines | Where-Object { $_ -match '^\s*-\s+llm_filter\s*$' }).Count -gt 0) {
     throw "方案里已有源码版组件（- llm_filter）——插件版与源码版二选一，请先重装小狼毫并恢复原始方案配置"
@@ -385,13 +400,36 @@ function Edit-SchemaPlugin([string]$schemaPath, [string]$modelPath, $Log, $prior
     else { throw "未找到 filters 块或 uniquifier，无法插入组件" }
   }
   if (-not $hasCfg) {
-    Get-LlmCfgLines $modelPath $prior | ForEach-Object { [void]$out.Add($_) }
-    & $Log "  + llm_rerank: 配置节（enabled: true）"; $changed = $true
+    Get-LlmCfgLines $modelPath $prior $enabled | ForEach-Object { [void]$out.Add($_) }
+    & $Log ("  + llm_rerank: 配置节（enabled: " + $(if ($enabled) { 'true' } else { 'false' }) + "）"); $changed = $true
   } elseif ($modelPath) {
     if (Add-ModelPathToExisting $out $modelPath $Log) { $changed = $true }
   }
   if ($changed) { Write-Schema $schemaPath $out; & $Log "  schema 已更新（幂等，重复运行不重复插入）" }
   else { & $Log "  schema 组件已存在，无需修改" }
+}
+
+# 方案是否需要"重建接入"（缺节 / 缺本版组件行 / 残留另一版组件行）
+# 返回 @{ Rebuild=$true/$false; Why="..." }
+function Test-SchemaNeedsRebuild([string]$schemaPath) {
+  $lines = Read-Schema $schemaPath
+  $hasProc = ($lines | Where-Object { $_ -match 'lua_processor@\*llm_processor' }).Count -gt 0
+  $hasFilt = ($lines | Where-Object { $_ -match 'lua_filter@\*llm_filter' }).Count -gt 0
+  $hasCfg  = ($lines | Where-Object { $_ -match '^llm_rerank:' }).Count -gt 0
+  $hasOther = ($lines | Where-Object { $_ -match '^\s*-\s+llm_filter\s*$' }).Count -gt 0
+  $why = @()
+  if (-not $hasCfg) { $why += "无配置节" }
+  if (-not $hasProc) { $why += "缺 lua_processor" }
+  if (-not $hasFilt) { $why += "缺 lua_filter" }
+  if ($hasOther) { $why += "残留源码版组件行" }
+  return [pscustomobject]@{ Rebuild = ($why.Count -gt 0); Why = ($why -join "、") }
+}
+
+# 用**界面参数**重建接入（剥净两版组件行 → 插入本版组件行 → 按界面值写节）
+function Edit-SchemaRebuild([string]$schemaPath, [hashtable]$p, [string]$modelPath, $Log, $quiet = $null) {
+  $sink = if ($quiet) { $quiet } else { $Log }
+  Edit-SchemaRemove $schemaPath $sink      # 剥净两版组件行 + 旧节
+  Edit-SchemaPlugin $schemaPath $modelPath $sink $p $p.enabled
 }
 
 # 读方案 llm_rerank 节内已生效的 model_path（先剥离后添加时保留用户已设路径）
@@ -502,6 +540,25 @@ function Schema-RemoveAction([string]$schemaName, $Log) {
   & $Log "完成。"
 }
 
+# 同目标残留的 curl 写入者（2026-10-01：关窗后子进程可能仍在后台跑，重开再点会
+# 变成"同一分片两个写入者"）。动作 = 结束旧进程后由本次 -C - 接管（分片不丢）。
+function Stop-StaleDownloader([string]$tmp, $Log) {
+  try {
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'curl.exe'" -ErrorAction Stop)
+  } catch { return 0 }
+  $n = 0
+  foreach ($pr in $procs) {
+    if ($pr.CommandLine -and ($pr.CommandLine -like ("*" + $tmp + "*"))) {
+      try {
+        Stop-Process -Id $pr.ProcessId -Force -ErrorAction Stop
+        $n++
+        if ($Log) { & $Log ("  已结束上次遗留的下载进程（PID {0}），由本次续传接管" -f $pr.ProcessId) }
+      } catch { }
+    }
+  }
+  return $n
+}
+
 # 下载模型（v1/v2 实测实现移植：curl 断点续传 + 分片转正；子进程轮询分片
 # 大小打进度行 → GUI 日志滚动显示。失败保留分片，重试 curl -C - 续传）
 function Download-ModelAction([string]$modelPath, $Log) {
@@ -509,19 +566,28 @@ function Download-ModelAction([string]$modelPath, $Log) {
   if (-not $modelPath) { $modelPath = $DEFAULT_MODEL }
   & $Log ("  目标: " + $modelPath)
   if (Test-Path $modelPath) {
-    & $Log ("  模型已存在（{0:N0} MB），无需下载" -f ((Get-Item $modelPath).Length / 1MB))
-    & $Log "完成。"
-    return
+    $sz = (Get-Item $modelPath).Length
+    if ($sz -ge $MODEL_MIN_BYTES) {
+      & $Log ("  模型已存在（{0:N0} MB），无需下载" -f ($sz / 1MB))
+      & $Log "完成。"
+      return
+    }
+    # ① 半截/损坏文件不再被当成"已存在"：小于下限 → 清掉重下（GUI 侧已确认过）
+    & $Log ("  已存在文件仅 {0:N0} MB（小于 {1} MB，疑似未下完/损坏）→ 删除后重新下载" -f ($sz / 1MB), ($MODEL_MIN_BYTES / 1MB))
+    Remove-Item -LiteralPath $modelPath -Force -ErrorAction SilentlyContinue
   }
   $dir = Split-Path $modelPath -Parent
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
   $tmp = $modelPath + ".download"
+  [void](Stop-StaleDownloader $tmp $Log)
   if ((Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 0)) {
     & $Log ("  发现未完成分片 {0:N0} MB — 断点续传" -f ((Get-Item $tmp).Length / 1MB))
   }
   $p = Start-Process -FilePath "curl.exe" `
     -ArgumentList @("-L", "-C", "-", "-s", "-S", "-o", "`"$tmp`"", "`"$MODEL_URL`"") `
     -PassThru -WindowStyle Hidden
+  # 记 PID：GUI 关窗时据此结束 curl（否则孙进程会脱离本进程继续写分片）
+  try { Set-Content -LiteralPath ($tmp + ".pid") -Value $p.Id -Encoding ascii -Force } catch { }
   while (-not $p.HasExited) {
     Start-Sleep -Seconds 5
     if (Test-Path $tmp) {
@@ -529,8 +595,9 @@ function Download-ModelAction([string]$modelPath, $Log) {
     }
   }
   $code = $p.ExitCode
-  if ($code -eq 0 -and (Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 100MB)) {
+  if ($code -eq 0 -and (Test-Path $tmp) -and ((Get-Item $tmp).Length -ge $MODEL_MIN_BYTES)) {
     Move-Item $tmp $modelPath -Force
+    Remove-Item -LiteralPath ($tmp + ".pid") -Force -ErrorAction SilentlyContinue
     & $Log ("  下载完成: {0:N0} MB → {1}" -f ((Get-Item $modelPath).Length / 1MB), $modelPath)
     & $Log "完成。"
   } else {
@@ -623,13 +690,11 @@ function Run-InstallerGui {
   $tipBeta = "用户词频权重 β（默认 1.5，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成`n越常上屏的词加分越多；加分在 log 域，可翻盘 LLM 的分差。"
   $tipElw = "预期词长权重 elw（默认 0.2，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成`n按 词长 = 码长÷2 给候选加成，只对两码一字的方案有意义；`n成熟机器建议 0。"
   $tipDebug = "诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt`n（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。"
-  $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n随后自动重新部署生效。"
-  $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
-  $tipSchemeRef = "重新扫描两处方案文件（用户文件夹 + 程序文件夹），并重新读入当前方案的参数。"
-  $tipAttach = "接入 LLM：把 lua_processor/lua_filter 组件行 + llm_rerank 配置节写进选中方案`n（先剥旧版组件再插入，可跨版转换），并自动重新部署。"
-  $tipStrip = "剥离：删掉选中方案里的 llm_filter 组件行与 llm_rerank 配置节，`n并自动重新部署。"
+  $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n随后自动重新部署生效。`n方案还没接入（缺配置节 / 缺组件行 / 残留另一版组件行）时，`n本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。"
+  $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；`n**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
+  $tipStrip = "剥离：把选中方案里的 LLM 组件行与 llm_rerank 配置节整个删掉`n（方案回到『未接入』状态），并自动重新部署。`n日常只想改参数请用『保存并生效』。"
   $tipFiles = "复制文件：停服务 → 清理旧二进制 → 替换 rime_llm.dll 与 lua → 启服务。"
-  $tipDownload = "下载模型：ModelScope 断点续传，落点 = 上面的模型路径框`n（留空 = 用户文件夹里的默认名）。"
+  $tipDownload = "下载模型：ModelScope 断点续传（curl -C -），落点 = 左边的模型路径框`n（留空 = 用户文件夹里的默认名 Qwen3.5-0.8B-Q4_K_M.gguf）。`n失败会保留 .download 分片，再点一次即续传。"
   $tipOpenDir = "打开小狼毫用户文件夹（%APPDATA%\Rime）——方案、模型与日志都在这里。"
 
   # 控件工厂：AutoSize=false —— Label 默认宽度会被缩到文字宽，
@@ -712,15 +777,9 @@ function Run-InstallerGui {
   # ── 方案接入（配置写在方案里 → 先选方案再改参数）──
   $g0 = Add-Group $form "方案接入" $GX 8 $GW 84
   [void](Add-Ctl "Label" "方案文件:" $g0 14 24 70 20)
-  $cmbSchema = Add-Ctl "ComboBox" "" $g0 88 21 264 21
+  $cmbSchema = Add-Ctl "ComboBox" "" $g0 88 21 528 21
   $cmbSchema.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-  $btnRefresh = Add-Ctl "Button" "刷新" $g0 358 20 56 24
-  $btnAttach = Add-Ctl "Button" "接入 LLM" $g0 422 20 86 24
-  $btnStrip = Add-Ctl "Button" "剥离" $g0 512 20 60 24
   $script:tip.SetToolTip($cmbSchema, $tipScheme)
-  $script:tip.SetToolTip($btnRefresh, $tipSchemeRef)
-  $script:tip.SetToolTip($btnAttach, $tipAttach)
-  $script:tip.SetToolTip($btnStrip, $tipStrip)
   Add-Help $g0 $tipScheme (Help-X $g0) 23 | Out-Null
   $lblScheStatus = Add-Ctl "Label" "" $g0 14 56 630 18
   $lblScheStatus.ForeColor = $colInfo
@@ -731,11 +790,13 @@ function Run-InstallerGui {
   $script:tip.SetToolTip($chkEnabled, $tipEnabled)
   Add-Help $g1 $tipEnabled (Help-X $g1) 25 | Out-Null
   [void](Add-Ctl "Label" "模型路径:" $g1 14 54 70 20)
-  $cmbModel = Add-Ctl "ComboBox" "" $g1 88 51 470 21
+  $cmbModel = Add-Ctl "ComboBox" "" $g1 88 51 300 21
   $cmbModel.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
-  $btnModelBrowse = Add-Ctl "Button" "浏览…" $g1 564 50 74 24
+  $btnModelBrowse = Add-Ctl "Button" "浏览…" $g1 392 50 74 24
+  $btnDownload = Add-Ctl "Button" "下载模型" $g1 470 50 128 24
   $script:tip.SetToolTip($cmbModel, $tipModel)
   $script:tip.SetToolTip($btnModelBrowse, "选择已有的 .gguf 模型文件。")
+  $script:tip.SetToolTip($btnDownload, $tipDownload)
   Add-Help $g1 $tipModel (Help-X $g1) 53 | Out-Null
   $lblModelStatus = Add-Ctl "Label" "" $g1 14 84 140 18
   $lblModelHint = Add-Ctl "Label" "" $g1 158 84 480 18
@@ -789,21 +850,20 @@ function Run-InstallerGui {
   $script:tip.SetToolTip($chkDebug, $tipDebug)
   Add-Help $form $tipDebug 664 530 | Out-Null
 
-  # ── 安装（插件版特有：二进制与模型；源码版由 setup.exe 完成）──
+  # ── 安装（插件版特有：二进制；源码版由 setup.exe 完成）──
+  #    模型下载归「总控」的模型路径行（2026-10-01 用户定案：下载 = 配置动作，两版一致）
   $g5 = Add-Group $form "安装" $GX 556 $GW 76
   $btnFiles = Add-Ctl "Button" "复制文件" $g5 14 24 152 30
-  $btnDownload = Add-Ctl "Button" "下载模型" $g5 176 24 152 30
   $script:tip.SetToolTip($btnFiles, $tipFiles)
-  $script:tip.SetToolTip($btnDownload, $tipDownload)
-  $lblInstallTarget = Add-Ctl "Label" "" $g5 334 30 326 18
-  $lblInstallTarget.ForeColor = [System.Drawing.Color]::DimGray
-  $lblInstallStatus = Add-Ctl "Label" "" $g5 14 56 630 18
+  $lblInstallStatus = Add-Ctl "Label" "" $g5 174 30 460 18
   $lblInstallStatus.ForeColor = $colInfo
 
-  # ── 操作行：保存 / 关闭 / 状态 / 打开用户文件夹（与源码版同序）──
+  # ── 操作行：保存 / 剥离 / 关闭 / 打开用户文件夹（剥离 = 保存的破坏性补充，2026-10-01 起并排）──
   $btnParamSave = Add-Ctl "Button" "保存并生效" $form 16 640 110 32
-  $btnClose = Add-Ctl "Button" "关闭" $form 134 640 76 32
+  $btnStrip = Add-Ctl "Button" "剥离" $form 130 640 76 32
+  $btnClose = Add-Ctl "Button" "关闭" $form 214 640 76 32
   $script:tip.SetToolTip($btnParamSave, $tipSave)
+  $script:tip.SetToolTip($btnStrip, $tipStrip)
   $lblParamStatus = Add-Ctl "Label" "" $form 16 678 668 18
   $lblParamStatus.ForeColor = $colInfo
   $btnOpenDir = Add-Ctl "Button" "打开用户文件夹" $form 558 640 126 32
@@ -849,14 +909,20 @@ function Run-InstallerGui {
     $p = $cmbModel.Text.Trim()
     if (-not $p) { $p = $DEFAULT_MODEL }
     if (Test-Path $p) {
-      $mb = [int][Math]::Floor((Get-Item $p).Length / 1MB)
-      $lblModelStatus.Text = "模型已就绪：$mb MB"
-      $lblModelHint.Text = ""
+      $len = (Get-Item $p).Length
+      $mb = [int][Math]::Floor($len / 1MB)
+      if ($len -ge $MODEL_MIN_BYTES) {
+        $lblModelStatus.Text = "模型已就绪：$mb MB"
+        $lblModelHint.Text = ""
+      } else {
+        # ① 半截/损坏文件不能显示成"已就绪"（否则重排静默失败、用户找不到原因）
+        $lblModelStatus.Text = "模型文件可疑：仅 $mb MB"
+        $lblModelHint.Text = "疑似未下完或损坏（完整约 508MB）——点『下载模型』会删除后重下，或用『浏览…』换一个"
+      }
     } else {
       $lblModelStatus.Text = "模型文件不存在"
-      $lblModelHint.Text = "点『下载模型』，或用『浏览…』选已有的 .gguf"
+      $lblModelHint.Text = "点『下载模型』下到左边这个路径（可断点续传），或用『浏览…』选已有的 .gguf"
     }
-    $lblInstallTarget.Text = "下载到: " + $(if ($cmbModel.Text.Trim()) { $cmbModel.Text.Trim() } else { $DEFAULT_MODEL })
   }
 
   # ── 方案清单：用户文件夹（无后缀）+ 程序文件夹预装方案（「（程序）」后缀）；
@@ -890,6 +956,30 @@ function Run-InstallerGui {
     return ($script:SchemaItems | Where-Object { $_.display -eq $disp } | Select-Object -First 1)
   }
 
+  # ── 外部改动保护（2026-10-01 用户定案）────────────────────────────
+  # 读参数时记下文件指纹；保存前若发现文件已被外部改过 → 弹框确认，避免用陈旧界面值覆盖。
+  function Get-FileStamp([string]$path) {
+    # 用**内容哈希**而不是时间戳：同内容重写/触摸文件不该误报"被外部修改"
+    if (-not (Test-Path $path)) { return "" }
+    return (Get-FileHash $path -Algorithm SHA1).Hash
+  }
+  # 界面是否有未保存改动：与"上次读入时的界面签名"比对（比事件脏标记简单可靠）
+  function Get-UiSignature {
+    $parts = @()
+    foreach ($k in @($PARAM_STR_KEYS) + @($PARAM_INT_KEYS) + @($PARAM_DBL_KEYS)) {
+      $parts += [string]$paramEdits[$k].Text.Trim()
+    }
+    $parts += [string]$chkEnabled.Checked
+    $parts += [string]$chkDebug.Checked
+    $parts += $cmbModel.Text.Trim()
+    return ($parts -join "|")
+  }
+  function Test-UiDirty { return ((Get-UiSignature) -ne $script:UiSig) }
+  $script:SuppressRead = $false
+  $script:UiSig = ""
+  $script:FileStamp = $null
+  $script:LoadedDisplay = ""   # 当前已读入界面的方案（切换取消时把下拉拨回它）
+
   function Read-ParamsToUi {
     $item = Get-SelectedSchema
     if (-not $item) { return }
@@ -899,6 +989,9 @@ function Run-InstallerGui {
     try { if (Test-Path $path) { $sec = Read-LlmParams $path } } catch { }
     $v = @{}
     foreach ($k in $PARAM_DEFAULTS.Keys) { $v[$k] = $PARAM_DEFAULTS[$k] }
+    # 无 llm_rerank 节 = 该方案还没接入：默认勾上「启用」，让"保存并生效"一步完成接入
+    # （用户若不想启用，取消勾选再保存即可——那会写入 enabled: false）
+    if (-not $sec) { $v.enabled = $true }
     if ($sec) {
       foreach ($k in $PARAM_INT_KEYS) {
         if ($sec.ContainsKey($k)) {
@@ -937,12 +1030,25 @@ function Run-InstallerGui {
       $lblScheStatus.Text = "已加载 $name 的 llm_rerank 配置节"
       $lblScheStatus.ForeColor = $colInfo
     } elseif ($item.shared) {
-      $lblScheStatus.Text = "[未接入] $name 是程序文件夹里的预装方案——点『接入 LLM』或『保存并生效』会先复制到用户文件夹再写入"
+      $lblScheStatus.Text = "[未接入] $name 是程序文件夹里的预装方案——点『保存并生效』会先复制到用户文件夹，再补组件行 + 配置节"
       $lblScheStatus.ForeColor = $colErr
     } else {
-      $lblScheStatus.Text = "[未接入] $name 里没有 llm_rerank 节——显示默认值，点『接入 LLM』写入"
+      $lblScheStatus.Text = "[未接入] $name 里没有 llm_rerank 节——显示默认值（已默认勾选启用），点『保存并生效』即接入"
       $lblScheStatus.ForeColor = $colErr
     }
+    # 记文件指纹 + 界面签名（外部改动保护 / 脏标记）
+    $script:FileStamp = [pscustomobject]@{ Path = $path; Sig = (Get-FileStamp $path) }
+    $script:UiSig = Get-UiSignature
+    $script:LoadedDisplay = $item.display
+  }
+
+  function Test-ModelPathOk([string]$p) {
+    # ③ model_path 必须是绝对路径（运行期直接交给 llama，不做 %VAR% 展开、
+    #    也不解析相对路径——相对值会按服务进程 cwd 解析，几乎必然加载失败）
+    if (-not $p) { return $true }   # 空 = 用默认
+    if ($p -match '^[A-Za-z]:[\\/]') { return $true }   # X:\ 或 X:/
+    if ($p -match '^\\\\') { return $true }             # UNC \\server\share
+    return $false
   }
 
   function Save-ParamsFromUi {
@@ -968,6 +1074,22 @@ function Run-InstallerGui {
       $lblParamStatus.Text = "方案文件不存在: $path"
       $lblParamStatus.ForeColor = $colErr
       return
+    }
+    # 外部改动保护：读入后文件又被别处改过（手工编辑 / 别的工具写）→ 先问再覆盖
+    if ($script:FileStamp -and $script:FileStamp.Path -eq $path -and -not $copied) {
+      $now = Get-FileStamp $path
+      if ($now -ne $script:FileStamp.Sig) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+          ("方案文件已被外部修改：`n$path`n`n用界面上的值覆盖它？（选『否』= 丢弃界面改动并重新读取）"),
+          "文件已变更", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+          [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
+          Read-ParamsToUi
+          $lblParamStatus.Text = "已取消保存并重新读取磁盘上的方案"
+          $lblParamStatus.ForeColor = $colInfo
+          return
+        }
+      }
     }
     $p = @{}
     foreach ($k in $PARAM_STR_KEYS) {
@@ -995,36 +1117,62 @@ function Run-InstallerGui {
     }
     $p.enabled = $chkEnabled.Checked
     $p.debug_fusion = $chkDebug.Checked
+    # ③ 模型路径：空 = 默认；非空必须是绝对路径（相对路径运行期必然加载失败）
+    $mpRaw = $cmbModel.Text.Trim()
+    if ($mpRaw -and -not (Test-ModelPathOk $mpRaw)) {
+      $lblParamStatus.Text = "『模型路径』必须是绝对路径（如 D:\gguf_models\xxx.gguf）或留空用默认：$mpRaw"
+      $lblParamStatus.ForeColor = $colErr
+      return
+    }
     # 模型路径归本页管理（= llm_rerank.model_path）；与源码版同规则：
     # 空 或 等于默认路径 → 写注释占位（默认路径由 llm_filter 兜底）
     $mp = $cmbModel.Text.Trim()
     if ($mp -eq $DEFAULT_MODEL) { $mp = "" }
+    # 保存 = 自适应（2026-10-01 用户定案，替代原「接入 LLM」+「保存」两按钮）：
+    #   节缺失 / 组件行缺失 / 残留另一版组件行 → 重建接入（剥净 + 插本版组件 + 按界面值写节）
+    #   否则                                   → 只重写节
+    $need = $null
+    try { $need = Test-SchemaNeedsRebuild $path } catch {
+      $lblParamStatus.Text = "[失败] 读取方案失败：" + $_.Exception.Message
+      $lblParamStatus.ForeColor = $colErr
+      Write-ErrLog "保存参数失败（读取 $name）" ($_.Exception.ToString()) | Out-Null
+      return
+    }
+    $logLines = New-Object System.Collections.Generic.List[string]
+    $sink = { param($t) [void]$logLines.Add([string]$t) }
     try {
-      Update-LlmSection $path $p $mp
+      if ($need.Rebuild) { Edit-SchemaRebuild $path $p $mp $sink }   # enabled 走 $p.enabled（复选框）
+      else { Update-LlmSection $path $p $mp }
     } catch {
       $lblParamStatus.Text = "[失败] " + $_.Exception.Message
       $lblParamStatus.ForeColor = $colErr
-      Write-ErrLog "保存参数失败（$name）" ($_.Exception.ToString()) | Out-Null
+      Write-ErrLog "保存参数失败（$name）" ($_.Exception.ToString() + "`n" + ($logLines -join "`n")) | Out-Null
       return
     }
-    $lblParamStatus.Text = "已保存到 $name，正在重新部署…"
+    $didRebuild = $need.Rebuild
+    $script:FileStamp = [pscustomobject]@{ Path = $path; Sig = (Get-FileStamp $path) }
+    $lblParamStatus.Text = "正在重新部署…"
     $lblParamStatus.ForeColor = $colInfo
     $form.Refresh()
-    if ($copied) { Refresh-Ui; Read-ParamsToUi }   # 预装方案已进用户文件夹 → 下拉改列用户那份
-    $note = $(if ($copied) { "（原为程序文件夹预装方案，已复制到用户文件夹）" } else { "" })
+    if ($copied) { Refresh-Ui }        # 预装方案已进用户文件夹 → 下拉改列用户那份
+    Read-ParamsToUi                    # 让「方案接入」状态行从"未接入"变"已加载"，并刷新脏标记快照
+    $act = $(if ($didRebuild) { "已接入并保存" } else { "已保存" })
+    $note = @($(if ($copied) { "原为程序文件夹预装方案，已复制到用户文件夹" }), $(if ($didRebuild) { "补齐了组件行：" + $need.Why }) |
+              Where-Object { $_ })
+    $note = $(if ($note.Count) { "（" + ($note -join "；") + "）" } else { "" })
     $installDir = Find-WeaselDir
     if ($installDir) {
       $notes = New-Object System.Collections.Generic.List[string]
       Invoke-Redeploy $installDir { param($t) [void]$notes.Add($t) }
       $bad = @($notes | Where-Object { $_ -match '提示|失败|错误' })
       if ($bad.Count) {
-        $lblParamStatus.Text = "已保存$note；重新部署有提示：" + ($bad[-1] -replace '^\s+', '')
+        $lblParamStatus.Text = "$act$note；重新部署有提示：" + ($bad[-1] -replace '^\s+', '')
         $lblParamStatus.ForeColor = $colErr
       } else {
-        $lblParamStatus.Text = "已保存到 $name$note 并触发重新部署——部署完成后参数生效"
+        $lblParamStatus.Text = "$act $name$note 并触发重新部署——部署完成后参数生效"
       }
     } else {
-      $lblParamStatus.Text = "已保存$note；未找到小狼毫目录，请托盘手动重新部署"
+      $lblParamStatus.Text = "$act$note；未找到小狼毫目录，请托盘手动重新部署"
       $lblParamStatus.ForeColor = $colErr
     }
   }
@@ -1035,11 +1183,16 @@ function Run-InstallerGui {
     $cmbSchema.Items.Clear()
     foreach ($it in $script:SchemaItems) { [void]$cmbSchema.Items.Add($it.display) }
     if ($cmbSchema.Items.Count -gt 0) {
-      if ($sel -and $cmbSchema.Items.Contains($sel)) {
-        $cmbSchema.SelectedItem = $sel     # 刷新保持当前选择（触发重读）
-      } else {
-        $cmbSchema.SelectedIndex = 0
-      }
+      # Items.Clear 会先把选择置空，恢复选择时必然触发 SelectedIndexChanged——
+      # 这里抑制它，避免"仅重扫列表"顺带把界面改动冲掉（重读由调用方按需显式做）
+      $script:SuppressRead = $true
+      try {
+        if ($sel -and $cmbSchema.Items.Contains($sel)) {
+          $cmbSchema.SelectedItem = $sel     # 刷新保持当前选择
+        } else {
+          $cmbSchema.SelectedIndex = 0
+        }
+      } finally { $script:SuppressRead = $false }
       # 下拉列表按最长项加宽（预装方案名 + 「（程序）」比框宽长）
       $dw = 0
       foreach ($it in $script:SchemaItems) {
@@ -1055,7 +1208,6 @@ function Run-InstallerGui {
     $btnFiles.Enabled = ($PluginReady -and $dir)
     $btnDownload.Enabled = $true
     $hasScheme = ($cmbSchema.Items.Count -gt 0)
-    $btnAttach.Enabled = $hasScheme
     $btnStrip.Enabled = $hasScheme
     $btnParamSave.Enabled = $hasScheme
   }
@@ -1089,8 +1241,8 @@ function Run-InstallerGui {
     $lblInstallStatus.Text = "执行中…（复制文件 / 模型下载可能需要几分钟）"
     $lblInstallStatus.ForeColor = $colInfo
     $btnFiles.Enabled = $false; $btnDownload.Enabled = $false
-    $btnAttach.Enabled = $false; $btnStrip.Enabled = $false
-    $btnParamSave.Enabled = $false; $btnRefresh.Enabled = $false
+    $btnStrip.Enabled = $false
+    $btnParamSave.Enabled = $false
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
       $psExe = (Get-Process -Id $PID).Path
@@ -1152,6 +1304,7 @@ function Run-InstallerGui {
     $script:WorkAction = ""
     $form.Cursor = [System.Windows.Forms.Cursors]::Default
     Refresh-Ui
+    Read-ParamsToUi
     if ($failed) {
       $errLine = ($text -split "`r?`n" | Where-Object { $_ -match '^\[ERROR\]' } | Select-Object -Last 1)
       $msg = if ($errLine) { $errLine -replace '^\[ERROR\]\s*', '' } else { "操作失败（退出码 $code）" }
@@ -1167,8 +1320,13 @@ function Run-InstallerGui {
     }
   })
 
-  # ── 事件接线（单页：接入 / 剥离 / 保存 都在这一页）──
-  $btnRefresh.Add_Click({ Refresh-Ui; Read-ParamsToUi })
+  # ── 事件接线（单页：接入已并入「保存并生效」，本页只剩 剥离 / 保存）──
+  # 下拉打开即重扫两处方案列表（外部新增/删除方案无需手动刷新）；界面无未保存改动时
+  # 顺便重读当前文件（吸收外部编辑）；有改动则只重扫列表，不覆盖用户输入。
+  $cmbSchema.Add_DropDown({
+    Refresh-Ui
+    if (-not (Test-UiDirty)) { Read-ParamsToUi }
+  })
   # 模型路径：手输/下拉/浏览后刷新状态行与下载目标
   $cmbModel.Add_TextChanged({ Update-ModelStatus })
   $cmbModel.Add_SelectedIndexChanged({ Update-ModelStatus })
@@ -1182,27 +1340,25 @@ function Run-InstallerGui {
     }
   })
   $btnFiles.Add_Click({ Start-Work "copy-files" "" "" })
-  $btnDownload.Add_Click({ Start-Work "download-model" "" $cmbModel.Text.Trim() })
-  $btnAttach.Add_Click({
-    $item = Get-SelectedSchema
-    if (-not $item) {
-      [System.Windows.Forms.MessageBox]::Show("请先选择方案文件", "提示") | Out-Null
-      return
-    }
-    if ($item.shared) {
-      # 预装方案：先落到用户文件夹（子进程与后续读取都以用户文件夹为准）
-      try {
-        [void](Resolve-SchemaPath $item.name $true $null)
-        $lblScheStatus.Text = "$($item.name) 原为程序文件夹预装方案，已复制到用户文件夹"
-        $lblScheStatus.ForeColor = $colInfo
-      } catch {
-        $lblScheStatus.Text = "[失败] " + $_.Exception.Message
-        $lblScheStatus.ForeColor = $colErr
-        Write-ErrLog "接入前复制预装方案失败（$($item.name)）" ($_.Exception.ToString()) | Out-Null
-        return
+  $btnDownload.Add_Click({
+    # ① 已存在但明显偏小 → 先确认再覆盖（此前会被当成"已存在"直接跳过）
+    $target = $cmbModel.Text.Trim()
+    if (-not $target) { $target = $DEFAULT_MODEL }
+    if (Test-Path $target) {
+      $len = (Get-Item $target).Length
+      if ($len -lt $MODEL_MIN_BYTES) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+          ("目标路径已有文件，但只有 {0:N0} MB（疑似未下完或损坏）：`n{1}`n`n删除它并重新下载？" -f ($len / 1MB), $target),
+          "模型文件可疑", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+          [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
+          $lblParamStatus.Text = "已取消下载（保留现有文件）"
+          $lblParamStatus.ForeColor = $colInfo
+          return
+        }
       }
     }
-    Start-Work "schema-add" $item.name $cmbModel.Text.Trim()
+    Start-Work "download-model" "" $cmbModel.Text.Trim()
   })
   $btnStrip.Add_Click({
     $item = Get-SelectedSchema
@@ -1212,7 +1368,7 @@ function Run-InstallerGui {
     }
     if ($item.shared) {
       # 预装方案（程序文件夹）根本没接入过 LLM，剥离无意义也不该动它
-      $lblScheStatus.Text = "[提示] $($item.name) 是程序文件夹预装方案（未被修改过）——无可剥离；若要改它请先『接入 LLM』（会复制到用户文件夹）"
+      $lblScheStatus.Text = "[提示] $($item.name) 是程序文件夹预装方案（未被修改过）——无可剥离；若要改它请点『保存并生效』（会复制到用户文件夹）"
       $lblScheStatus.ForeColor = $colErr
       return
     }
@@ -1230,8 +1386,29 @@ function Run-InstallerGui {
       Write-ErrLog "打开用户文件夹失败" ($_.Exception.ToString()) | Out-Null
     }
   })
-  # 切方案 = 切配置（配置节在方案里）
-  $cmbSchema.Add_SelectedIndexChanged({ Read-ParamsToUi })
+  # 切方案 = 切配置（配置节在方案里）；重扫列表时的恢复选择被抑制。
+  # ④ 有未保存改动时先问（否则切换会把界面改动静默丢掉）；选"否"把下拉拨回去
+  $cmbSchema.Add_SelectedIndexChanged({
+    if ($script:SuppressRead) { return }
+    if (Test-UiDirty) {
+      $ans = [System.Windows.Forms.MessageBox]::Show(
+        "当前方案有未保存的改动。`n`n切换方案会丢弃这些改动，继续吗？",
+        "未保存的改动", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+      if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
+        $script:SuppressRead = $true
+        try {
+          if ($script:LoadedDisplay -and $cmbSchema.Items.Contains($script:LoadedDisplay)) {
+            $cmbSchema.SelectedItem = $script:LoadedDisplay
+          }
+        } finally { $script:SuppressRead = $false }
+        $lblParamStatus.Text = "已取消切换（保留未保存的改动）"
+        $lblParamStatus.ForeColor = $colInfo
+        return
+      }
+    }
+    Read-ParamsToUi
+  })
 
   $form.Add_Shown({
     Refresh-Ui
@@ -1257,6 +1434,14 @@ function Run-InstallerGui {
     if ($script:WorkProc -and -not $script:WorkProc.HasExited) {
       try { $script:WorkProc.Kill() } catch { }
     }
+    # ② 关窗时把 curl 一并结束：下载动作的 curl 是"子进程的孙进程"，
+    #    只杀包装 pwsh 会留下一个仍在写分片的孤儿（重开再点会变成两个写入者）。
+    #    分片本身保留 → 下次点『下载模型』照样断点续传。
+    try {
+      $dlTarget = if ($cmbModel) { $cmbModel.Text.Trim() } else { "" }
+      if (-not $dlTarget) { $dlTarget = $DEFAULT_MODEL }
+      Stop-StaleDownloader ($dlTarget + ".download") $null | Out-Null
+    } catch { }
   }
 }
 

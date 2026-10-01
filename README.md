@@ -1,5 +1,21 @@
 # RIME LLM 候选重排（rime-llm-rerank）
 
+## 快速开始（以朙月拼音为例，约 5 分钟）
+
+> 目标：让 **朙月拼音 `luna_pinyin`**（Rime 自带默认方案）用上 LLM 候选重排。换别的方案同理，只有第 5 步的"编码匹配"要按该方案的码长改。
+
+1. **装官方小狼毫** —— 本插件跑在官方 `rime.dll` 上：<https://rime.im/download/>（装完确认能打字）。
+2. **双击 `installer\install_plugin.bat`** —— 下载/克隆本仓库后跑它（会自动请求管理员）。
+3. **方案接入**：`方案文件` 选 **`luna_pinyin.schema.yaml（程序）`**（带「（程序）」= 小狼毫自带的预装方案；保存时会先复制到用户文件夹再改，原件不动）。
+4. **下模型**：`总控` → 模型路径留默认 → 点 **『下载模型』**（约 508 MB，ModelScope，断点续传；中断了再点一次接着下）。
+5. **改匹配模式**：`触发条件` → `编码匹配` 填 **`.+`** —— 朙月拼音码长 1~6 不等，默认的 `.{4}`（恰 4 码）不会触发。
+6. **点『复制文件』**（部署 `rime_llm.dll` + 两个 lua）→ 再点 **『保存并生效』**（写进方案并自动重新部署）。
+7. **验证**：在任意编辑器里键入 `nihao` —— 首选候选应出现 `AI·…` 徽章（`AI·COM` / `AI·UIA` / `AI·历史`）。没生效：托盘小狼毫 → **重新部署**。
+
+后续微调都在同一页：`推理规模`（上文 token / 候选数 / CPU 线程）与 `候选排序融合`（词频 β、词长权重）→ **保存并生效**；模型换位置用 **『浏览…』** 选 `.gguf`（**必须是绝对路径**）。不想要了：点 **『剥离』**（组件行与配置节一起删，自动重新部署），再删安装目录里的 `rime_llm.dll` 与 `%APPDATA%\Rime\lua\` 下两个 lua 即为完全卸载。
+
+---
+
 使用本地部署的小型 LLM 为任意 RIME **四码定长**输入方案（五笔、郑码、仓颉、拼读双拼等）提供打字时的智能候选排序。LLM 与编码方案无关——它只看到最终的中文候选词列表，利用上文的语义把正确词排到候选第一位，减少手动选重。
 
 | 关键指标 | 值 |
@@ -37,22 +53,22 @@
 
 ## 一键部署（推荐）
 
-**插件版安装器**（本仓库 `installer\` 目录；源码版 2026-08-27 起改用 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的 setup.exe 安装包，不再带 PS 安装器）。**单页界面**（2026-09-30 起与源码版设置界面同构），自上而下：**方案接入**（方案文件下拉 + 刷新 / **接入 LLM** / **剥离**）、**总控**（启用开关 + 模型路径下拉/浏览 + 模型状态行）、**触发条件**、**推理规模**、**候选排序融合**（`融合分 = score + β·log(1+eff) + elw·span·匹配词长`）、**诊断日志**、**安装**（**复制文件** = 停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务；**下载模型** = ModelScope 断点续传，落点 = 上面的模型路径框，留空 = 默认 `%APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf`），底部 **保存并生效 / 关闭 / 打开用户文件夹**。每个配置项一行、行末「?」悬停看说明；**界面不留日志框**——正常只看状态行，出错才写 `installer\install_error.log` 并弹框给出路径。参数读写选中方案的 `llm_rerank:` 节（与源码版同一套键），保存后自动重新部署。不碰注册表。
+**插件版安装器**（本仓库 `installer\` 目录；源码版 2026-08-27 起改用 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的 setup.exe 安装包，不再带 PS 安装器）。**单页界面**（2026-09-30 起与源码版设置界面同构），自上而下：**方案接入**（方案文件下拉）、**总控**（启用开关 + 模型路径下拉/浏览 + **下载模型** + 模型状态行）、**触发条件**、**推理规模**、**候选排序融合**（`融合分 = score + β·log(1+eff) + elw·span·匹配词长`）、**诊断日志**、**安装**（**复制文件** = 停算法服务 + 清理上次残留 → 二进制一律改名腾位 `*.llm_old` 替换 → 启服务），底部 **保存并生效 / 剥离 / 关闭 / 打开用户文件夹**（**剥离** 就在保存右侧，是它的破坏性补充）。**下载模型**在模型路径那一行（ModelScope 断点续传，落点 = 该路径框，留空 = 默认 `%APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf`）。每个配置项一行、行末「?」悬停看说明；**界面不留日志框**——正常只看状态行，出错才写 `installer\install_error.log` 并弹框给出路径。**保存并生效是自适应的**：方案还没接入（缺配置节 / 缺组件行 / 残留另一版组件行）时会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」按钮已并入这里），已接入则只重写配置节；无配置节的方案默认勾选「启用」，点一次保存即完成接入。参数读写选中方案的 `llm_rerank:` 节（与源码版同一套键），保存后自动重新部署。不碰注册表。
 
-**方案下拉列出两处** `*.schema.yaml`：**用户文件夹** `%APPDATA%\Rime`（可写、Rime 优先）与**程序文件夹** `<小狼毫安装目录>\data`（预装方案 luna_pinyin / cangjie5 / bopomofo …，带「（程序）」后缀）。预装方案**写入前会自动复制到用户文件夹**（写程序文件夹既要管理员、又会被下次升级覆盖；用户文件夹优先也正是 Rime 自己的解析顺序），程序文件夹里的原件不受影响。
+**方案下拉列出两处** `*.schema.yaml`：**用户文件夹** `%APPDATA%\Rime`（可写、Rime 优先）与**程序文件夹** `<小狼毫安装目录>\data`（预装方案 luna_pinyin / cangjie5 / bopomofo …，带「（程序）」后缀）；**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面没有未保存改动时还会重读当前文件。预装方案**写入前会自动复制到用户文件夹**（写程序文件夹既要管理员、又会被下次升级覆盖；用户文件夹优先也正是 Rime 自己的解析顺序），程序文件夹里的原件不受影响。若方案文件在界面读入后被外部改过，保存前会弹一次确认，避免用陈旧界面值覆盖。
 
-**前提**：已安装官方小狼毫。方案组件行**无需预先准备**——第 6 步「接入 LLM」会自动幂等插入（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）；手动添加参照"手动安装"第三步。
+**前提**：已安装官方小狼毫。方案组件行**无需预先准备**——第 6 步「保存并生效」会自动幂等插入（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节）；手动添加参照"手动安装"第三步。
 
 1. `git clone` 本仓库到目标电脑（或下载仓库 zip 解压——插件版文件在 `user\`，已入库）
 2. **双击 `installer\install_plugin.bat`**（自动请求管理员权限；SmartScreen 弹"Windows 已保护你的电脑"时选"更多信息 → 仍要运行"——安装器未做代码签名）
 3. 选择方案文件（下拉列出**两处**：用户文件夹 `%APPDATA%\Rime\*.schema.yaml` 与程序文件夹 `<小狼毫目录>\data` 的预装方案，后者带「（程序）」后缀——选预装方案时写入前会自动复制到用户文件夹）；模型路径留空 = 默认
-4. 缺模型时点击 **下载模型**：从 ModelScope 下载到模型路径（约 500MB，断点续传——中断/失败后重新点击自动续传）
+4. 缺模型时点**总控**里的 **下载模型**：从 ModelScope 下载到模型路径（约 500MB，断点续传——中断/失败后重新点击自动续传）
 5. 点击 **复制文件**：停算法服务 → `rime_llm.dll` 等 → 小狼毫安装目录；`llm_filter.lua` / `llm_processor.lua` → `%APPDATA%\Rime\lua\` → 启服务
-6. 点击 **接入 LLM**：schema 幂等插入组件行（`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节，全键生效行）→ 自动重新部署（**剥离** 为逆操作；重复接入保留方案里已有参数与 `model_path`，不会被重置回默认）
+6. 点 **保存并生效**：方案还没接入时它会自动补齐（幂等插入组件行：`processors` 最前 `lua_processor@*llm_processor`、`filters` 的 `uniquifier` 后 `lua_filter@*llm_filter`、顶层 `llm_rerank:` 节全键生效行）→ 自动重新部署（**剥离** 就在它右侧 = 逆操作；重复保存保留方案里已有参数与 `model_path`，不会被重置回默认）
 7. 在**同一页**改 β / 词长权重 / 编码匹配等 → **保存并生效**（自动重新部署）；状态行有校验提示，非法输入不落盘
 8. 验证：打满 4 码，首选候选 comment 出现 `AI·` 徽章（`AI·COM` / `AI·UIA` / `AI·历史`，上文来源自动判定）；日志 `%APPDATA%\Rime\rime_llm_events.txt`（未生效时托盘小狼毫 → 右键 → 重新部署）
 
-**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 源码版跑 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的安装包 / 插件版跑本仓库安装器（其**接入 LLM** 会先剥离另一版组件行再插入，跨版自动转换，无需恢复原始方案配置）。
+**切换版本**（插件版 ↔ 源码版）：重装官方小狼毫（恢复官方二进制）→ 源码版跑 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 的安装包 / 插件版跑本仓库安装器（其**保存并生效**会先剥离另一版组件行再插入，跨版自动转换，无需恢复原始方案配置）。
 
 **输入法图标消失时**：运行源码版安装目录下的 `repair_tsf.ps1`（随 [rime-llm-ime](https://github.com/zhanghaozhecn/rime-llm-ime) 安装包装入，右键"使用 PowerShell 运行"自动提权重注册 TSF——插件版安装不碰注册表，此症状只源于源码版操作或系统问题）。
 
@@ -64,7 +80,18 @@
 
 打开 https://www.modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/files ，下载 `Qwen3.5-0.8B-Q4_K_M.gguf`（约 500 MB），放到 `%APPDATA%\Rime\`（默认路径 = RIME 用户文件夹根；放其他位置需在方案中设置 `llm_rerank.model_path`）。
 
-> 放其他路径需在 schema 中设置 `llm_rerank.model_path`。
+> 放其他路径需在 schema 中设置 `llm_rerank.model_path`；**必须是绝对路径**（`D:\gguf_models\...` 或 UNC），
+> 相对路径会被 GUI 拒绝保存（运行期把值原样交给 llama，相对值按服务进程的当前目录解析，必然加载失败）。
+
+**模型路径的几条用户规则**（GUI 侧，两版一致）：
+
+| 情形 | 行为 |
+|------|------|
+| 方案节里没写 `model_path` | 界面上直接显示**默认全路径** = Rime 用户目录（`RIME_LLM_USER_DIR` → 注册表 `RimeUserDir` → `%APPDATA%\Rime`）下的 `Qwen3.5-0.8B-Q4_K_M.gguf`；保存时写注释占位（换机/便携部署自动跟新目录）|
+| 指到的文件 >100MB | 状态行"模型已就绪：N MB" |
+| 指到的文件 <100MB | 状态行"模型文件可疑：仅 N MB"（半截模型会让重排静默失效，不再谎报已就绪）；此时点『下载模型』会先确认再删除重下 |
+| 手输相对路径 | 保存被拒绝，状态行提示"必须是绝对路径…"（文件不动）|
+| 下载中断/关窗 | 分片 `<目标>.download` 保留，重开再点『下载模型』即续传；每次下载记 `<分片>.pid`，新下载会先结束上次遗留的 curl 进程 |
 
 ### 第二步：复制插件
 
@@ -104,7 +131,7 @@ Get-Content "$env:APPDATA\Rime\rime_llm_events.txt" -Tail 5
 在方案的 `schema.yaml` 中配置（全部可选；也可在安装器**「方案接入」+ 参数区**（单页）图形化修改——写回选中方案的这一节，保存后自动重新部署）：
 
 > 「最少上文 token」（`min_tokens`）自 2026-09-30 起**不再是用户配置项**：前期研究与长期实机使用确认它恒为 1（有上文即参与重排），
-> 代码内默认值保留，方案里若残留旧行在保存 / 重跑「接入 LLM」重建节时自动剥除。
+> 代码内默认值保留，方案里若残留旧行在保存 / 重跑重建节时自动剥除。
 >
 > 编码触发条件自 2026-09-30 起由「最小编码长度 / 最大编码长度」改为**单个正则** `code_pattern`（全串匹配），
 > 旧键同样是残留即剥除。二者语义等价写法：`min_code_len: 4` + `max_code_len: 0` ⇒ `code_pattern: '.{4}'`。
@@ -292,7 +319,7 @@ local scores = llm.get_scores()          -- 数值分数（调试用）
 
 ## 安装器原理
 
-`installer\install_plugin.ps1`（**单文件全部逻辑**；`install_plugin.bat` 为 ASCII 提权垫片——**优先 pwsh 7、回退系统自带 PowerShell 5.1**（.ps1 带 UTF-8 BOM，5.1 也能正确解析中文；无 BOM 时 5.1 按 ANSI 解码会在解析期就报错 = 双击闪退，2026-09-30 修）。2026-09-04 起原入口壳 + common.ps1 双文件合并：源码版 2026-08-27 改 setup.exe 分发后"两仓共用"已名存实亡，源码版动作与双版分支一并删除）。GUI 为**单页**（2026-09-30 起；与源码版 WeaselLLMSetup 同构）：方案接入（方案下拉 + 刷新 / 导入… / **接入 LLM** / **剥离**）+ 总控（启用 / 模型路径 / 模型状态）+ 触发条件 + 推理规模 + 候选排序融合 + 诊断日志 + 安装（`复制文件` / `下载模型`）+ 保存并生效 / 关闭 / 打开用户文件夹；**无日志框**，出错写 `installer\install_error.log`。`复制文件` / `下载模型` / `接入 LLM` / `剥离` 各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程输出轮询取末行做进度反馈）、`schema-add`（**先剥离后插入**——方案原状无论无 LLM / 本版 / 另一版组件均先剥净再全新插入，跨版自动转换；`model_path` 与已有参数逐键保留——`Read-LlmParams` 先读后剥、`Get-LlmCfgLines` 重建节时回填，重跑不重置用户自定义）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。参数读写为进程内轻量操作，不走子进程：`Read-LlmParams` 解析选中方案 `llm_rerank:` 节（缺键回 lua 默认）→ 控件回填；`Update-LlmSection` 原位重写节（组件行不动），保存后 `Invoke-Redeploy`。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。GUI/CLI 自动化测试：`installer\test_gui.ps1`（APPDATA 沙箱隔离 + `LLM_INSTALLER_NO_REDEPLOY` 钩子，pwsh 7 运行；复选框断言走 BM_CLICK + 落盘——WinForms 主题复选框的 BM_GETCHECK 跨进程读不到内部态；G9 断言"正常不写、出错才写 install_error.log"）。
+`installer\install_plugin.ps1`（**单文件全部逻辑**；`install_plugin.bat` 为 ASCII 提权垫片——**优先 pwsh 7、回退系统自带 PowerShell 5.1**（.ps1 带 UTF-8 BOM，5.1 也能正确解析中文；无 BOM 时 5.1 按 ANSI 解码会在解析期就报错 = 双击闪退，2026-09-30 修）。2026-09-04 起原入口壳 + common.ps1 双文件合并：源码版 2026-08-27 改 setup.exe 分发后"两仓共用"已名存实亡，源码版动作与双版分支一并删除）。GUI 为**单页**（2026-09-30 起；与源码版 WeaselLLMSetup 同构）：方案接入（方案下拉）+ 总控（启用 / 模型路径 / 下载模型 / 模型状态）+ 触发条件 + 推理规模 + 候选排序融合 + 诊断日志 + 安装（`复制文件`）+ 保存并生效 / 剥离 / 关闭 / 打开用户文件夹（下载模型在总控的模型路径行）；**无日志框**，出错写 `installer\install_error.log`。`复制文件` / `下载模型` / `剥离` 各起一个 CLI 子进程——`copy-files`（停服务 + 清残留 → 二进制一律改名腾位 `*.llm_old`，复制失败回滚 → 启服务）、`download-model`（curl.exe 断点续传 ModelScope → `.download` 分片 → 完成转正；子进程输出轮询取末行做进度反馈）、`schema-add`（**先剥离后插入**——方案原状无论无 LLM / 本版 / 另一版组件均先剥净再全新插入，跨版自动转换；`model_path` 与已有参数逐键保留——`Read-LlmParams` 先读后剥、`Get-LlmCfgLines` 重建节时回填，重跑不重置用户自定义）、`schema-remove`（剥离两版组件行与 `llm_rerank` 节）；配置类动作完成后自动重新部署（15 秒有界等待，超时留后台）。参数读写为进程内轻量操作，不走子进程：`Read-LlmParams` 解析选中方案 `llm_rerank:` 节（缺键回 lua 默认）→ 控件回填；`Update-LlmSection` 原位重写节（组件行不动），保存后 `Invoke-Redeploy`。不碰注册表、不调 WeaselSetup。所有 schema 读写为 UTF-8 无 BOM。GUI/CLI 自动化测试：`installer\test_gui.ps1`（APPDATA 沙箱隔离 + `LLM_INSTALLER_NO_REDEPLOY` 钩子，pwsh 7 运行；复选框断言走 BM_CLICK + 落盘——WinForms 主题复选框的 BM_GETCHECK 跨进程读不到内部态；G9 断言"正常不写、出错才写 install_error.log"）。
 
 ---
 
