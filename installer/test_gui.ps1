@@ -5,8 +5,15 @@
 # 教训：无隔离 + 下拉默认第一项 = 打在活方案上）。
 # 测试钩子（install_plugin.ps1 内置）：
 #   LLM_INSTALLER_NO_REDEPLOY=1  跳过重新部署（沙箱内无小狼毫可部署）
+#   RIME_LLM_FAKE_CORES=N        伪装逻辑核数（bench_threads.exe 与 GUI 同读；
+#                                本机没法真的变成 4 核，「不足 5 线程不实测」
+#                                这条分支只能靠它验证。G13 全程设为 3）
 # 用 pwsh 7 运行：pwsh -File test_gui.ps1
 $ErrorActionPreference = "Stop"
+# CLI 子进程的 stdout 是 UTF-8（install_plugin.ps1 里显式设了 OutputEncoding），
+# 而父进程默认按控制台代码页（本机 GBK）解码 → 断言中文必然全变乱码。
+# 统一按 UTF-8 解码才能断言中文（纯 ASCII 断言不受影响）。
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 $entry = Join-Path $PSScriptRoot "install_plugin.ps1"
 $sandbox = Join-Path $env:TEMP ("llminst_sandbox_" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
 $rime = Join-Path $sandbox "Rime"
@@ -29,6 +36,9 @@ $env:LLM_INSTALLER_NO_REDEPLOY = "1"
 # 用户目录也要钉在沙箱：GUI 现在优先注册表 RimeUserDir（真实机器上指向真目录），
 # 该覆盖变量优先级最高，保证测试读写全落沙箱
 $env:RIME_LLM_USER_DIR = Join-Path $sandbox "Rime"
+# 线程数实测：GUI 相位全程伪装成 3 逻辑核（<5 → 不实测、直接取最大线程数）；
+# 真机路径（≥5 核）另走 G13b 的 CLI 子进程（环境变量可按用例切换）
+$env:RIME_LLM_FAKE_CORES = "3"
 try {
   New-Item -ItemType Directory -Path $rime -Force | Out-Null
 
@@ -581,6 +591,52 @@ engine:
   # "切回原方案后读回磁盘值"的严格版本在源码版套件 phase11(d) 里有同款覆盖
   Assert ("确认切换后未保存值被丢弃（实测 '$vAfter'）") ($vAfter -ne "77")
 
+  # ══ G13：线程数实测（2026-10-01 用户定案：起点 4 / 终点 8；不足 5 线程不实测）══
+  Write-Host "== G13: 『实测线程数』按钮 + 不足 5 线程直接取最大（GUI 全程假 3 核）=="
+  $e13 = Get-ParamEdits
+  $bBench = Find-Button "实测线程数"
+  Assert "「实测线程数」按钮在页" ($bBench -ne [IntPtr]::Zero)
+  $rBench = (Get-Ctls | Where-Object { $_.h -eq $bBench })[0]
+  $rCores13 = (Get-Ctls | Where-Object { $_.h -eq $e13[3].h })[0]
+  Assert "按钮在 CPU 线程数框右侧且同排" (($rBench.x -gt $rCores13.x + $rCores13.w) -and
+                                        ([Math]::Abs($rBench.y - $rCores13.y) -le 6))
+  # 行末「?」徽标列不被按钮压到（该行最近的徽标）
+  $badge = @(Get-Ctls | Where-Object { $_.cls -match '\.Static\.' -and $_.text -eq "?" } |
+             Sort-Object { [Math]::Abs($_.y - $rBench.y) } | Select-Object -First 1)
+  if ($badge.Count) {
+    Assert ("按钮右边界不越过「?」徽标列（按钮 $($rBench.x + $rBench.w) < 徽标 $($badge[0].x)）") `
+      (($rBench.x + $rBench.w) -lt $badge[0].x)
+  }
+  Set-Edit $e13[3] "6"                    # 先填别的值，确认会被覆盖
+  Click-Btn $bBench
+  [void](Dismiss-Prompt "确定")           # 不足 5 线程 → 提示框（只有确定）
+  Start-Sleep -Milliseconds 500
+  Assert ("不足 5 线程：CPU 线程数被直接填成 3（实测 '" + (Get-WText $e13[3].h) + "'）") ((Get-WText $e13[3].h) -eq "3")
+  Assert "状态行说明『不做实测』" (Any-Text "直接填入最大线程数")
+  Set-Edit $e13[3] "4"                    # 复原（后续相位不依赖）
+
+  Write-Host "== G13b: CLI bench（真机 ≥5 核路径 + 不足 5 核路径）=="
+  $benchModel = "d:/gguf_models/Qwen3-0.6B-Q4_K_M.gguf"
+  if (Test-Path $benchModel) {
+    $env:RIME_LLM_FAKE_CORES = "5"       # 5 核 → 实测 4~5 两档（快）
+    $o = (& $psExe -NoProfile -ExecutionPolicy Bypass -File $entry -CliAction bench `
+          -ModelPath $benchModel -BenchTrials 5 2>&1 | Out-String)
+    Assert "CLI 实测输出含 [RESULT] reason=ok" ($o -match 'reason=ok')
+    Assert "CLI 输出含 推荐 CPU 线程数" ($o -match '推荐 CPU 线程数')
+    $rec13 = -1
+    $m13 = [regex]::Match($o, 'rec=(\d+)')
+    if ($m13.Success) { $rec13 = [int]$m13.Groups[1].Value }
+    Assert ("推荐值落在 4..8（实测 $rec13）") ($rec13 -ge 4 -and $rec13 -le 8)
+    Assert ("实测档位只扫 4 起（未出现 thr= 3）") (-not ($o -match 'thr=\s*3:'))
+  } else {
+    Write-Host "  （跳过真机路径：$benchModel 不存在）"
+  }
+  $env:RIME_LLM_FAKE_CORES = "3"
+  $o3 = (& $psExe -NoProfile -ExecutionPolicy Bypass -File $entry -CliAction bench 2>&1 | Out-String)
+  Assert "CLI 不足 5 线程：直接推荐最大线程数 3" ($o3 -match '直接推荐最大线程数 3')
+  Assert "CLI 不足 5 线程：不进实测（无 thr= 行）" (-not ($o3 -match 'thr='))
+  Assert "CLI 不足 5 线程：无需模型文件" ($o3 -match '不做实测')
+
   # ② 遗留 curl 接管：起 CLI 下载 → 杀包装进程留下 curl → 再起一次 → 旧进程被接管
   #（走 CLI 而非 GUI：WinForms 组合框的托管 Text 与跨进程 WM_SETTEXT 不一定同步，
   #  而 CLI 与 GUI 用的是同一个 Download-ModelAction + Stop-StaleDownloader）
@@ -613,6 +669,101 @@ engine:
   } else {
     Write-Host "  （跳过 ②：本机无 curl.exe）"
   }
+
+  # ══ G13c：真机实测路径（≥5 核 + 真模型 → 弹框给表+推荐值 → 采用回填）══
+  # 套件前段全程假 3 核（只覆盖"不实测"分支），这里重开一个假 5 核的 GUI，
+  # 把「起子进程 → 读结果文件 → 解析 [RESULT] → 弹框 → 回填」整条链路跑通。
+  # 依赖本机模型（不存在则跳过）——套件是本机维护用，不发布。
+  Write-Host "== G13c: 真机实测路径（假 5 核 + 真模型，约 20 秒）=="
+  $benchModel2 = "d:/gguf_models/Qwen3-0.6B-Q4_K_M.gguf"
+  if (-not (Test-Path $benchModel2)) {
+    Write-Host "  （跳过：$benchModel2 不存在）"
+  } else {
+    Get-Process pwsh, powershell -ErrorAction SilentlyContinue |
+      Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like "*LLM 重排安装器*" } |
+      Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    $env:RIME_LLM_FAKE_CORES = "5"
+    # 必须带 -WindowStyle Hidden（同首次启动）：否则 pwsh 的控制台窗口会成为
+    # MainWindowHandle，枚举到的全是控制台而不是 WinForms 窗体（实测踩到）
+    $p2 = Start-Process -FilePath $psExe -ArgumentList @("-NoProfile", "-STA", "-ExecutionPolicy",
+             "Bypass", "-WindowStyle", "Hidden", "-File", "`"$entry`"") -PassThru
+    $hw2 = [IntPtr]::Zero
+    for ($t = 0; $t -lt 24; $t++) {
+      Start-Sleep -Milliseconds 500
+      $p2.Refresh()
+      if ($p2.HasExited) { break }
+      if ($p2.MainWindowHandle -ne [IntPtr]::Zero) { $hw2 = $p2.MainWindowHandle; break }
+    }
+    if ($hw2 -eq [IntPtr]::Zero) { throw "第二次 GUI 启动失败（真机实测路径）" }
+    Start-Sleep -Seconds 2
+    # 本相位**不复用**上面那套绑定 $hw 的辅助函数（$hw 指向第一个已被杀掉的窗口），
+    # 全部按 $hw2 现枚举，避免"读到死窗口 → 空结果"。
+    function Get-CtlsOf([IntPtr]$w) {
+      $list = @()
+      foreach ($h in [W]::Children($w)) {
+        $cn = New-Object System.Text.StringBuilder 256
+        [void][W]::GetClassName($h, $cn, 256)
+        $r = New-Object "W+RECT"
+        [void][W]::GetWindowRect($h, [ref]$r)
+        $list += [pscustomobject]@{
+          h = $h; cls = $cn.ToString(); text = (Get-WText $h)
+          vis = [W]::IsWindowVisible($h); parent = [W]::GetParent($h)
+          x = $r.L; y = $r.T; w = ($r.R - $r.L); hh = ($r.B - $r.T)
+        }
+      }
+      return $list
+    }
+    $c2 = Get-CtlsOf $hw2
+    $cmbModel2 = @($c2 | Where-Object { $_.cls -match '(?i)COMBOBOX' } | Select-Object -Last 1)
+    $btnBench2 = @($c2 | Where-Object { $_.cls -match 'BUTTON' -and $_.text -eq "实测线程数" } | Select-Object -First 1)
+    $edCores2 = @($c2 | Where-Object {
+        if ($_.cls -notmatch '\.Edit\.') { return $false }
+        return (@('触发条件', '推理规模', '候选排序融合') -contains (Get-WText $_.parent))
+      } | Sort-Object y, x)
+    Assert "第二个 GUI 上找到 按钮/模型框/参数框" ($btnBench2.Count -eq 1 -and $cmbModel2.Count -eq 1 -and $edCores2.Count -eq 6)
+    if ($btnBench2.Count -eq 1 -and $cmbModel2.Count -eq 1 -and $edCores2.Count -eq 6) {
+      # 模型路径：跨进程 WM_SETTEXT 能同步到 WinForms ComboBox 的托管 Text（G12 已证）
+      [void][W]::SendMsgStr($cmbModel2[0].h, 0x000C, [IntPtr]::Zero, $benchModel2)
+      Start-Sleep -Milliseconds 500
+      [void][W]::SendMsgStr($edCores2[3].h, 0x000C, [IntPtr]::Zero, "4")
+      [void][W]::PostMsg($btnBench2[0].h, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)   # BM_CLICK(Post!)
+      $dlg = [IntPtr]::Zero
+      for ($t = 0; $t -lt 130; $t++) {   # 最多等 ~65 秒（4~5 档 × 41 次 + 模型加载）
+        Start-Sleep -Milliseconds 500
+        $gpid2 = 0
+        [void][W]::GetWindowThreadProcessId($hw2, [ref]$gpid2)
+        $dlg = [W]::FindDialog([int]$gpid2)
+        if ($dlg -ne [IntPtr]::Zero) { break }
+        $p2.Refresh()
+        if ($p2.HasExited) { break }
+      }
+      Assert "真机实测弹出推荐值框（65 秒内）" ($dlg -ne [IntPtr]::Zero)
+      if ($dlg -ne [IntPtr]::Zero) {
+        $dtext = (@([W]::Children($dlg)) | ForEach-Object { Get-WText $_ }) -join "`n"
+        Assert "弹框含逐档延迟表（thr= 行）" ($dtext -match 'thr=\s*4:')
+        Assert "弹框含推荐值行" ($dtext -match '推荐 CPU 线程数 = \d+')
+        # 应答：中文 Windows 的 Yes 按钮文案是「是(&Y)」→ 先按文本前缀点，再按 IDYES 兜底
+        $hit = $false
+        foreach ($h in [W]::Children($dlg)) {
+          if ((Get-WText $h) -like "是*") {
+            [void][W]::PostMsg($h, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero); $hit = $true; break
+          }
+        }
+        if (-not $hit) { [void][W]::PostMsg($dlg, 0x0111, [IntPtr]6, [IntPtr]::Zero) }
+        Start-Sleep -Milliseconds 900
+        $filled = Get-WText $edCores2[3].h
+        Assert ("采用后回填 CPU 线程数 = 推荐值（实测 '$filled'）") ($filled -match '^[4-8]$')
+      }
+    }
+    # 关窗：应连带结束 bench_threads 子进程
+    [void]$p2.CloseMainWindow()
+    Start-Sleep -Seconds 2
+    if (-not $p2.HasExited) { try { $p2.Kill() } catch { } }
+    Start-Sleep -Milliseconds 500
+    Assert ("关窗后无遗留 bench_threads 进程（实测 {0} 个）" -f @(Get-Process bench_threads -ErrorAction SilentlyContinue).Count) (@(Get-Process bench_threads -ErrorAction SilentlyContinue).Count -eq 0)
+    Get-Process bench_threads -ErrorAction SilentlyContinue | Stop-Process -Force
+  }
 }
 finally {
   Get-Process pwsh, powershell -ErrorAction SilentlyContinue |
@@ -620,6 +771,7 @@ finally {
     Stop-Process -Force -ErrorAction SilentlyContinue
   Remove-Item Env:LLM_INSTALLER_NO_REDEPLOY -ErrorAction SilentlyContinue
 Remove-Item Env:RIME_LLM_USER_DIR -ErrorAction SilentlyContinue
+Remove-Item Env:RIME_LLM_FAKE_CORES -ErrorAction SilentlyContinue
 
   Remove-Item $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }

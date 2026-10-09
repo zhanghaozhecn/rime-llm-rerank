@@ -5,21 +5,24 @@
 # GUI：双击 install_plugin.bat（提权）→ **单页**（2026-09-30 用户定案：与源码版
 #   WeaselLLMSetup 尽量一致、并去掉"加/去 LLM 在另一页"的割裂）：
 #     方案接入（方案下拉）→ 总控（启用 + 模型路径 + 下载模型 + 模型状态）→ 触发条件 →
-#     推理规模 → 候选排序融合 → 诊断日志 → 安装（复制文件）→ 保存并生效 / 剥离 / 关闭。
+#     推理规模（CPU 线程数行含『实测线程数』）→ 候选排序融合 → 诊断日志 →
+#     安装（复制文件）→ 保存并生效 / 剥离 / 关闭。
 # 底色：表单 BackColor = White（2026-10-01 用户定案：**两版底色统一为白**；
 #   WinForms 的 BackColor 是环境属性，GroupBox/Label/CheckBox 未显式设色时会跟着继承）。
 #   界面**不留日志框**：正常只更新状态行；出错写 installer\install_error.log
 #   （GUI 程序所在目录）并弹一次框给出日志路径。
 #   参数读写选中方案的 llm_rerank 配置节，保存后自动重新部署（两版配置节相同）。
-# CLI：-CliAction status|install|copy-files|schema-add|schema-remove|download-model
+# CLI：-CliAction status|install|copy-files|schema-add|schema-remove|download-model|bench
 #      -SchemaName pdsp.schema.yaml -ModelPath d:\gguf_models\xxx.gguf（可选，写入配置）
+#      bench = 线程数实测（起点 4 / 终点 8；本机不足 5 线程不实测，直接取最大线程数）
 # 设计（2026-08-25 定稿）：安装器只做 文件操作 + schema 加/去 LLM 组件行（幂等）。
 # 不碰注册表、不调 WeaselSetup、不做还原（切换 = 重装小狼毫 + 换原始方案配置）。
 
 param(
   [string]$CliAction = "",
   [string]$SchemaName = "",
-  [string]$ModelPath = ""
+  [string]$ModelPath = "",
+  [int]$BenchTrials = 41        # 线程数实测：每档计时次数（GUI/CLI 默认 41 ≈ 30 秒）
 )
 
 $ErrorActionPreference = "Stop"
@@ -607,6 +610,139 @@ function Download-ModelAction([string]$modelPath, $Log) {
   }
 }
 
+# ── 线程数实测（2026-10-01 用户定案）──────────────────────────────
+# 起点 4 线程、终点 8 线程；本机不足 5 逻辑核**不实测**，直接取最大线程数。
+# 推荐规则本体在 bench_threads.exe 内（它打 `[RESULT]` 机器可读行），本脚本与
+# 两版 GUI 都只做「起进程 → 读结果文件 → 显示/回填」，避免两版各写一套规则。
+$BenchMinCores = 5        # 逻辑核 < 5 → 不实测，直接取最大线程数
+$BenchTrialsDef = 41      # 每档计时次数（41 × 5 档 ≈ 30 秒）
+$BENCH_TMP = Join-Path $env:TEMP "rime_llm_bench_result.txt"
+$BENCH_PID = Join-Path $env:TEMP "rime_llm_bench.pid"
+$BENCH_LOG = Join-Path $env:TEMP "rime_llm_bench_stdout.txt"
+if ($BenchTrials -le 0) { $BenchTrials = $BenchTrialsDef }   # GUI / CLI 共用的每档次数
+
+function Get-LogicalCores {
+  # 测试钩子（正常部署不设，bench_threads.exe 读同一个变量）：
+  # 本机没法真的变成 4 核，「不足 5 线程不实测」那条分支只能靠它验证
+  $fake = $env:RIME_LLM_FAKE_CORES
+  if ($fake) {
+    $n = 0
+    if ([int]::TryParse("$fake".Trim(), [ref]$n) -and $n -gt 0) { return $n }
+  }
+  return [Environment]::ProcessorCount
+}
+
+function Resolve-BenchExe {
+  $root = Split-Path $PSScriptRoot -Parent
+  foreach ($p in @((Join-Path $root "bin\bench_threads.exe"),
+                   (Join-Path $root "cpp\bench_threads.exe"))) {
+    if (Test-Path $p) { return $p }
+  }
+  return $null
+}
+
+# 解析 bench_threads 的输出：表格行（进度显示）+ [RESULT] 机器可读行（推荐值）
+function Get-BenchResult([string]$text) {
+  $m = [regex]::Match($text, '\[RESULT\][^\r\n]*')
+  if (-not $m.Success) { return $null }
+  $kv = @{}
+  foreach ($mm in [regex]::Matches($m.Value, '(\w+)=([^\s]+)')) {
+    $kv[$mm.Groups[1].Value] = $mm.Groups[2].Value
+  }
+  return @{
+    Line   = $m.Value.Trim()
+    Table  = ((($text -split "`r?`n") | Where-Object { $_ -match '^\s*thr=' }) -join "`n")
+    Rec    = [int]$kv['rec']
+    Reason = $kv['reason']
+    RecMs  = $kv['rec_ms']
+    Best   = $kv['best']
+    BestMs = $kv['best_ms']
+    Phys   = $kv['phys_cores']
+  }
+}
+
+# 读结果文件：写入端是 bench_threads（_SH_DENYNO 共享打开），这里也用共享模式
+# 读并重试——轮询正好撞上写入时不会抛 "used by another process"
+function Read-TextShared([string]$path, [int]$retry = 3) {
+  for ($i = 0; $i -lt $retry; $i++) {
+    try {
+      if (-not (Test-Path $path)) { return "" }
+      $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+      try {
+        $buf = New-Object byte[] ([int]$fs.Length)
+        $n = $fs.Read($buf, 0, $buf.Length)
+        return [Text.Encoding]::UTF8.GetString($buf, 0, $n)
+      } finally { $fs.Close() }
+    } catch {
+      if ($i -eq $retry - 1) { return "" }
+      Start-Sleep -Milliseconds 150
+    }
+  }
+  return ""
+}
+
+# 遗留接管（同 curl 的 ④ 规则）：上次实测异常退出（关窗没杀干净）→ 先结束它，
+# 否则两份实测互相抢 CPU，延迟全测歪
+function Stop-StaleBench {
+  if (-not (Test-Path $BENCH_PID)) { return $false }
+  $txt = (Get-Content $BENCH_PID -Raw -ErrorAction SilentlyContinue)
+  Remove-Item $BENCH_PID -Force -ErrorAction SilentlyContinue
+  $old = 0
+  if (-not [int]::TryParse(("$txt").Trim(), [ref]$old)) { return $false }
+  try {
+    $p = Get-Process -Id $old -ErrorAction Stop
+    if ($p.ProcessName -ieq "bench_threads") { $p.Kill(); return $true }
+  } catch { }
+  return $false
+}
+
+# 线程数实测（CLI = -CliAction bench；GUI 走同一套探测/规则，只是把推荐值回填输入框）
+function Bench-Action([string]$modelPath, [int]$trials, $Log) {
+  & $Log "── 线程数实测（4~8 线程；本机不足 $BenchMinCores 线程不实测）──"
+  $cores = Get-LogicalCores
+  if ($cores -lt $BenchMinCores) {
+    & $Log "本机逻辑核 $cores（不足 $BenchMinCores）→ 不做实测，直接推荐最大线程数 $cores"
+    & $Log "请在方案 llm_rerank 里设 cpu_cores: $cores，然后重新部署"
+    return $cores
+  }
+  $exe = Resolve-BenchExe
+  if (-not $exe) { throw "未找到 bench_threads.exe（应在 bin\bench_threads.exe）——见 README 的线程数实测一节" }
+  if (-not $modelPath) { throw "需要 -ModelPath 指定模型文件（实测必须加载模型）" }
+  if (-not (Test-Path $modelPath)) { throw "模型文件不存在：$modelPath" }
+  if (Stop-StaleBench) { & $Log "已结束上次遗留的实测进程，由本次接管" }
+  Remove-Item $BENCH_TMP -Force -ErrorAction SilentlyContinue
+  $argList = @("--out", "`"$BENCH_TMP`"", "--trials", "$trials", "--no-wait", "`"$modelPath`"")
+  $proc = Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden `
+    -RedirectStandardOutput $BENCH_LOG -PassThru
+  Set-Content -Path $BENCH_PID -Value $proc.Id -Encoding ASCII
+  $off = 0
+  try {
+    while (-not $proc.HasExited) {
+      Start-Sleep -Milliseconds 400
+      if (Test-Path $BENCH_TMP) {   # 逐档出结果 → 实时转写到调用方的日志
+        $txt = Read-TextShared $BENCH_TMP
+        $lines = @($txt -split "`r?`n" | Where-Object { $_ -match '^\s*thr=' })
+        while ($off -lt $lines.Count) { & $Log ("  " + $lines[$off].Trim()); $off++ }
+      }
+    }
+  } finally {
+    Remove-Item $BENCH_PID -Force -ErrorAction SilentlyContinue
+  }
+  $text = ""
+  if (Test-Path $BENCH_TMP) { $text = Read-TextShared $BENCH_TMP }
+  $r = Get-BenchResult $text
+  if ($proc.ExitCode -ne 0 -or -not $r) {
+    throw "实测失败（退出码 $($proc.ExitCode)）——模型能否加载 / bench_threads.exe 是否匹配"
+  }
+  # 表格：轮询里已实时转过一部分，这里只补剩余（避免整表重复打印）
+  $lines = @($text -split "`r?`n" | Where-Object { $_ -match '^\s*thr=' })
+  while ($off -lt $lines.Count) { & $Log ("  " + $lines[$off].Trim()); $off++ }
+  & $Log $r.Line
+  & $Log "推荐 CPU 线程数 = $($r.Rec)（$($r.RecMs) ms/pass；最优 $($r.BestMs) ms @ $($r.Best) 线程，物理核 $($r.Phys)）"
+  & $Log "在方案 llm_rerank 里设 cpu_cores: $($r.Rec)，然后重新部署（GUI 点『实测线程数』可直接采用）"
+  return $r.Rec
+}
+
 # 完整安装 = 复制文件 + 方案配置（CLI -CliAction install，自动化旧路径）
 function Install-PluginAction([string]$schemaName, $Log) {
   Copy-FilesPluginAction $Log
@@ -642,7 +778,8 @@ function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$mode
           Schema-RemoveAction $schemaName $Log
         }
         "download-model" { Download-ModelAction $modelPath $Log }
-        default { & $Log "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove | download-model）"; exit 1 }
+        "bench" { [void](Bench-Action $modelPath $BenchTrials $Log) }
+        default { & $Log "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove | download-model | bench）"; exit 1 }
       }
     } catch {
       & $Log ("[ERROR] " + $_.Exception.Message)
@@ -690,7 +827,8 @@ function Run-InstallerGui {
   $tipCodePat = "触发条件：编码串全串正则匹配，只有匹配上的编码才交给 LLM 重排`n（写法与 Rime speller/auto_select_pattern 一致）。`n默认 .{4} = 恰 4 码。例：`n　.{4,} 4 码以上　　.{3,4} 3~4 码`n　[abcde]{4} 指定首码　　空 = 不限制`n含 \ 的写法要用单引号，如 '\d{4}'。"
   $tipMaxTok = "上文长度上限：取光标前多少个 token 作为重排依据（默认 10）。`n越大越准，但每次都更慢。"
   $tipMaxCand = "每次按键参与 LLM 打分的候选数上限（默认 5）。`n一般不用改——调大更准但更慢。"
-  $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n可用 bin\bench_threads.exe 实测最优值。"
+  $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
+  $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
   $tipBeta = "用户词频权重 β（默认 1.5，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成`n越常上屏的词加分越多；加分在 log 域，可翻盘 LLM 的分差。"
   $tipElw = "预期词长权重 elw（默认 0.2，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成`n按 词长 = 码长÷2 给候选加成，只对两码一字的方案有意义；`n成熟机器建议 0。"
   $tipDebug = "诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt`n（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。"
@@ -871,6 +1009,10 @@ function Run-InstallerGui {
   $txtCores = Add-Ctl "TextBox" "" $g3 (14 + $lwP + 10) ($rowY - 3) 64 22
   $script:tip.SetToolTip($txtCores, $tipCores)
   Add-Help $g3 $tipCores (Help-X $g3) ($rowY - 1) | Out-Null
+  # 线程数实测（2026-10-01 用户定案）：本行右起按钮，弹框给表 + 采用回填
+  $btnBench = Add-Ctl "Button" "实测线程数" $g3 (14 + $lwP + 10 + 64 + 8) ($rowY - 3) 92 24
+  Style-Btn $btnBench $false
+  $script:tip.SetToolTip($btnBench, $tipBench)
 
   $g4 = Add-Group $form "候选排序融合" $GX 426 $GW 92
   $rowY = 22
@@ -1103,6 +1245,139 @@ function Run-InstallerGui {
     if ($p -match '^\\\\') { return $true }             # UNC \\server\share
     return $false
   }
+
+  # ── 线程数实测（2026-10-01 用户定案：起点 4 / 终点 8）────────────────
+  # 推荐规则本体在 bench_threads.exe（它打 `[RESULT]` 机器可读行），这里只做
+  # 「起进程 → 读结果文件（唯一进度通道，工具逐行 flush）→ 弹框给表 + 采用回填」，
+  # 免得两版 GUI 各写一套规则。实测期间禁用按钮；关窗时结束子进程。
+  $script:BenchProc = $null
+  $script:BenchText = New-Object System.Text.StringBuilder
+  $BenchTimer = New-Object System.Windows.Forms.Timer
+  $BenchTimer.Interval = 400
+
+  function Read-BenchProgress {
+    if (-not (Test-Path $BENCH_TMP)) { return }
+    $chunk = Read-TextShared $BENCH_TMP
+    if (-not $chunk) { return }
+    [void]$script:BenchText.Clear()
+    [void]$script:BenchText.Append($chunk)
+    $last = @($chunk -split "`r?`n" | Where-Object { $_ -match '^\s*thr=' } | Select-Object -Last 1)
+    if ($last.Count) {
+      $lblParamStatus.Text = "实测中… " + $last[0].Trim()
+      $lblParamStatus.ForeColor = $colInfo
+    }
+  }
+
+  function Stop-Bench {
+    if ($script:BenchProc -and -not $script:BenchProc.HasExited) {
+      try { $script:BenchProc.Kill() } catch { }
+    }
+    $script:BenchProc = $null
+    $BenchTimer.Stop()
+    Remove-Item $BENCH_PID -Force -ErrorAction SilentlyContinue
+    $btnBench.Enabled = $true
+  }
+
+  function Start-Bench {
+    if ($script:BenchProc) { return }
+    $lblParamStatus.ForeColor = $colInfo
+    # 本机不足 5 线程：不实测，直接取最大线程数（工具内同规则；不加载模型 →
+    # 秒回，连模型文件都不需要）
+    $cores = Get-LogicalCores
+    if ($cores -lt $BenchMinCores) {
+      $txtCores.Text = [string]$cores
+      [void][System.Windows.Forms.MessageBox]::Show(
+        ("本机逻辑核 $cores（不足 $BenchMinCores），不做实测。`n已直接填入最大线程数 $cores——点『保存并生效』应用。"),
+        "线程数实测", [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Information)
+      $lblParamStatus.Text = "本机仅 $cores 线程，已直接填入最大线程数 $cores（点『保存并生效』应用）"
+      return
+    }
+    $exe = Resolve-BenchExe
+    if (-not $exe) {
+      $lblParamStatus.Text = "[失败] 未找到 bench_threads.exe（应在 bin\bench_threads.exe）"
+      $lblParamStatus.ForeColor = $colErr
+      return
+    }
+    # 实测要加载模型：按"保存"同一口径先校验模型路径（绝对路径 / 存在 / 不像半截）
+    $model = $cmbModel.Text.Trim()
+    if (-not $model) { $model = $DEFAULT_MODEL }
+    if (-not (Test-ModelPathOk $model)) {
+      $lblParamStatus.Text = "[失败] 实测需要绝对路径的模型：$model"
+      $lblParamStatus.ForeColor = $colErr
+      return
+    }
+    $fi = Get-Item -LiteralPath $model -ErrorAction SilentlyContinue
+    if (-not $fi) {
+      $lblParamStatus.Text = "[失败] 模型文件不存在（实测必须加载模型）：$model"
+      $lblParamStatus.ForeColor = $colErr
+      return
+    }
+    if ($fi.Length -lt $MODEL_MIN_BYTES) {
+      $lblParamStatus.Text = ("[失败] 模型文件可疑（仅 {0:N0} MB）——先点『下载模型』或换一个" -f ($fi.Length / 1MB))
+      $lblParamStatus.ForeColor = $colErr
+      return
+    }
+    if (Stop-StaleBench) {
+      $lblParamStatus.Text = "已结束上次遗留的实测进程，由本次接管…"
+    }
+    Remove-Item $BENCH_TMP -Force -ErrorAction SilentlyContinue
+    [void]$script:BenchText.Clear()
+    try {
+      $argList = @("--out", "`"$BENCH_TMP`"", "--trials", "$BenchTrials", "--no-wait", "`"$model`"")
+      $script:BenchProc = Start-Process -FilePath $exe -ArgumentList $argList `
+        -WindowStyle Hidden -RedirectStandardOutput $BENCH_LOG -PassThru
+      Set-Content -Path $BENCH_PID -Value $script:BenchProc.Id -Encoding ASCII
+    } catch {
+      $script:BenchProc = $null
+      $lblParamStatus.Text = "[失败] 无法启动 bench_threads.exe：" + $_.Exception.Message
+      $lblParamStatus.ForeColor = $colErr
+      Write-ErrLog "线程数实测启动失败" ($_.Exception.ToString()) | Out-Null
+      return
+    }
+    $btnBench.Enabled = $false
+    $lblParamStatus.Text = "实测中…（4~$([Math]::Min($cores, 8)) 线程 × $BenchTrials 次，约 30 秒，期间请勿打字）"
+    $BenchTimer.Start()
+  }
+
+  $BenchTimer.Add_Tick({
+    Read-BenchProgress
+    if (-not $script:BenchProc) { $BenchTimer.Stop(); return }
+    if (-not $script:BenchProc.HasExited) { return }
+    Start-Sleep -Milliseconds 250
+    Read-BenchProgress
+    $code = $null
+    try { $code = $script:BenchProc.ExitCode } catch { }
+    $text = $script:BenchText.ToString()
+    $script:BenchProc = $null
+    $BenchTimer.Stop()
+    $btnBench.Enabled = $true
+    Remove-Item $BENCH_PID -Force -ErrorAction SilentlyContinue
+    $r = Get-BenchResult $text
+    if ($code -ne 0 -or -not $r) {
+      $lblParamStatus.Text = "[失败] 实测失败（退出码 $code）——换一个模型，或用 CLI：-CliAction bench"
+      $lblParamStatus.ForeColor = $colErr
+      Write-ErrLog "线程数实测失败（退出码 $code）" $text | Out-Null
+      return
+    }
+    if ($r.Reason -eq 'low_cores') {
+      $txtCores.Text = [string]$r.Rec
+      $lblParamStatus.Text = "本机不足 $BenchMinCores 线程，已直接填入最大线程数 $($r.Rec)（点『保存并生效』应用）"
+      return
+    }
+    $msg = "本机实测（ms/pass，越小越快）：`n`n$($r.Table)`n`n" +
+           "推荐 CPU 线程数 = $($r.Rec)（$($r.RecMs) ms；最优 $($r.BestMs) ms @ $($r.Best) 线程，物理核 $($r.Phys)）。`n`n" +
+           "采用该值吗？（采用后点『保存并生效』应用）"
+    $ans = [System.Windows.Forms.MessageBox]::Show($msg, "线程数实测 — 推荐值",
+             [System.Windows.Forms.MessageBoxButtons]::YesNo,
+             [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
+      $txtCores.Text = [string]$r.Rec
+      $lblParamStatus.Text = "已填入 CPU 线程数 = $($r.Rec)（点『保存并生效』应用）"
+    } else {
+      $lblParamStatus.Text = "已取消（保留原值 $($txtCores.Text.Trim())）"
+    }
+  })
 
   function Save-ParamsFromUi {
     $item = Get-SelectedSchema
@@ -1393,6 +1668,7 @@ function Run-InstallerGui {
     }
   })
   $btnFiles.Add_Click({ Start-Work "copy-files" "" "" })
+  $btnBench.Add_Click({ Start-Bench })
   $btnDownload.Add_Click({
     # ① 已存在但明显偏小 → 先确认再覆盖（此前会被当成"已存在"直接跳过）
     $target = $cmbModel.Text.Trim()
@@ -1477,6 +1753,9 @@ function Run-InstallerGui {
     if ($script:WorkProc -and -not $script:WorkProc.HasExited) {
       try { $script:WorkProc.Kill() } catch { }
     }
+    # 关窗时结束线程数实测子进程（它自己不带子进程，直接杀即可；结果文件保留，
+    # 下次点『实测线程数』重跑）——与下面 curl 的处理同理
+    try { Stop-Bench } catch { }
     # ② 关窗时把 curl 一并结束：下载动作的 curl 是"子进程的孙进程"，
     #    只杀包装 pwsh 会留下一个仍在写分片的孤儿（重开再点会变成两个写入者）。
     #    分片本身保留 → 下次点『下载模型』照样断点续传。
