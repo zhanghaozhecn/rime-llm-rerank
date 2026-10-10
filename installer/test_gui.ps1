@@ -561,7 +561,7 @@ engine:
   [void][W]::SendMsgStr($modelCmb.h, 0x000C, [IntPtr]::Zero, $small)
   Start-Sleep -Milliseconds 300
   Click-Btn (Find-Button "保存并生效")
-  Assert "小文件显示为可疑" (Any-Text "模型文件可疑")
+  Assert "小文件显示为可疑" (Any-Text "模型可疑")
   # ①b 已存在但偏小时点下载 → 先弹确认；选"否"→ 取消且不启动下载
   $curlBefore = @(Get-Process curl -ErrorAction SilentlyContinue).Count
   Click-Btn (Find-Button "下载模型")

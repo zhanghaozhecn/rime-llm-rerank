@@ -804,8 +804,26 @@ function Run-InstallerGui {
   # 底色 = 白（2026-10-01 用户定案：两版底色统一）。WinForms 的 BackColor 是**环境属性**，
   # 未显式设色的子控件（GroupBox / Label / CheckBox）会继承 → 一处置白即可全白。
   $form.BackColor = [System.Drawing.Color]::White
-  # 字体/缩放交给系统（AutoScaleMode=Font 时 WinForms 按系统 DPI 缩放，控件不糊）
-  $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
+  # 字体/缩放（2026-10-09 用户真机反馈修正）：纯代码建的 WinForms 窗体**不会**自动
+  # 按 DPI 缩放——AutoScaleDimensions 在构造时就固定成当时的字体尺寸，与
+  # CurrentAutoScaleDimensions 同源 → 比值恒为 1（实测 AutoScaleMode 的 Font/Dpi
+  # 各配置在本机都不缩放）→ 200% 屏上"系统字体 2×、写死的坐标与尺寸仍 1×"，
+  # 表现为输入框很大/文字溢出、比例全乱（3120×2080@200% 实测截图）。
+  # 修法与源码版 ts() 同口径：布局一律按 **96 DPI 设计值**写死，最后统一缩放一次
+  # （见布局末尾的 $form.Scale 调用）：字体要自己按 k 设（实测 Scale 不动字体）。
+  # 钩子 RIME_LLM_FAKE_DPI=192：本机 100% 也能按 200% 排版核对（截图/几何断言）。
+  $script:DpiK = 1.0
+  try {
+    if ($env:RIME_LLM_FAKE_DPI) {
+      $script:DpiK = [double]$env:RIME_LLM_FAKE_DPI / 96.0
+    } else {
+      $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)   # 屏幕 DC → 主显示器 DPI
+      $script:DpiK = [double]$g.DpiX / 96.0
+      $g.Dispose()
+    }
+  } catch { $script:DpiK = 1.0 }
+  if ($script:DpiK -le 0) { $script:DpiK = 1.0 }
+  $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
   # 状态色（原 DarkBlue/Firebrick 偏刺眼，改柔和且语义清晰）
   $colInfo = [System.Drawing.Color]::FromArgb(0, 90, 158)
   $colOk = [System.Drawing.Color]::FromArgb(0, 120, 60)
@@ -865,7 +883,7 @@ function Run-InstallerGui {
   # 坑：Label 自己的文字在 Paint 事件**之前**画 → 圆底会把文字盖掉，
   # 故徽标文字由本函数自己 DrawString（Label.Text 仍留 "?"，供自动化/读屏识别）。
   # x 一律取分组框 ClientSize 右端，避免不同主题的边框宽度把徽标挤出可视区。
-  $script:helpFont = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+  $script:helpFont = New-Object System.Drawing.Font("Segoe UI", [float](8 * $script:DpiK), [System.Drawing.FontStyle]::Bold)
   $script:helpBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(45, 78, 120))
   function Add-Help($parent, [string]$tip, $x, $y) {
     $c = Add-Ctl "Label" "?" $parent $x $y 18 18
@@ -1111,12 +1129,14 @@ function Run-InstallerGui {
         $lblModelHint.Text = ""
       } else {
         # ① 半截/损坏文件不能显示成"已就绪"（否则重排静默失败、用户找不到原因）
-        $lblModelStatus.Text = "模型文件可疑：仅 $mb MB"
-        $lblModelHint.Text = "疑似未下完或损坏（完整约 508MB）——点『下载模型』会删除后重下，或用『浏览…』换一个"
+        # 文案长度受 $lblModelStatus(140) + $lblModelHint(480) 的**可见宽度**约束
+        # （2026-10-09 实测：超长会被 Label 直接截断，末尾看不见）——改文案先量宽
+        $lblModelStatus.Text = "模型可疑：仅 $mb MB"
+        $lblModelHint.Text = "疑似未下完或损坏——点『下载模型』重下，或用『浏览…』换一个"
       }
     } else {
       $lblModelStatus.Text = "模型文件不存在"
-      $lblModelHint.Text = "点『下载模型』下到左边这个路径（可断点续传），或用『浏览…』选已有的 .gguf"
+      $lblModelHint.Text = "点『下载模型』（可续传），或用『浏览…』选已有的 .gguf"
     }
   }
 
@@ -1728,6 +1748,20 @@ function Run-InstallerGui {
     }
     Read-ParamsToUi
   })
+
+  # ── 统一 DPI 缩放（必须在全部控件建好之后、显示之前）────────────────────
+  # ① 字体先按 k 放大（子控件未显式设字体时继承 → 文字与单行 TextBox 高度一起变大；
+  #    实测 $form.Scale 不动字体，所以这步不能省）
+  # ② 再 Scale(k,k)：把写死的坐标/尺寸/分组框/ClientSize 全部等比放大
+  #    （MeasureText 量出来的宽度是设计值，随后一并被缩放 → 与放大后的文字仍然吻合）
+  # 96 DPI（k=1）下整段跳过 → 与本次改动前逐像素一致。
+  if ([Math]::Abs($script:DpiK - 1.0) -gt 0.001) {
+    $k = [single]$script:DpiK
+    $form.Font = New-Object System.Drawing.Font($form.Font.FontFamily, [single]($form.Font.Size * $k))
+    $form.Scale((New-Object System.Drawing.SizeF($k, $k)))
+    # 页脚小字与「?」徽标是显式设过字体的，跟着一起放大（表单字体已放大 → 按它算）
+    $lblFooter.Font = New-Object System.Drawing.Font($form.Font.FontFamily, [float]($form.Font.Size - 0.75 * $k))
+  }
 
   $form.Add_Shown({
     Refresh-Ui
