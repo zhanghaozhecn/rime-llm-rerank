@@ -61,8 +61,8 @@ engine:
                       (($f | Select-String "lua_filter@\*llm_filter").Count) -eq 1)
   Assert "enabled: true" (($f | Where-Object { $_ -match '^\s+enabled: true\s*$' }).Count -eq 1)
   Assert "模板无 com_context（配置项已删）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
-  Assert "freq_beta: 1.50" (($f | Where-Object { $_ -match '^\s+freq_beta: 1\.50\s*$' }).Count -eq 1)
-  Assert "expected_length_weight: 0.20" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.20\s*$' }).Count -eq 1)
+  Assert "freq_beta: 8.00" (($f | Where-Object { $_ -match '^\s+freq_beta: 8\.00\s*$' }).Count -eq 1)
+  Assert "expected_length_weight: 0.00" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.00\s*$' }).Count -eq 1)
   Assert "code_pattern: '.{4}'（默认）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\.\{4\}'" }).Count -eq 1)
 
   Write-Host "== C2: 自定义参数 + model_path 后重跑 schema-add（逐键保留）=="
@@ -336,8 +336,8 @@ public class W {
   Assert "max_tokens = 10" ((Get-WText $e[1].h) -eq "10")
   Assert "max_candidates = 5" ((Get-WText $e[2].h) -eq "5")
   Assert "cpu_cores = 4" ((Get-WText $e[3].h) -eq "4")
-  Assert "freq_beta = 1.50" ((Get-WText $e[4].h) -eq "1.50")
-  Assert "elw = 0.20" ((Get-WText $e[5].h) -eq "0.20")
+  Assert "freq_beta = 8.00" ((Get-WText $e[4].h) -eq "8.00")
+  Assert "elw = 0.00" ((Get-WText $e[5].h) -eq "0.00")
   # 复选框状态不在此断言：BM_GETCHECK 跨进程读不到 WinForms 主题复选框的
   # 内部态（渲染/保存均正确，2026-09-29 截图+落盘双验证）——复选框断言
   # 统一走 BM_CLICK 切换 + 保存落盘（G4 读入态保持 / G7 点击翻转）

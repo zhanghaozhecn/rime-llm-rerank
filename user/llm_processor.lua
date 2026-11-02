@@ -76,8 +76,10 @@ end
 -- _G.user_word_freq: 词 → {c=累计次数, d=衰减计数 dee, t=最后提交 tick}
 -- _G.user_freq_tick: 全局 tick (每词提交 +1, 同 rime userdb UpdateTickCount)
 -- 衰减算法 = librime algo::formula_d (user_dictionary.cc 调频同源):
---   提交: dee = 1 + dee·exp((t_old - t_now)/200)   时间常数 τ=200 tick
---   查询: eff = dee·exp((t_word - t_now)/200)      (未提交期间持续衰减)
+--   提交: dee = 1 + dee·exp((t_old - t_now)/800)   时间常数 τ=800 tick
+--   查询: eff = dee·exp((t_word - t_now)/800)      (未提交期间持续衰减)
+-- τ=800 (2026-11-02 连续文章语料重标定: τ×β 联合扫描内点最优, β=8 时
+-- 较 τ=200 +0.25pp; 词频记忆跨约 800 次上屏/数篇文章, 旧值 200 偏短)
 -- 每 20 个新词重写落盘 user_freq.tsv (崩溃最多丢 19 次计数)。仅计含中文的词
 -- (判定为非 ASCII 即计, 与 Rime userdb "任何词条提交推 tick" 同源口径——
 -- 全角标点也计, 有意为之; 2026-09-03 tick 含一字词定案同源原则)。
@@ -85,7 +87,7 @@ end
 -- (迁移为 dee=次数, tick=当前 — 视为刚提交过)。
 -- 落盘修剪 (2026-09-04): eff < 1e-3 的冷词条不再写 (对融合分影响
 -- < 0.002 nats, 远低于任何实际分差) — 文件有界, 旧冷词条自然淘汰。
-local FREQ_TAU = 200
+local FREQ_TAU = 800
 local FREQ_FLUSH = 20
 local freq_dirty = 0
 local function freq_file()
