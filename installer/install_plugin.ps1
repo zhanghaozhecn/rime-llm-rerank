@@ -202,14 +202,20 @@ function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $
 # ——同样只在重建节时剥除，不做专门清理。
 # min_code_len / max_code_len 已废弃（2026-09-30 定案：改为 code_pattern 正则匹配，
 # 语义同 Rime speller/auto_select_pattern 的全串匹配）——旧行同样在重建节时剥除。
+# freq_beta 已删（2026-11-05 定案：标定产物退出用户配置面——用户没有标定能力；
+# FREQ_BETA=12 为 llm_filter.lua 内置常数，与 τ=400 同待遇（v3 六维联合标定 2026-11-06））——方案里残留的旧行读取端
+# 忽略，保存/重跑加 LLM 重建节时剥除。
+# expected_length_weight 保留（2026-11-05 同日恢复）：两码一字整句方案下使
+# floor(码长/2) 字的候选优先（长编码切词拼接选长度匹配的长词，1~2 码简码又
+# 不应压到字前面）——CE 权重覆盖不了这个结构效应，定长方案可试 0.2。
 $PARAM_DEFAULTS = [ordered]@{
   enabled = $false
   code_pattern = '.{4}'   # 仅 4 码；4 码以上 .{4,} / 3-4 码 .{3,4} / 指定字母 [abcde]{4}
   max_tokens = 10; max_candidates = 5; cpu_cores = 4
-  freq_beta = 8; expected_length_weight = 0; debug_fusion = $false   # 连续文章语料重标定 2026-11-02
+  expected_length_weight = 0; debug_fusion = $false
 }
 $PARAM_INT_KEYS  = @("max_tokens","max_candidates","cpu_cores")
-$PARAM_DBL_KEYS  = @("freq_beta","expected_length_weight")
+$PARAM_DBL_KEYS  = @("expected_length_weight")
 $PARAM_BOOL_KEYS = @("debug_fusion")
 # 字符串型参数（不做数值解析，原样写回；空串合法 = 总是匹配）
 $PARAM_STR_KEYS  = @("code_pattern")
@@ -268,7 +274,6 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
     "  max_tokens: $($p.max_tokens)",
     "  max_candidates: $($p.max_candidates)",
     "  cpu_cores: $($p.cpu_cores)",
-    "  freq_beta: $(Format-F2 ([double]$p.freq_beta))",
     "  expected_length_weight: $(Format-F2 ([double]$p.expected_length_weight))",
     "  debug_fusion: $(if ($p.debug_fusion) { 'true' } else { 'false' })"
   )
@@ -322,7 +327,6 @@ function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
     "  max_tokens: $($d.max_tokens)",
     "  max_candidates: $($d.max_candidates)",
     "  cpu_cores: $($d.cpu_cores)",
-    "  freq_beta: $(Format-F2 ([double]$d.freq_beta))",
     "  expected_length_weight: $(Format-F2 ([double]$d.expected_length_weight))",
     "  debug_fusion: $(if ($d.debug_fusion) { 'true' } else { 'false' })"
   )
@@ -797,7 +801,7 @@ function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$mode
 function Run-InstallerGui {
   $form = New-Object System.Windows.Forms.Form
   $form.Text = "LLM 重排安装器 — 插件版"
-  $form.ClientSize = New-Object System.Drawing.Size(700, 726)
+  $form.ClientSize = New-Object System.Drawing.Size(700, 700)
   $form.StartPosition = "CenterScreen"
   $form.FormBorderStyle = "FixedDialog"
   $form.MaximizeBox = $false
@@ -847,8 +851,7 @@ function Run-InstallerGui {
   $tipMaxCand = "每次按键参与 LLM 打分的候选数上限（默认 5）。`n一般不用改——调大更准但更慢。"
   $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
   $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
-  $tipBeta = "用户词频权重 β（默认 8，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成`n越常上屏的词加分越多；加分在 log 域，可翻盘 LLM 的分差。"
-  $tipElw = "预期词长权重 elw（默认 0，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + elw·词长加成`n按 词长 = 码长÷2 给候选加成，只对两码一字的定长方案（双拼/五笔/郑码）`n在冷启动阶段可能有用，可试 0.2；一般保持 0。"
+  $tipElw = "预期词长权重 elw（默认 0，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + log(0.5·p2+0.5·p1) + elw·词长加成`n两码一字整句方案：长编码切词拼接的候选里使 floor(码长/2) 字的`n长词优先，又不直接优先最长词（1~2 码简码不应压到字前面）。`n定长方案（双拼/五笔/郑码）冷启动可试 0.2；一般保持 0。`n注：词频权重 β 与 bigram 项 γ/λ 均为内置常数 12/1/0.5（v3 六维联合标定 2026-11-06 起不提供配置）。"
   $tipDebug = "诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt`n（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。"
   $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n随后自动重新部署生效。`n方案还没接入（缺配置节 / 缺组件行 / 残留另一版组件行）时，`n本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。"
   $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；`n**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
@@ -958,11 +961,12 @@ function Run-InstallerGui {
   }
 
   # ══════════════════════════════════════════════════════════════════
-  # 单页布局（2026-09-30 用户定案：与源码版 WeaselLLMSetup 尽量一致）
+  # 单页布局（2026-09-30 用户定案：与源码版 WeaselLLMSetup 尽量一致；
+  # 2026-11-05 用户定案：删「用户词频权重」行——freq_beta 为标定产物退出配置面
+  # → 内置常数；「候选排序融合」组保留（只剩预期词长权重一行——整句方案
+  # 长度匹配效应 CE 覆盖不了），与源码版同日同改）
   #   —— 方案接入 / 总控 / 触发条件 / 推理规模 / 候选排序融合 / 诊断日志
-  #   六块与源码版同序同标题同措辞；插件版多一块「安装」（复制文件 + 下载模型）
-  #   与「导入方案…」按钮。原先分两页导致"加/去 LLM"与"参数"割裂，现合并：
-  #   接入 / 剥离 / 启用 / 模型路径 / 参数 / 保存 全在同一页。
+  #   六块与源码版同序同标题同措辞；插件版多一块「安装」（复制文件 + 下载模型）。
   #   界面**不留日志框**：正常只更新状态行，出错才写 install_error.log。
   # ══════════════════════════════════════════════════════════════════
   $GX = 12; $GW = 676
@@ -1004,10 +1008,10 @@ function Run-InstallerGui {
   $script:tip.SetToolTip($txtCodePat, $tipCodePat)
   Add-Help $g2 $tipCodePat (Help-X $g2) 23 | Out-Null
 
-  # ── 推理规模 + 候选排序融合：五个参数各一行，标签列用同一个实测宽度 ──
+  # ── 推理规模 + 候选排序融合（一行）：标签列用同一个实测宽度 ──
   $lwP = 0
   foreach ($t in @("上文 token 上限:", "参与打分的候选数:", "CPU 线程数:",
-                   "用户词频权重:", "预期词长权重:")) {
+                   "预期词长权重:")) {
     $w = ([System.Windows.Forms.TextRenderer]::MeasureText($t, $form.Font)).Width + 8
     if ($w -gt $lwP) { $lwP = $w }
   }
@@ -1032,26 +1036,24 @@ function Run-InstallerGui {
   Style-Btn $btnBench $false
   $script:tip.SetToolTip($btnBench, $tipBench)
 
-  $g4 = Add-Group $form "候选排序融合" $GX 426 $GW 92
+  # 候选排序融合（2026-11-05 用户定案：删「用户词频权重」行——freq_beta 为标定
+  # 产物退出配置面 → FREQ_BETA 内置常数；保留「预期词长权重」一行——整句方案
+  # 长度匹配效应 CE 覆盖不了，保留配置项）
+  $g4 = Add-Group $form "候选排序融合" $GX 426 $GW 66
   $rowY = 22
-  [void](Add-Ctl "Label" "用户词频权重:" $g4 14 $rowY ($lwP + 4) 20)
-  $txtBeta = Add-Ctl "TextBox" "" $g4 (14 + $lwP + 10) ($rowY - 3) 64 22
-  $script:tip.SetToolTip($txtBeta, $tipBeta)
-  Add-Help $g4 $tipBeta (Help-X $g4) ($rowY - 1) | Out-Null
-  $rowY += 32
   [void](Add-Ctl "Label" "预期词长权重:" $g4 14 $rowY ($lwP + 4) 20)
   $txtElw = Add-Ctl "TextBox" "" $g4 (14 + $lwP + 10) ($rowY - 3) 64 22
   $script:tip.SetToolTip($txtElw, $tipElw)
   Add-Help $g4 $tipElw (Help-X $g4) ($rowY - 1) | Out-Null
 
   # ── 诊断日志（与源码版同位置：参数组之后、按钮之前）──
-  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion" $form 16 528 260 22
+  $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion" $form 16 502 260 22
   $script:tip.SetToolTip($chkDebug, $tipDebug)
-  Add-Help $form $tipDebug 664 530 | Out-Null
+  Add-Help $form $tipDebug 664 504 | Out-Null
 
   # ── 安装（插件版特有：二进制；源码版由 setup.exe 完成）──
   #    模型下载归「总控」的模型路径行（2026-10-01 用户定案：下载 = 配置动作，两版一致）
-  $g5 = Add-Group $form "安装" $GX 556 $GW 76
+  $g5 = Add-Group $form "安装" $GX 530 $GW 76
   $btnFiles = Add-Ctl "Button" "复制文件" $g5 14 24 152 30
   Style-Btn $btnFiles $false
   $script:tip.SetToolTip($btnFiles, $tipFiles)
@@ -1069,9 +1071,9 @@ function Run-InstallerGui {
     if ($w -gt $btnRowW) { $btnRowW = $w }
   }
   $btnRowGap = 8
-  $btnParamSave = Add-Ctl "Button" "保存并生效" $form 16 640 $btnRowW 32
-  $btnStrip = Add-Ctl "Button" "剥离" $form (16 + $btnRowW + $btnRowGap) 640 $btnRowW 32
-  $btnClose = Add-Ctl "Button" "关闭" $form (16 + 2 * ($btnRowW + $btnRowGap)) 640 $btnRowW 32
+  $btnParamSave = Add-Ctl "Button" "保存并生效" $form 16 614 $btnRowW 32
+  $btnStrip = Add-Ctl "Button" "剥离" $form (16 + $btnRowW + $btnRowGap) 614 $btnRowW 32
+  $btnClose = Add-Ctl "Button" "关闭" $form (16 + 2 * ($btnRowW + $btnRowGap)) 614 $btnRowW 32
   Style-Btn $btnParamSave $true
   Style-Btn $btnStrip $false
   Style-Btn $btnClose $false
@@ -1079,9 +1081,9 @@ function Run-InstallerGui {
   $form.AcceptButton = $btnParamSave
   $script:tip.SetToolTip($btnParamSave, $tipSave)
   $script:tip.SetToolTip($btnStrip, $tipStrip)
-  $lblParamStatus = Add-Ctl "Label" "" $form 16 678 668 18
+  $lblParamStatus = Add-Ctl "Label" "" $form 16 652 668 18
   $lblParamStatus.ForeColor = $colInfo
-  $lblFooter = Add-Ctl "Label" ("保存后自动重新部署生效　|　本机逻辑核 " + [Environment]::ProcessorCount + "　|　出错日志：install_error.log（本目录）") $form 16 700 668 16
+  $lblFooter = Add-Ctl "Label" ("保存后自动重新部署生效　|　本机逻辑核 " + [Environment]::ProcessorCount + "　|　出错日志：install_error.log（本目录）") $form 16 674 668 16
   $lblFooter.ForeColor = [System.Drawing.Color]::DimGray
   $lblFooter.Font = New-Object System.Drawing.Font($form.Font.FontFamily, [float]($form.Font.Size - 0.75))
 
@@ -1091,12 +1093,10 @@ function Run-InstallerGui {
     max_tokens = $txtMaxTok
     max_candidates = $txtMaxCand
     cpu_cores = $txtCores
-    freq_beta = $txtBeta
     expected_length_weight = $txtElw
   }
   foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
   foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
-  $txtBeta.Text = Format-F2 ([double]$PARAM_DEFAULTS["freq_beta"])
   $txtElw.Text = Format-F2 ([double]$PARAM_DEFAULTS["expected_length_weight"])
 
   # ── 模型路径下拉扫描 + 模型状态（与源码版同款：只扫用户文件夹与
@@ -1230,7 +1230,6 @@ function Run-InstallerGui {
     }
     foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$v[$k] }
     foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$v[$k] }
-    $txtBeta.Text = Format-F2 ([double]$v.freq_beta)
     $txtElw.Text = Format-F2 ([double]$v.expected_length_weight)
     $chkEnabled.Checked = $v.enabled
     $chkDebug.Checked = $v.debug_fusion

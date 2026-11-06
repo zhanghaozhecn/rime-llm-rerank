@@ -78,8 +78,8 @@ end
 -- 衰减算法 = librime algo::formula_d (user_dictionary.cc 调频同源):
 --   提交: dee = 1 + dee·exp((t_old - t_now)/800)   时间常数 τ=800 tick
 --   查询: eff = dee·exp((t_word - t_now)/800)      (未提交期间持续衰减)
--- τ=800 (2026-11-02 连续文章语料重标定: τ×β 联合扫描内点最优, β=8 时
--- 较 τ=200 +0.25pp; 词频记忆跨约 800 次上屏/数篇文章, 旧值 200 偏短)
+-- τ=400 (2026-11-06 v3 六维联合标定: w2×w3×β×τ×γ×λ 68,640 点, 用户域
+-- argmax τ=400; 词频记忆半衰 ~277 次上屏, 旧值 800 偏长)
 -- 每 20 个新词重写落盘 user_freq.tsv (崩溃最多丢 19 次计数)。仅计含中文的词
 -- (判定为非 ASCII 即计, 与 Rime userdb "任何词条提交推 tick" 同源口径——
 -- 全角标点也计, 有意为之; 2026-09-03 tick 含一字词定案同源原则)。
@@ -87,7 +87,7 @@ end
 -- (迁移为 dee=次数, tick=当前 — 视为刚提交过)。
 -- 落盘修剪 (2026-09-04): eff < 1e-3 的冷词条不再写 (对融合分影响
 -- < 0.002 nats, 远低于任何实际分差) — 文件有界, 旧冷词条自然淘汰。
-local FREQ_TAU = 800
+local FREQ_TAU = 400
 local FREQ_FLUSH = 20
 local freq_dirty = 0
 local function freq_file()
@@ -157,6 +157,99 @@ _G.user_freq_eff = function(w)
     local e = _G.user_word_freq and _G.user_word_freq[w]
     if not e or e.d <= 0 then return 0 end
     return e.d * math.exp((e.t - (_G.user_freq_tick or e.t)) / FREQ_TAU)
+end
+
+-- === 用户 bigram 计数 (v3 2026-11-06 六维联合标定: γ=1, λ=0.5) ===
+-- 融合项 = log(0.5·p2 + 0.5·p1) [fired=b 见过] / log(0.5·p1) [未 fired];
+-- p1 = (uni[x]+1)/(n_seen+20000), p2 = bi[h2,x]/c1[h2]。
+-- 口径 = 研究库 §三十二(续): 只计含中文字符的词 (纯标点不计——与标定的
+-- 词典词流同源); h2 = 上一个中文提交词 (标点跳过不清空); **原始计数不衰减**
+-- (τ 衰减只作用于 eff 单词项; 原始计数是标定语义本身, 冷启动自然回退)。
+-- 存储: user_bigram.tsv, 首行 "#n=N" (n_seen), 行 "u\t词\t次数" /
+-- "b\t前词\t词\t次数"; c1[前词] 载入时由 b 行合计, 不落盘。
+-- 文件有界: 用户一年 ~10 万行 ≈ 3MB, 原始计数不修剪 (标定语义)。
+local function bigram_file()
+    return rime_api.get_user_data_dir() .. "\\user_bigram.tsv"
+end
+local BIGRAM_VCAP = 20000
+local bigram_dirty = 0
+local function bigram_load()
+    if _G.user_uni then return end
+    _G.user_uni, _G.user_bi, _G.user_c1 = {}, {}, {}
+    _G.user_nseen = 0
+    local f = io.open(bigram_file(), "r")
+    if f then
+        for line in f:lines() do
+            local n = line:match("^#n=(%d+)$")
+            if n then
+                _G.user_nseen = tonumber(n)
+            else
+                local kind, a, b, cnt = line:match("^(%a)\t(.-)\t(.-)\t(%d+)$")
+                if kind == "u" then
+                    _G.user_uni[a] = tonumber(cnt)
+                elseif kind == "b" then
+                    local key = a .. "\t" .. b
+                    _G.user_bi[key] = tonumber(cnt)
+                    _G.user_c1[a] = (_G.user_c1[a] or 0) + tonumber(cnt)
+                end
+            end
+        end
+        f:close()
+    end
+end
+local function bigram_save()
+    local f = io.open(bigram_file(), "w")
+    if f then
+        f:write("#n=" .. (_G.user_nseen or 0) .. "\n")
+        for w, c in pairs(_G.user_uni) do
+            f:write("u\t" .. w .. "\t" .. c .. "\n")
+        end
+        for key, c in pairs(_G.user_bi) do
+            local a, b = key:match("^(.-)\t(.+)$")
+            f:write("b\t" .. a .. "\t" .. b .. "\t" .. c .. "\n")
+        end
+        f:close()
+    end
+end
+local function bigram_bump(word)
+    bigram_load()
+    -- 只计含中文字符的词 (CJK 统合区 U+4E00-U+9FFF)
+    local is_cjk = false
+    for _, cp in utf8.codes(word) do
+        if cp >= 0x4E00 and cp <= 0x9FFF then is_cjk = true end
+    end
+    if not is_cjk then return end
+    _G.user_nseen = (_G.user_nseen or 0) + 1
+    _G.user_uni[word] = (_G.user_uni[word] or 0) + 1
+    local h2 = _G.user_last_cjk
+    if h2 then
+        local key = h2 .. "\t" .. word
+        _G.user_bi[key] = (_G.user_bi[key] or 0) + 1
+        _G.user_c1[h2] = (_G.user_c1[h2] or 0) + 1
+    end
+    _G.user_last_cjk = word
+    bigram_dirty = bigram_dirty + 1
+    if bigram_dirty >= FREQ_FLUSH then
+        bigram_save()
+        bigram_dirty = 0
+    end
+end
+-- 融合项查询 (llm_filter): fired = bi[h2,x]>0 且 c1[h2]>0
+_G.user_bigram_term = function(x)
+    bigram_load()
+    local p1 = ((_G.user_uni[x] or 0) + 1)
+        / ((_G.user_nseen or 0) + BIGRAM_VCAP)
+    local h2 = _G.user_last_cjk
+    if h2 then
+        local cc = _G.user_c1[h2]
+        if cc and cc > 0 then
+            local b = _G.user_bi[h2 .. "\t" .. x] or 0
+            if b > 0 then
+                return math.log(0.5 * (b / cc) + 0.5 * p1)
+            end
+        end
+    end
+    return math.log(0.5 * p1)
 end
 
 local function find_overlap(prev, curr)
@@ -340,6 +433,7 @@ local function processor(key, env)
                     local before = _G.user_freq_eff and _G.user_freq_eff(w) or 0
                     local t_before = _G.user_freq_tick or 0
                     freq_bump(w)
+                    bigram_bump(w)
                     local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
                     if dbg_flag then
                         pcall(function()

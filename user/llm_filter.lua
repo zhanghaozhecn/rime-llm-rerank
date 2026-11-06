@@ -5,6 +5,19 @@
 local llm = nil
 local llm_loaded_for = nil  -- enabled value when llm was loaded
 
+-- 融合系数 β 为内置常数（2026-11-05 用户定案：标定产物退出用户配置面——用户没有
+-- 标定能力；与 FREQ_TAU=400 同待遇。调整 = 改代码随下次发版生效）：
+local FREQ_BETA = 12 -- 对数词频融合系数（v3 2026-11-06 六维联合标定
+                     -- w2×w3×β×τ×γ×λ 68,640 点: 用户域标定 → wiki 平台内
+                     -- 就近点 (1.05/0.45/β12/τ400/γ1/λ0.5), 见研究库 §三十三）
+                     -- fused = score + β·log(1+eff) + log(0.5·p2+0.5·p1)
+                     --   p2/p1 = 用户 bigram 项（llm_processor 维护,
+                     --   _G.user_bigram_term 查询; γ=1/λ=0.5 同为内置常数）
+-- elw 保留为配置项（2026-11-05 用户定案，同日从"退出配置面"初版决定中恢复）：
+-- 两码一字整句方案下使 floor(码长/2) 字的候选优先——整句模式候选可能是长串编码
+-- 切分后词的拼接，要选长度匹配的长词；又不能直接优先最长词（1~2 码简码存在，
+-- 不希望压到字前面）。默认 0（连续文章语料全切片 argmax=0），定长方案可试 0.2。
+
 local cfg = {
     -- 编码匹配模式（2026-09-30 取代 min_code_len/max_code_len）：
     -- 全串匹配输入编码串，语法同 Rime 自身 speller/auto_select_pattern。
@@ -19,10 +32,10 @@ local cfg = {
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
     debug_fusion     = false, -- true = 逐候选融合明细写 rime_llm_debug.txt (诊断用)
-    expected_length_weight = 0,  -- 预期词长加成 (连续文章语料重标定 2026-11-02: 全切片
-                                 -- argmax=0, 旧 0.2 出自独立句池口径已废; 0=关闭)
-    freq_beta = 8,  -- 对数词频融合系数 (连续文章语料重标定 2026-11-02: 平台 8~30
-                     -- 取左段; 0=关闭); fused = score + β·log(1+eff)
+    expected_length_weight = 0,  -- 预期词长加成（默认 0=关闭; 定长整句方案可试 0.2）
+                                 -- fused += elw·span·[词长==⌊码长/2⌋]
+    -- freq_beta 不再从 schema 读取（2026-11-05 用户配置面移除，标定产物退出配置面）
+    -- → 内置常数 FREQ_BETA；方案里残留旧行读取端忽略，保存/重建节时剥除
 }
 
 local lat_max   = 0
@@ -106,8 +119,8 @@ local function init_config(env)
     if pat ~= nil then cfg.code_pattern = pat end
     local v = get_config_number(sc, "llm_rerank/expected_length_weight")
     if v ~= nil then cfg.expected_length_weight = math.max(0, v) end
-    v = get_config_number(sc, "llm_rerank/freq_beta")
-    if v ~= nil then cfg.freq_beta = math.max(0, v) end
+    -- freq_beta 不再读取（2026-11-05 配置面移除; 方案里残留旧行忽略,
+    -- 保存时由安装器剥除）
     v = sc:get_int("llm_rerank/max_tokens")
     if v then cfg.max_tokens = v end
     v = sc:get_int("llm_rerank/max_candidates")
@@ -275,18 +288,27 @@ return function(translation, env)
                 end
             end
         end
-        -- 统一结合公式 (2026-09-03 冷启动标定; 2026-11-02 连续文章语料重标定):
-        --   fused(w) = score(w) + β·log(1+eff(w)) + elw·span·[词长==⌊码长/2⌋]
+        -- 统一结合公式 (2026-09-03 冷启动标定; 2026-11-02 连续文章语料重标定;
+        -- 2026-11-05 β 退出配置面 → FREQ_BETA 内置常数; elw 保留配置项;
+        -- **2026-11-06 v3: 六维联合标定 + 用户 bigram 项上线**):
+        --   fused(w) = score(w) + FREQ_BETA·log(1+eff(w))
+        --              + log(0.5·p2+0.5·p1)     ← 用户 bigram 项 (v3)
+        --              + elw·span·[词长==⌊码长/2⌋]
         -- score = 原始 LLM 分 (−CE, 对数概率域); eff = librime algo::formula_d
-        -- 指数衰减计数 (τ=800 tick, tick=每词提交+1, 引擎调频同源; llm_processor
-        -- 维护, _G.user_freq_eff 查询)。对数域三项加法:
-        --   ① 词频无上限: 强个人高频词可翻盘 CE 分差 (β=8, 连续文章语料
-        --      全程累计 eff 口径平台 8~30 取左段; 旧 β=1.5 出自独立窗/单用户
-        --      打字口径, 偏小近半增益);
-        --   ② 预期词长加成作用于融合分 (elw 默认 0——连续口径全切片 argmax=0,
-        --      旧 0.2 出自独立句池冷启动标定已废; 双拼/五笔定长方案冷启动可试 0.2)
+        -- 指数衰减计数 (**τ=400** tick 内置常数, tick=每词提交+1, 引擎调频同源;
+        -- llm_processor 维护, _G.user_freq_eff 查询)。对数域加法:
+        --   ① 词频无上限: 强个人高频词可翻盘 CE 分差 (FREQ_BETA=12, v3 六维
+        --      联合标定用户域标定→wiki 平台就近);
+        --   ② 用户 bigram 项 (v3): p2 = bi[前词,候选]/c1[前词] (原始计数不衰减,
+        --      fired=见过), p1 = (uni+1)/(n_seen+2万) 兜底; fired 时
+        --      log(0.5·p2+0.5·p1), 否则 log(0.5·p1)——与标定语义逐字一致;
+        --      冷启动全等值自动无害退化; llm_processor 维护 _G.user_bigram_term;
+        --   ③ 预期词长加成作用于融合分 (默认 0——连续口径全切片 argmax=0; 两码一字
+        --      整句方案可试 0.2: 长编码切词拼接时使 floor(码长/2) 字的候选优先,
+        --      又不直接优先最长词——1~2 码简码不应压到字前面)
         --      ——修复旧实现按原始分重排导致 ELW 架空词频融合的组成缺陷;
-        --   ③ 冷启动 eff≡0 自动退化为 score + elw·span·匹配, 成熟期三项叠加。
+        --   ④ 冷启动 eff≡0 且 bigram 无计数时自动退化为 score + elw·span·匹配,
+        --      成熟期四项叠加。
         -- span 取窗内有效原始分跨度; 失败哨兵分 (≤-1e9) 排尾部不参与;
         -- 任一候选无有效融合分则整体跳过 elw 段。同分稳定保序 (融合序)。
         local fused_scores = nil
@@ -298,12 +320,15 @@ return function(translation, env)
                 local s = scores[c.text]
                 if is_valid_llm_score(s) then
                     local n = freq_eff and freq_eff(c.text) or 0
-                    local t = s + cfg.freq_beta * math.log(1 + n)
+                    local bi_term = _G.user_bigram_term
+                            and _G.user_bigram_term(c.text) or 0
+                    local t = s + FREQ_BETA * math.log(1 + n) + bi_term
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = n,
-                                        fb = cfg.freq_beta * math.log(1 + n),
+                                        fb = FREQ_BETA * math.log(1 + n),
+                                        bi = bi_term,
                                         fused = t, cerank = i }
                     end
                 else
@@ -350,8 +375,7 @@ return function(translation, env)
                         if item.m then
                             item.s = item.s + cfg.expected_length_weight * span
                             if dbg and dbg[item.c.text] then
-                                dbg[item.c.text].eb =
-                                    cfg.expected_length_weight * span
+                                dbg[item.c.text].eb = cfg.expected_length_weight * span
                             end
                         end
                     end

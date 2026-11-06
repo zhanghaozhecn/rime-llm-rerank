@@ -61,8 +61,8 @@ engine:
                       (($f | Select-String "lua_filter@\*llm_filter").Count) -eq 1)
   Assert "enabled: true" (($f | Where-Object { $_ -match '^\s+enabled: true\s*$' }).Count -eq 1)
   Assert "模板无 com_context（配置项已删）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
-  Assert "freq_beta: 8.00" (($f | Where-Object { $_ -match '^\s+freq_beta: 8\.00\s*$' }).Count -eq 1)
-  Assert "expected_length_weight: 0.00" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.00\s*$' }).Count -eq 1)
+  Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
+  Assert "expected_length_weight: 0.00（保留配置项）" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.00\s*$' }).Count -eq 1)
   Assert "code_pattern: '.{4}'（默认）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\.\{4\}'" }).Count -eq 1)
 
   Write-Host "== C2: 自定义参数 + model_path 后重跑 schema-add（逐键保留）=="
@@ -95,7 +95,7 @@ llm_rerank:
 '@ | Out-File -FilePath $test -Encoding ascii
   Run-Cli "schema-add" | Out-Null
   $f = Get-Content $test -Encoding UTF8
-  Assert "freq_beta 保留 2.25" (($f | Where-Object { $_ -match '^\s+freq_beta: 2\.25\s*$' }).Count -eq 1)
+  Assert "残留 freq_beta 行已剥（标定产物退出配置面）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "elw 保留 0.35" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.35\s*$' }).Count -eq 1)
   Assert "max_tokens 保留 12" (($f | Where-Object { $_ -match '^\s+max_tokens: 12\s*$' }).Count -eq 1)
   Assert "code_pattern 保留 [abcde]{4}（单引号保留）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\[abcde\]\{4\}'\s*$" }).Count -eq 1)
@@ -331,13 +331,14 @@ public class W {
   $prog = @($items | Where-Object { $_ -like "*（程序）" })
   Assert ("程序文件夹预装方案已列出（实测 $($prog.Count) 个）") ($prog.Count -ge 1)
   $e = Get-ParamEdits
-  Assert ("参数框数 = 6（实测 $($e.Count)：$(($e | ForEach-Object { $_.text }) -join '|')）") ($e.Count -eq 6)
+  Assert ("参数框数 = 5（实测 $($e.Count)：$(($e | ForEach-Object { $_.text }) -join '|')）") ($e.Count -eq 5)
   Assert "code_pattern = .{4}" ((Get-WText $e[0].h) -eq ".{4}")
   Assert "max_tokens = 10" ((Get-WText $e[1].h) -eq "10")
   Assert "max_candidates = 5" ((Get-WText $e[2].h) -eq "5")
   Assert "cpu_cores = 4" ((Get-WText $e[3].h) -eq "4")
-  Assert "freq_beta = 8.00" ((Get-WText $e[4].h) -eq "8.00")
-  Assert "elw = 0.00" ((Get-WText $e[5].h) -eq "0.00")
+  Assert "elw = 0.00" ((Get-WText $e[4].h) -eq "0.00")
+  Assert "「用户词频权重」行已移除（β 退出配置面）" (-not (Has-Text "用户词频权重"))
+  Assert "「候选排序融合」组仍在（只剩预期词长权重）" (Has-Text "候选排序融合")
   # 复选框状态不在此断言：BM_GETCHECK 跨进程读不到 WinForms 主题复选框的
   # 内部态（渲染/保存均正确，2026-09-29 截图+落盘双验证）——复选框断言
   # 统一走 BM_CLICK 切换 + 保存落盘（G4 读入态保持 / G7 点击翻转）
@@ -401,8 +402,7 @@ llm_rerank:
   Assert "code_pattern = .{3,4}" ((Get-WText $e[0].h) -eq ".{3,4}")
   Assert "max_tokens = 12" ((Get-WText $e[1].h) -eq "12")
   Assert "cpu_cores = 6" ((Get-WText $e[3].h) -eq "6")
-  Assert "freq_beta = 2.25" ((Get-WText $e[4].h) -eq "2.25")
-  Assert "elw = 0.35" ((Get-WText $e[5].h) -eq "0.35")
+  Assert "elw = 0.35" ((Get-WText $e[4].h) -eq "0.35")
 
   Write-Host "== G3b: 打开下拉重扫方案列表（外部新增方案后无需手动刷新）=="
   $extra = Join-Path (Split-Path $test -Parent) "zz_extra.schema.yaml"
@@ -444,8 +444,7 @@ engine:
   Set-Edit $e[1] "12"     # 复原
   Read-Host 2>$null | Out-Null
 
-  Write-Host "== G4: 保存（β→0.80、mode→[abcde]{4}；复选框按读入态原样落盘；旧键被剥）=="
-  Set-Edit $e[4] "0.80"
+  Write-Host "== G4: 保存（mode→[abcde]{4}；复选框按读入态原样落盘；freq_beta 旧行被剥）=="
   Set-Edit $e[0] "[abcde]{4}"
   Click-Btn (Find-Button "保存并生效")
   Assert "状态含 已保存…并触发重新部署" (Any-Text "并触发重新部署")
@@ -453,12 +452,12 @@ engine:
   Assert "enabled: true（读入态保持）" (($f | Where-Object { $_ -match '^\s+enabled: true\s*$' }).Count -eq 1)
   Assert "debug_fusion: true（读入态保持）" (($f | Where-Object { $_ -match '^\s+debug_fusion: true\s*$' }).Count -eq 1)
   Assert "残留 com_context 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
-  Assert "freq_beta: 0.80" (($f | Where-Object { $_ -match '^\s+freq_beta: 0\.80\s*$' }).Count -eq 1)
+  Assert "残留 freq_beta 行已剥（标定产物退出配置面）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
+  Assert "elw 保留 0.35" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.35\s*$' }).Count -eq 1)
   Assert "残留 min_tokens 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'min_tokens' }).Count -eq 0)
   Assert "残留 min_code_len 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'min_code_len' }).Count -eq 0)
   Assert "残留 max_code_len 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'max_code_len' }).Count -eq 0)
   Assert "code_pattern 落盘 [abcde]{4}（单引号）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\[abcde\]\{4\}'\s*$" }).Count -eq 1)
-  Assert "elw 保留 0.35" (($f | Where-Object { $_ -match '^\s+expected_length_weight: 0\.35\s*$' }).Count -eq 1)
   Assert "max_tokens 保留 12" (($f | Where-Object { $_ -match '^\s+max_tokens: 12\s*$' }).Count -eq 1)
   Assert "model_path 保留" (($f | Where-Object { $_ -match '^\s+model_path: d:/gguf_models/zz_test\.gguf\s*$' }).Count -eq 1)
   Assert "组件行未动" ((($f | Select-String "lua_processor@\*llm_processor").Count) -eq 1 -and
@@ -472,12 +471,12 @@ engine:
   $h2 = (Get-FileHash $test -Algorithm MD5).Hash
   Assert "文件逐字节一致" ($h1 -eq $h2)
 
-  Write-Host "== G6: 非法输入 β=abc → 拒绝保存 =="
+  Write-Host "== G6: 非法输入 elw=abc → 拒绝保存 =="
   Set-Edit $e[4] "abc"
   Click-Btn (Find-Button "保存并生效")
   Assert "状态含 不是有效数字" (Any-Text "不是有效数字")
   Assert "文件未改动" ((Get-FileHash $test -Algorithm MD5).Hash -eq $h2)
-  Set-Edit $e[4] "0.80"   # 恢复合法值——G7 复选框相位要靠保存落盘验证
+  Set-Edit $e[4] "0.00"   # 恢复合法值——G7 复选框相位要靠保存落盘验证
 
   Write-Host "== G7: 复选框 BM_CLICK 切换 + 保存落盘 =="
   [void][W]::SendMsg((Find-Check "启用 LLM 重排"), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # true→false
@@ -486,11 +485,12 @@ engine:
   $f = Get-Content $test -Encoding UTF8
   Assert "enabled: false（点击翻转）" (($f | Where-Object { $_ -match '^\s+enabled: false\s*$' }).Count -eq 1)
   Assert "debug_fusion: true（未动保持）" (($f | Where-Object { $_ -match '^\s+debug_fusion: true\s*$' }).Count -eq 1)
-  Assert "freq_beta 仍 0.80" (($f | Where-Object { $_ -match '^\s+freq_beta: 0\.80\s*$' }).Count -eq 1)
+  Assert "freq_beta 仍不存在" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
 
   Write-Host "== G8: 重读回环（保存值回到界面）=="
   Reload-Params
-  Assert "beta 字段 = 0.80" ((Get-WText $e[4].h) -eq "0.80")
+  Assert "elw 字段 = 0.00" ((Get-WText $e[4].h) -eq "0.00")
+  Assert "max_tokens 字段 = 12" ((Get-WText $e[1].h) -eq "12")
   Assert "code_pattern 字段 = [abcde]{4}" ((Get-WText $e[0].h) -eq "[abcde]{4}")
 
   Write-Host "== G9: 只在出错时写 install_error.log（GUI 程序目录）=="
@@ -721,8 +721,8 @@ engine:
         if ($_.cls -notmatch '\.Edit\.') { return $false }
         return (@('触发条件', '推理规模', '候选排序融合') -contains (Get-WText $_.parent))
       } | Sort-Object y, x)
-    Assert "第二个 GUI 上找到 按钮/模型框/参数框" ($btnBench2.Count -eq 1 -and $cmbModel2.Count -eq 1 -and $edCores2.Count -eq 6)
-    if ($btnBench2.Count -eq 1 -and $cmbModel2.Count -eq 1 -and $edCores2.Count -eq 6) {
+    Assert "第二个 GUI 上找到 按钮/模型框/参数框" ($btnBench2.Count -eq 1 -and $cmbModel2.Count -eq 1 -and $edCores2.Count -eq 5)
+    if ($btnBench2.Count -eq 1 -and $cmbModel2.Count -eq 1 -and $edCores2.Count -eq 5) {
       # 模型路径：跨进程 WM_SETTEXT 能同步到 WinForms ComboBox 的托管 Text（G12 已证）
       [void][W]::SendMsgStr($cmbModel2[0].h, 0x000C, [IntPtr]::Zero, $benchModel2)
       Start-Sleep -Milliseconds 500

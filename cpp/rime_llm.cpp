@@ -67,7 +67,10 @@ static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker 
 // 影响衰减属噪声源降权；4+ token 词只算前三项——外推证伪删除（λ 0→1 端到端
 // 命中率单调递减，λ=0 最优；旧 λ=0.6 标定用"与全量 CE 一致率"口径，与端
 // 指标分道扬镳）。胜出变体 conf 91.82→92.13（+0.31pp，平台非尖峰）。
-static constexpr double kCeW1 = 1.0, kCeW2 = 1.13, kCeW3 = 0.61;
+// v3 2026-11-06 六维联合标定 (w2×w3×β×τ×γ×λ 68,640 点, 用户域标定 →
+// wiki 平台内就近): (1.0, 1.05, 0.45); 旧值 (1.0, 1.13, 0.61) 出自
+// 2026-09-16 20% 前缀标定。
+static constexpr double kCeW1 = 1.0, kCeW2 = 1.05, kCeW3 = 0.45;
 
 // ============================================================
 // 模型状态
@@ -87,6 +90,8 @@ static std::vector<std::string> g_last_cands;
 // ============================================================
 static std::vector<llama_token> g_prep_ctx;     // 预解码的上下文 token
 static std::vector<float>       g_prep_logits;  // ctx_last logits
+static float                    g_prep_m = 0;   // ctx_last logits 的 softmax max（随 prep 缓存，命中路径免 O(vocab) 重扫）
+static double                   g_prep_lse = 0; // ctx_last logits 的 logsumexp（同上）
 static bool                      g_prep_ready = false; // prepare() 已完成
 static std::atomic<int>         g_prep_seq{0};  // 请求序列号，跳过过期请求
 static long                      g_seq0_gen = 0; // seq0 KV 代次: 任何覆盖 seq0 的 decode 递增
@@ -907,27 +912,42 @@ static std::vector<llama_token> ctx_token_ids(const char * context) {
 
 // ============================================================
 // Softmax CE 辅助：-log(softmax(x)[target])
+// 通用优化（2026-11-06，两版同步；不依赖特定指令集、不改评分语义）：
+// ① 尾部跳过：与 max 相差 > kLseSkipNat 的项不做 exp——单项贡献
+//    < e^-20 ≈ 2.1e-9，全词表（26 万封顶）总贡献 < 5.5e-4，即 lse 偏差
+//    < 0.0006 nats，比候选间典型 CE 差（≥0.01）小一个数量级以上；
+//    真实分布高度集中，跳过量通常 >90%（近乎均匀的病态分布退化为原速）。
+// ② exp 用 float 版 expf（标量运算，无 SIMD 依赖），求和仍 double 累加。
+// 实测（13900H 锁频）：单次全词表归一化 ~2ms → ~0.1ms；prep 命中路径
+// 配合归一化量缓存（见 score_batch）CE1 段 ~0ms。
 // ============================================================
-static double cross_entropy(float * logits, int vs, int target_id) {
+static const float kLseSkipNat = 20.0f;  // 尾部跳过阈值（nats，误差界见上）
+
+static double cross_entropy(const float * logits, int vs, int target_id) {
     float m = -1e30f;
     for (int k = 0; k < vs; k++) if (logits[k] > m) m = logits[k];
+    const float cut = m - kLseSkipNat;
     double se = 0;
-    for (int k = 0; k < vs; k++) se += exp((double)(logits[k] - m));
+    for (int k = 0; k < vs; k++)
+        if (logits[k] >= cut) se += expf(logits[k] - m);
     return -((double)(logits[target_id] - m) - log(se));
 }
 
 // 归一化 (max, logsumexp) 一次计算, 多目标 CE 共享复用:
 // Step 1 所有候选对同一 ctx logits 打分, 原实现对每个候选重扫
 // O(vocab) (5 候选取 5 次 -> 实测 CE1 段 ~6ms), 共享后一次扫描 + 查表
-// (-> ~2ms)
-static void logits_normalizer(float * logits, int vs, float & m, double & lse) {
+// (-> ~2ms)。2026-11-06 再叠加尾部跳过 + expf，且归一化量随 prep 状态
+// 缓存——prep 命中路径完全免扫（CE1 段 ~0ms）。
+static void logits_normalizer(const float * logits, int vs, float & m, double & lse) {
     m = -1e30f;
     for (int k = 0; k < vs; k++) if (logits[k] > m) m = logits[k];
+    const float cut = m - kLseSkipNat;
     double se = 0;
-    for (int k = 0; k < vs; k++) se += exp((double)(logits[k] - m));
+    for (int k = 0; k < vs; k++)
+        if (logits[k] >= cut) se += expf(logits[k] - m);
     lse = log(se);
 }
-static double ce_target(float * logits, int target_id, float m, double lse) {
+static double ce_target(const float * logits, int target_id, float m, double lse) {
     return -((double)(logits[target_id] - m) - lse);
 }
 
@@ -971,7 +991,9 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     // 检测预解码状态：ctx 完全匹配 且 seq0 未被其他 decode 覆盖 → 跳过 Step 1
     // 代次匹配防止: 完整流程 score 覆盖 seq0 后, 旧 prep 状态被误用 (KV 与 logits 不一致)
     bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen;
-    std::vector<float> ctx_logits;
+    const float * ctx_logits = nullptr;  // 直接指向 prep 存储，免全量 vector 拷贝
+    float m0 = 0;
+    double lse0 = 0;
     double ms1 = 0;
 
     if (!use_prep) {
@@ -988,36 +1010,40 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         }
         ctx_batch.logits[ctx_len - 1] = 1;
         ctx_batch.n_tokens = ctx_len;
+        bool decoded_ok = false;
         if (llama_decode(g_ctx, ctx_batch) == 0) {
             g_seq0_gen++;  // seq0 KV 已更新
             float* cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
-            if (cl) ctx_logits.assign(cl, cl + vs);
+            if (cl) { g_prep_logits.assign(cl, cl + vs); decoded_ok = true; }
         }
         llama_batch_free(ctx_batch);
 
-        if (ctx_logits.empty()) return;  // decode failed
+        if (!decoded_ok) return;  // decode failed（prep 存储只在成功时覆写）
         // 完整流程自我刷新 prep: 刚 decode 完 seq0 (代次已递增), KV/logits 一致,
         // 保存后同 ctx 的后续 score (翻页/候选窗重建) 全部命中——
         // 否则一次未命中导致代次失配, 后续 score 连锁全部 prep=0 直到下次 commit
         g_prep_gen = g_seq0_gen;
         g_prep_ctx = ctx_ids;
-        g_prep_logits = ctx_logits;
+        logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);  // 归一化量随 prep 缓存
         g_prep_ready = true;
+        ctx_logits = g_prep_logits.data();
+        m0 = g_prep_m;
+        lse0 = g_prep_lse;
         auto ts1_1 = std::chrono::high_resolution_clock::now();
         ms1 = std::chrono::duration<double, std::milli>(ts1_1 - ts1_0).count();
     } else {
-        // 预解码命中：直接使用已保存的 logits
-        ctx_logits = g_prep_logits;
+        // 预解码命中：直接使用已保存的 logits 与归一化量（免 O(vocab) 重扫）
+        ctx_logits = g_prep_logits.data();
+        m0 = g_prep_m;
+        lse0 = g_prep_lse;
     }
 
-    // 所有候选的第 1 个 token CE (共享同一 ctx logits -> 归一化只算一次)
+    // 所有候选的第 1 个 token CE (共享同一 ctx logits -> 归一化只算一次;
+    // 2026-11-06 归一化量随 prep 缓存, 命中路径连扫描也免)
     auto ts_ce1_0 = std::chrono::high_resolution_clock::now();
     std::vector<double> ce_sum(n_cands, 0);
-    float m0;
-    double lse0;
-    logits_normalizer(ctx_logits.data(), vs, m0, lse0);
     for (int i = 0; i < n_cands; i++) {
-        ce_sum[i] = kCeW1 * ce_target(ctx_logits.data(), cands[i][0], m0, lse0);
+        ce_sum[i] = kCeW1 * ce_target(ctx_logits, cands[i][0], m0, lse0);
     }
     auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
     double ms_ce1 =
@@ -1192,6 +1218,10 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     g_seq0_gen++;   // seq0 KV 已更新 (本代)
     g_prep_gen = g_seq0_gen;
     g_prep_ctx = ctx_ids;
+    // 归一化量随 prep 一并算好（2026-11-06）：score 的 prep 命中路径
+    // 直接取用，省一次 O(vocab) 扫描（实测 CE1 段 2ms → ~0ms）。
+    // 放在 g_prep_ready 置位前、锁内完成，无 torn state。
+    logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);
     g_prep_ready = true;
     log_msg("prepare: done ctx_tok=%d seq=%d", ctx_len, seq);
 }
