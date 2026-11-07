@@ -205,18 +205,18 @@ function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $
 # freq_beta 已删（2026-11-05 定案：标定产物退出用户配置面——用户没有标定能力；
 # FREQ_BETA=12 为 llm_filter.lua 内置常数，与 τ=400 同待遇（v3 六维联合标定 2026-11-06））——方案里残留的旧行读取端
 # 忽略，保存/重跑加 LLM 重建节时剥除。
-# expected_length_weight 保留（2026-11-05 同日恢复）：两码一字整句方案下使
-# floor(码长/2) 字的候选优先（长编码切词拼接选长度匹配的长词，1~2 码简码又
-# 不应压到字前面）——CE 权重覆盖不了这个结构效应，定长方案可试 0.2。
+# expected_length_weight 已删（2026-11-07 用户定案：整句偏好改由布尔键
+# two_code_sentence 直接实现——词长==⌊码长/2⌋ 的候选一组直接优先, 不再
+# 需要 elw·span 间接量。旧行读取端忽略, 保存/重建节时剥除。
 $PARAM_DEFAULTS = [ordered]@{
   enabled = $false
   code_pattern = '.{4}'   # 仅 4 码；4 码以上 .{4,} / 3-4 码 .{3,4} / 指定字母 [abcde]{4}
   max_tokens = 10; max_candidates = 5; cpu_cores = 4
-  expected_length_weight = 0; debug_fusion = $false
+  two_code_sentence = $false; debug_fusion = $false
 }
 $PARAM_INT_KEYS  = @("max_tokens","max_candidates","cpu_cores")
-$PARAM_DBL_KEYS  = @("expected_length_weight")
-$PARAM_BOOL_KEYS = @("debug_fusion")
+$PARAM_DBL_KEYS  = @()
+$PARAM_BOOL_KEYS = @("two_code_sentence","debug_fusion")
 # 字符串型参数（不做数值解析，原样写回；空串合法 = 总是匹配）
 $PARAM_STR_KEYS  = @("code_pattern")
 
@@ -274,7 +274,7 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
     "  max_tokens: $($p.max_tokens)",
     "  max_candidates: $($p.max_candidates)",
     "  cpu_cores: $($p.cpu_cores)",
-    "  expected_length_weight: $(Format-F2 ([double]$p.expected_length_weight))",
+    "  two_code_sentence: $(if ($p.two_code_sentence) { 'true' } else { 'false' })",
     "  debug_fusion: $(if ($p.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $sec += "  model_path: " + (Convert-ToYamlPath $modelPath) }
@@ -327,7 +327,7 @@ function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
     "  max_tokens: $($d.max_tokens)",
     "  max_candidates: $($d.max_candidates)",
     "  cpu_cores: $($d.cpu_cores)",
-    "  expected_length_weight: $(Format-F2 ([double]$d.expected_length_weight))",
+    "  two_code_sentence: $(if ($d.two_code_sentence) { 'true' } else { 'false' })",
     "  debug_fusion: $(if ($d.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
@@ -851,7 +851,7 @@ function Run-InstallerGui {
   $tipMaxCand = "每次按键参与 LLM 打分的候选数上限（默认 5）。`n一般不用改——调大更准但更慢。"
   $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
   $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
-  $tipElw = "预期词长权重 elw（默认 0，0 = 关闭）。`n融合分 = CE 分 + β·log(1+词频计数) + log(0.5·p2+0.5·p1) + elw·词长加成`n两码一字整句方案：长编码切词拼接的候选里使 floor(码长/2) 字的`n长词优先，又不直接优先最长词（1~2 码简码不应压到字前面）。`n定长方案（双拼/五笔/郑码）冷启动可试 0.2；一般保持 0。`n注：词频权重 β 与 bigram 项 γ/λ 均为内置常数 12/1/0.5（v3 六维联合标定 2026-11-06 起不提供配置）。"
+  $tipTcs = "两码整句 two_code_sentence（默认关闭）。`n开启后（双拼/五笔/郑码等两码一字整句方案）：词长恰为`nfloor(码长/2) 字的候选作为一组直接优先（组内按融合分），`n其余候选按融合分排后——整句方案的满句长候选优先。`n一般字词方案保持关闭。取代原预期词长权重 elw（2026-11-07）。"
   $tipDebug = "诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt`n（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。"
   $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n随后自动重新部署生效。`n方案还没接入（缺配置节 / 缺组件行 / 残留另一版组件行）时，`n本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。"
   $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；`n**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
@@ -1010,8 +1010,7 @@ function Run-InstallerGui {
 
   # ── 推理规模 + 候选排序融合（一行）：标签列用同一个实测宽度 ──
   $lwP = 0
-  foreach ($t in @("上文 token 上限:", "参与打分的候选数:", "CPU 线程数:",
-                   "预期词长权重:")) {
+  foreach ($t in @("上文 token 上限:", "参与打分的候选数:", "CPU 线程数:")) {
     $w = ([System.Windows.Forms.TextRenderer]::MeasureText($t, $form.Font)).Width + 8
     if ($w -gt $lwP) { $lwP = $w }
   }
@@ -1036,15 +1035,13 @@ function Run-InstallerGui {
   Style-Btn $btnBench $false
   $script:tip.SetToolTip($btnBench, $tipBench)
 
-  # 候选排序融合（2026-11-05 用户定案：删「用户词频权重」行——freq_beta 为标定
-  # 产物退出配置面 → FREQ_BETA 内置常数；保留「预期词长权重」一行——整句方案
-  # 长度匹配效应 CE 覆盖不了，保留配置项）
+  # 候选排序融合（2026-11-07 用户定案：「预期词长权重」退役——整句偏好改由
+  # 「两码整句」复选框直接实现，词长==⌊码长/2⌋ 的候选一组优先）
   $g4 = Add-Group $form "候选排序融合" $GX 426 $GW 66
   $rowY = 22
-  [void](Add-Ctl "Label" "预期词长权重:" $g4 14 $rowY ($lwP + 4) 20)
-  $txtElw = Add-Ctl "TextBox" "" $g4 (14 + $lwP + 10) ($rowY - 3) 64 22
-  $script:tip.SetToolTip($txtElw, $tipElw)
-  Add-Help $g4 $tipElw (Help-X $g4) ($rowY - 1) | Out-Null
+  $chkTcs = Add-Ctl "CheckBox" "两码整句 two_code_sentence" $g4 14 $rowY 260 22
+  $script:tip.SetToolTip($chkTcs, $tipTcs)
+  Add-Help $g4 $tipTcs (Help-X $g4) ($rowY + 1) | Out-Null
 
   # ── 诊断日志（与源码版同位置：参数组之后、按钮之前）──
   $chkDebug = Add-Ctl "CheckBox" "诊断日志 debug_fusion" $form 16 502 260 22
@@ -1093,11 +1090,10 @@ function Run-InstallerGui {
     max_tokens = $txtMaxTok
     max_candidates = $txtMaxCand
     cpu_cores = $txtCores
-    expected_length_weight = $txtElw
   }
   foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
   foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
-  $txtElw.Text = Format-F2 ([double]$PARAM_DEFAULTS["expected_length_weight"])
+  $chkTcs.Checked = [bool]$PARAM_DEFAULTS["two_code_sentence"]
 
   # ── 模型路径下拉扫描 + 模型状态（与源码版同款：只扫用户文件夹与
   #    %USERPROFILE%\gguf_models，避免遍历整盘）──
@@ -1185,6 +1181,7 @@ function Run-InstallerGui {
       $parts += [string]$paramEdits[$k].Text.Trim()
     }
     $parts += [string]$chkEnabled.Checked
+    $parts += [string]$chkTcs.Checked
     $parts += [string]$chkDebug.Checked
     $parts += $cmbModel.Text.Trim()
     return ($parts -join "|")
@@ -1230,8 +1227,8 @@ function Run-InstallerGui {
     }
     foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$v[$k] }
     foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$v[$k] }
-    $txtElw.Text = Format-F2 ([double]$v.expected_length_weight)
     $chkEnabled.Checked = $v.enabled
+    $chkTcs.Checked = [bool]$v.two_code_sentence
     $chkDebug.Checked = $v.debug_fusion
     # 模型路径：节里是正斜杠，显示统一反斜杠；未配置显示默认路径
     # （model_path 不在 $PARAM_*_KEYS 里——那是六个参数框的键集，故直接从节读）
@@ -1463,6 +1460,7 @@ function Run-InstallerGui {
       $p[$k] = $d
     }
     $p.enabled = $chkEnabled.Checked
+    $p.two_code_sentence = $chkTcs.Checked
     $p.debug_fusion = $chkDebug.Checked
     # ③ 模型路径：空 = 默认；非空必须是绝对路径（相对路径运行期必然加载失败）
     $mpRaw = $cmbModel.Text.Trim()

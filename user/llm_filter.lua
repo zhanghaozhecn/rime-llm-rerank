@@ -13,10 +13,10 @@ local FREQ_BETA = 12 -- 对数词频融合系数（v3 2026-11-06 六维联合标
                      -- fused = score + β·log(1+eff) + log(0.5·p2+0.5·p1)
                      --   p2/p1 = 用户 bigram 项（llm_processor 维护,
                      --   _G.user_bigram_term 查询; γ=1/λ=0.5 同为内置常数）
--- elw 保留为配置项（2026-11-05 用户定案，同日从"退出配置面"初版决定中恢复）：
--- 两码一字整句方案下使 floor(码长/2) 字的候选优先——整句模式候选可能是长串编码
--- 切分后词的拼接，要选长度匹配的长词；又不能直接优先最长词（1~2 码简码存在，
--- 不希望压到字前面）。默认 0（连续文章语料全切片 argmax=0），定长方案可试 0.2。
+-- two_code_sentence 两码整句开关（2026-11-07 用户定案取代 elw）：
+-- 两码一字整句方案下勾选后，词长==⌊码长/2⌋ 的候选作为一组直接优先
+-- （组内融合分降序、同分稳定），其余候选按融合分降序在后——即原 elw
+-- 的极限行为（elw·span 加成→∞），不再需要 span 间接量。默认 false。
 
 local cfg = {
     -- 编码匹配模式（2026-09-30 取代 min_code_len/max_code_len）：
@@ -32,8 +32,9 @@ local cfg = {
     max_candidates   = 5,
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
     debug_fusion     = false, -- true = 逐候选融合明细写 rime_llm_debug.txt (诊断用)
-    expected_length_weight = 0,  -- 预期词长加成（默认 0=关闭; 定长整句方案可试 0.2）
-                                 -- fused += elw·span·[词长==⌊码长/2⌋]
+    two_code_sentence = false, -- 两码整句：词长==⌊码长/2⌋ 的候选一组优先
+                               -- （2026-11-07 取代 expected_length_weight；
+                               --  旧行读取端忽略，保存/重建节时剥除）
     -- freq_beta 不再从 schema 读取（2026-11-05 用户配置面移除，标定产物退出配置面）
     -- → 内置常数 FREQ_BETA；方案里残留旧行读取端忽略，保存/重建节时剥除
 }
@@ -54,17 +55,6 @@ end
 
 local function is_valid_llm_score(v)
     return is_finite_number(v) and v > -1e9
-end
-
-local function get_config_number(sc, key)
-    local ok, v = pcall(function() return sc:get_double(key) end)
-    if ok and is_finite_number(v) then return v end
-    ok, v = pcall(function() return sc:get_string(key) end)
-    if ok then
-        v = tonumber(v)
-        if is_finite_number(v) then return v end
-    end
-    return nil
 end
 
 -- 编码模式匹配（2026-09-30）：全串匹配，语义同 Rime speller/auto_select_pattern。
@@ -117,11 +107,11 @@ local function init_config(env)
     -- nil，配置了空串则视为"总是匹配"（与源码版一致）
     local pat = sc:get_string("llm_rerank/code_pattern")
     if pat ~= nil then cfg.code_pattern = pat end
-    local v = get_config_number(sc, "llm_rerank/expected_length_weight")
-    if v ~= nil then cfg.expected_length_weight = math.max(0, v) end
+    -- expected_length_weight 不再读取（2026-11-07 由 two_code_sentence 取代;
+    -- 方案里残留旧行忽略, 保存时由安装器剥除）
     -- freq_beta 不再读取（2026-11-05 配置面移除; 方案里残留旧行忽略,
     -- 保存时由安装器剥除）
-    v = sc:get_int("llm_rerank/max_tokens")
+    local v = sc:get_int("llm_rerank/max_tokens")
     if v then cfg.max_tokens = v end
     v = sc:get_int("llm_rerank/max_candidates")
     if v then cfg.max_candidates = v end
@@ -191,11 +181,36 @@ return function(translation, env)
     -- 不需过滤尾部 ASCII: Rime 编码显示在候选窗, 不写入编辑器,
     -- 外挂读到的光标前文本不会包含编码字母 (微软拼音式 inline composition 才会)
     local context = (ctx_text or ""):gsub('%s+', '')
-    local cands = {}
-    for i, c in ipairs(all) do
-        if i > cfg.max_candidates then break end
-        table.insert(cands, c.text)
+    -- ═══ 层1: 全体候选 用户词频+bigram 打分重排（v3 两层重排, 2026-11-07 定案）═══
+    -- 全体候选 S1 = FREQ_BETA·log1p(eff) + bigram 项, 稳定降序（同分保引擎序）,
+    -- 取前 max_candidates 进 LLM 评分（层2 三项融合重排）, 其余按层1 序透传。
+    -- 目标在层1 前 k 外 → 必然不在首位（评测 sweep_2layer 同语义, 全窗参评）。
+    -- 文件序无关性: 引擎调频与否仅影响冷词同分打破（目标卷入 ≤0.05pp 窗,
+    -- 实测见研究库 §三十三·附 6）。
+    local layer1 = {}
+    local s1_of = {}
+    do
+        local fe, bt = _G.user_freq_eff, _G.user_bigram_term
+        for i, c in ipairs(all) do
+            local n = fe and fe(c.text) or 0
+            local s = FREQ_BETA * math.log(1 + n)
+            if bt then s = s + bt(c.text) end
+            layer1[i] = { c = c, s = s, idx = i }
+            s1_of[c.text] = s
+        end
+        table.sort(layer1, function(a, b)
+            if a.s ~= b.s then return a.s > b.s end
+            return a.idx < b.idx   -- 稳定: 同分保引擎序
+        end)
     end
+    local cands = {}
+    local l1win = {}
+    for i = 1, math.min(cfg.max_candidates, #layer1) do
+        cands[i] = layer1[i].c.text
+        l1win[i] = layer1[i].c.text
+    end
+    -- 候选窗快照改为层1 前 k（LLM 实际评分范围; 训练语料窗口语义随生产）
+    _G.llm_last_window = { input = input, cands = l1win }
 
     -- 缓存命中: 同 (ctx, input) 的评分结果直接复用 (翻页/候选窗重建不重复推理)。
     -- 编辑操作 (退格/导航/回车) 后 llm_processor 清空 _G.llm_filter_cache,
@@ -253,9 +268,8 @@ return function(translation, env)
     end
 
     -- 融合诊断 (llm_rerank/debug_fusion: true): 每次评分逐候选记录
-    -- CE/eff/词频加成/词长加成/最终 key 与名次, 写 rime_llm_debug.txt
+    -- CE/eff/词频加成/满长标记/最终 key 与名次, 写 rime_llm_debug.txt
     local dbg = cfg.debug_fusion and {} or nil
-    local dbg_span = nil
     if dbg then
         local ctx_tail = #context > 16 and ("…" .. context:sub(-15)) or context
         local ready = "n/a"
@@ -289,11 +303,10 @@ return function(translation, env)
             end
         end
         -- 统一结合公式 (2026-09-03 冷启动标定; 2026-11-02 连续文章语料重标定;
-        -- 2026-11-05 β 退出配置面 → FREQ_BETA 内置常数; elw 保留配置项;
+        -- 2026-11-05 β 退出配置面 → FREQ_BETA 内置常数;
         -- **2026-11-06 v3: 六维联合标定 + 用户 bigram 项上线**):
         --   fused(w) = score(w) + FREQ_BETA·log(1+eff(w))
         --              + log(0.5·p2+0.5·p1)     ← 用户 bigram 项 (v3)
-        --              + elw·span·[词长==⌊码长/2⌋]
         -- score = 原始 LLM 分 (−CE, 对数概率域); eff = librime algo::formula_d
         -- 指数衰减计数 (**τ=400** tick 内置常数, tick=每词提交+1, 引擎调频同源;
         -- llm_processor 维护, _G.user_freq_eff 查询)。对数域加法:
@@ -303,14 +316,10 @@ return function(translation, env)
         --      fired=见过), p1 = (uni+1)/(n_seen+2万) 兜底; fired 时
         --      log(0.5·p2+0.5·p1), 否则 log(0.5·p1)——与标定语义逐字一致;
         --      冷启动全等值自动无害退化; llm_processor 维护 _G.user_bigram_term;
-        --   ③ 预期词长加成作用于融合分 (默认 0——连续口径全切片 argmax=0; 两码一字
-        --      整句方案可试 0.2: 长编码切词拼接时使 floor(码长/2) 字的候选优先,
-        --      又不直接优先最长词——1~2 码简码不应压到字前面)
-        --      ——修复旧实现按原始分重排导致 ELW 架空词频融合的组成缺陷;
-        --   ④ 冷启动 eff≡0 且 bigram 无计数时自动退化为 score + elw·span·匹配,
-        --      成熟期四项叠加。
-        -- span 取窗内有效原始分跨度; 失败哨兵分 (≤-1e9) 排尾部不参与;
-        -- 任一候选无有效融合分则整体跳过 elw 段。同分稳定保序 (融合序)。
+        --   ③ expected_length_weight (elw) 已退役 (2026-11-07): 整句偏好改由
+        --      two_code_sentence 开关直接实现 (见下方满长组优先块)。
+        --   ④ 冷启动 eff≡0 且 bigram 无计数时自动退化为 score 序, 成熟期三项叠加。
+        -- 失败哨兵分 (≤-1e9) 排尾部不参与; 同分稳定保序 (融合序)。
         local fused_scores = nil
         if #ordered > 1 and scores then
             local freq_eff = _G.user_freq_eff
@@ -332,11 +341,15 @@ return function(translation, env)
                                         fused = t, cerank = i }
                     end
                 else
-                    fused_scores[c.text] = -math.huge
-                    arr[i] = { c = c, t = -math.huge, idx = i }  -- 无效分保序排尾
+                    -- 无 CE 分（评分失败）→ 后两项和（层1 分）参与窗内排序
+                    -- （2026-11-07 两层重排语义; 层1 已保证其在本窗内）
+                    local s1 = s1_of[c.text]
+                    fused_scores[c.text] = s1 or -math.huge
+                    arr[i] = { c = c, t = s1 or -math.huge, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = 0, fb = 0,
-                                        fused = -1 / 0, cerank = i, invalid = true }
+                                        fused = s1 or -1 / 0, cerank = i,
+                                        invalid = true }
                     end
                 end
             end
@@ -346,47 +359,28 @@ return function(translation, env)
             end)
             for i = 1, #arr do ordered[i] = arr[i].c end
         end
-        -- 预期词长加权 (expected_length_weight): 两码一字方案 L 码对应 floor(L/2) 字
-        if cfg.expected_length_weight > 0 and #ordered > 1 and fused_scores then
+        -- 两码整句 (two_code_sentence, 2026-11-07 用户定案取代 elw):
+        -- 词长==⌊码长/2⌋ 的候选一组直接优先 (组内融合分降序, 同分稳定),
+        -- 其余按融合分降序——即原 elw 的极限行为 (elw·span 加成→∞),
+        -- 不再需要 span 间接量。
+        if cfg.two_code_sentence and #ordered > 1 and fused_scores then
             local expected_len = math.floor(#input / 2)
-            local min_score, max_score
-            for _, c in ipairs(ordered) do
-                local s = scores[c.text]
-                if is_valid_llm_score(s) then
-                    if not min_score or s < min_score then min_score = s end
-                    if not max_score or s > max_score then max_score = s end
-                end
-            end
-            local span = (min_score and max_score) and (max_score - min_score) or 0
-            if expected_len >= 1 and span > 0 then
-                local arr, ok2 = {}, true
+            if expected_len >= 1 then
+                local arr = {}
                 for i, c in ipairs(ordered) do
-                    local f = fused_scores[c.text]
-                    if not f or f == -math.huge then
-                        ok2 = false
-                        break
-                    end
                     local len = utf8.len(c.text or "") or 0
-                    arr[i] = { c = c, s = f,
+                    arr[i] = { c = c, s = fused_scores[c.text] or -math.huge,
                                m = (len == expected_len), idx = i }
-                end
-                if ok2 then
-                    for _, item in ipairs(arr) do
-                        if item.m then
-                            item.s = item.s + cfg.expected_length_weight * span
-                            if dbg and dbg[item.c.text] then
-                                dbg[item.c.text].eb = cfg.expected_length_weight * span
-                            end
-                        end
+                    if dbg and dbg[c.text] then
+                        dbg[c.text].full = arr[i].m
                     end
-                    table.sort(arr, function(a, b)
-                        if a.s ~= b.s then return a.s > b.s end
-                        if a.m ~= b.m then return a.m end
-                        return a.idx < b.idx  -- 分数相同保持融合序
-                    end)
-                    for i = 1, #arr do ordered[i] = arr[i].c end
                 end
-                if dbg then dbg_span = span end
+                table.sort(arr, function(a, b)
+                    if a.m ~= b.m then return a.m end
+                    if a.s ~= b.s then return a.s > b.s end
+                    return a.idx < b.idx  -- 同分保持融合序
+                end)
+                for i = 1, #arr do ordered[i] = arr[i].c end
             end
         end
 
@@ -403,9 +397,9 @@ return function(translation, env)
                     local ce_str = (d.ce and d.ce > -1e9)
                         and string.format("%8.3f", d.ce) or "   -sent"
                     table.insert(dbg, string.format(
-                        "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f 长+%5.2f key=%8.3f  原次序%d→%d",
+                        "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f bi+%6.3f 满=%d key=%8.3f  原次序%d→%d",
                         i, c.text, ce_str, d.eff or 0, d.fb or 0,
-                        d.eb or 0, (d.fused or 0) + (d.eb or 0),
+                        d.bi or 0, d.full and 1 or 0, d.fused or 0,
                         d.cerank or 0, final_rank[c.text] or 0))
                 end
             end
@@ -421,9 +415,6 @@ return function(translation, env)
             table.insert(dbg, #moved > 0
                 and ("  名次变化: " .. table.concat(moved, ", "))
                 or  "  名次变化: 无 (CE 序即融合序)")
-            if dbg_span then
-                table.insert(dbg, string.format("  词长span=%.3f", dbg_span))
-            end
             local okw = pcall(function()
                 local f = io.open(rime_api.get_user_data_dir()
                                   .. "\\rime_llm_debug.txt", "a")
@@ -448,10 +439,11 @@ return function(translation, env)
                 yield(c)
             end
         end
-        for _, c in ipairs(all) do
-            if not seen[c.text] then yield(c) end
+        for _, e in ipairs(layer1) do
+            if not seen[e.c.text] then yield(e.c) end
         end
     else
-        for _, c in ipairs(all) do yield(c) end
+        -- 评分失败/缺分: 层1 已重排全体候选 → 按层1 序展示
+        for _, e in ipairs(layer1) do yield(e.c) end
     end
 end
