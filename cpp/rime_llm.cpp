@@ -955,8 +955,12 @@ static double ce_target(const float * logits, int target_id, float m, double lse
 // 核心评分：ctx 仅 1 次 decode + KV copy + 多序列分层并行候选 decode
 //
 // Step 1: decode ctx → 保存 logits → 所有候选的第 1 个 token CE 从此计算
-// Step 2: KV copy ctx → M 个 seq，并行 decode 候选首 token → 第 2 token CE
-// Step 3: 同一批 seq 继续 decode → 第 3 token CE
+// Step 2: KV copy ctx → worker seq，并行 decode 候选首 token → 第 2 token CE
+//         （2026-11-07 前缀去重：step2 行按首 token 去重，共享行上每个
+//          候选读各自的 CE 目标——CE 数学不变，省重复行）
+// Step 3: 次 token 并行 decode → 第 3 token CE
+//         （step3 行按 (首token, 次token) 对去重；同首 token 的后续对
+//          seq_cp 出新 seq 携带 [ctx, c0] KV）
 //
 // 原理：P(tok_i0|ctx) 对所有 i 共享同一个 ctx_last hidden state
 //       多 token 候选每个 seq 仅 1 个新 token，SSM 跨序列干扰可忽略
@@ -986,7 +990,6 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     }
     int M = (int)idx2.size();
     int K = (int)idx3.size();
-    std::vector<int> cand_to_seq(n_cands, -1);  // candidate index → seq id
 
     // 检测预解码状态：ctx 完全匹配 且 seq0 未被其他 decode 覆盖 → 跳过 Step 1
     // 代次匹配防止: 完整流程 score 覆盖 seq0 后, 旧 prep 状态被误用 (KV 与 logits 不一致)
@@ -1049,33 +1052,69 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     double ms_ce1 =
         std::chrono::duration<double, std::milli>(ts_ce1_1 - ts_ce1_0).count();
 
-    // ---- Step 2: 多 token 候选的首 token 并行 decode（每 seq 1 token）----
-    double ms2a = 0, ms2b = 0;
-    if (M > 0) {
-        auto ts2_0 = std::chrono::high_resolution_clock::now();
-        // KV copy ctx (seq 0) → worker seqs 1..M
-        for (int s = 0; s < M; s++) {
-            llama_memory_seq_cp(llama_get_memory(g_ctx), 0, s + 1, 0, -1);
-            cand_to_seq[idx2[s]] = s + 1;
+    // ---- Step 2/3: 前缀去重批量 decode（2026-11-07，两版同步）----
+    // 行按"已解码前缀"分组：step2 行 = 候选首 token（去重）；step3 行 =
+    // (首token, 次token) 对（去重）。同一行上的多个候选从同一 logits 行
+    // 读各自的 CE 目标——CE 数学与逐候选行完全一致，只省掉重复行的
+    // decode 与 head 计算（标定语料实测 20.3% 行共享首 token、34.1% 窗
+    // 省 ≥1 行）。seq 分配：每个 step2 行一条 worker seq（seq_cp 0→s）；
+    // step3 对里该首 token 的第一个对复用 step2 seq，同首 token 的后续
+    // 对 seq_cp(step2 seq→新 seq) 携带 [ctx, c0] KV——worker seq 总数 =
+    // 不同前缀路径数 ≤ 候选数 ≤ max_candidates ≤ n_seq_max-1，天然不越界。
+    double ms2a = 0, ms2b = 0, ms3 = 0;
+    int seq_top = 0;  // 使用的最大 worker seq（尾部清理用）
+    // step2 行：按首 token 去重（线性扫描，候选数 ≤ max_candidates）
+    std::vector<llama_token> r2_tok;
+    std::vector<std::vector<int>> r2_cands;
+    for (int ci : idx2) {
+        size_t u = 0;
+        while (u < r2_tok.size() && r2_tok[u] != cands[ci][0]) u++;
+        if (u == r2_tok.size()) {
+            r2_tok.push_back(cands[ci][0]);
+            r2_cands.emplace_back();
         }
+        r2_cands[u].push_back(ci);
+    }
+    const int U = (int)r2_tok.size();
+    // step3 行：按 (首token, 次token) 对去重
+    struct Row3 { int base; llama_token tok1; std::vector<int> cands; int seq; };
+    std::vector<Row3> rows3;
+    for (int ci : idx3) {
+        int base = -1;
+        for (int u = 0; u < U; u++)
+            if (r2_tok[u] == cands[ci][0]) { base = u; break; }
+        int v = 0;
+        while (v < (int)rows3.size() &&
+               !(rows3[v].base == base && rows3[v].tok1 == cands[ci][1])) v++;
+        if (v == (int)rows3.size()) rows3.push_back({base, cands[ci][1], {}, 0});
+        rows3[v].cands.push_back(ci);
+    }
+
+    bool step2_ok = false;
+    if (U > 0) {
+        auto ts2_0 = std::chrono::high_resolution_clock::now();
+        // KV copy ctx (seq 0) → 每个 step2 行一条 worker seq
+        for (int u = 0; u < U; u++)
+            llama_memory_seq_cp(llama_get_memory(g_ctx), 0, u + 1, 0, -1);
+        seq_top = U;
         auto ts2_kv = std::chrono::high_resolution_clock::now();
 
-        llama_batch b2 = llama_batch_init(M, 0, M);
-        for (int s = 0; s < M; s++) {
-            int ci = idx2[s];
-            b2.token[s] = cands[ci][0];
-            b2.pos[s] = ctx_len;
-            b2.n_seq_id[s] = 1;
-            b2.seq_id[s][0] = s + 1;
-            b2.logits[s] = 1;
+        llama_batch b2 = llama_batch_init(U, 0, U);
+        for (int u = 0; u < U; u++) {
+            b2.token[u] = r2_tok[u];
+            b2.pos[u] = ctx_len;
+            b2.n_seq_id[u] = 1;
+            b2.seq_id[u][0] = u + 1;
+            b2.logits[u] = 1;
         }
-        b2.n_tokens = M;
-        if (llama_decode(g_ctx, b2) == 0) {
-            for (int s = 0; s < M; s++) {
-                int ci = idx2[s];
-                float* l = llama_get_logits_ith(g_ctx, s);
-                if (l) ce_sum[ci] += kCeW2 * cross_entropy(l, vs, cands[ci][1]);
-                else   ce_sum[ci] = -1e10;
+        b2.n_tokens = U;
+        step2_ok = llama_decode(g_ctx, b2) == 0;
+        if (step2_ok) {
+            for (int u = 0; u < U; u++) {
+                float* l = llama_get_logits_ith(g_ctx, u);
+                if (!l) { for (int ci : r2_cands[u]) ce_sum[ci] = -1e10; continue; }
+                for (int ci : r2_cands[u])
+                    ce_sum[ci] += kCeW2 * cross_entropy(l, vs, cands[ci][1]);
             }
         } else {
             for (int ci : idx2) ce_sum[ci] = -1e10;
@@ -1090,49 +1129,71 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         ms2b = std::chrono::duration<double, std::milli>(ts2_1 - ts2_kv).count();
     }
 
-    // ---- Step 3: 3-token 候选的次 token 并行 decode ----
-    double ms3 = 0;
-    if (K > 0) {
+    // ---- Step 3: 前缀 (c0,c1) 去重 decode ----
+    const int V = (int)rows3.size();
+    if (V > 0 && step2_ok) {
         auto ts3_0 = std::chrono::high_resolution_clock::now();
-        llama_batch b3 = llama_batch_init(K, 0, K);
-        for (int s = 0; s < K; s++) {
-            int ci = idx3[s];
-            int seq_id = cand_to_seq[ci];  // same seq as step 2
-            b3.token[s] = cands[ci][1];
-            b3.pos[s] = ctx_len + 1;
-            b3.n_seq_id[s] = 1;
-            b3.seq_id[s][0] = seq_id;
-            b3.logits[s] = 1;
+        // seq 分配：每个首 token 的第一个对复用 step2 seq；后续对
+        // seq_cp(step2 seq → 新 seq)——拷贝发生在 step3 decode 的 update
+        // 阶段，取的是 step2 后（ctx+c0）的状态，c1 尚未 decode
+        {
+            std::vector<int> base_cnt(U, 0);
+            int fresh = U;
+            for (auto& r : rows3) {
+                if (r.base < 0) continue;  // 理论不可达（idx3 ⊆ idx2），防御
+                if (++base_cnt[r.base] == 1) {
+                    r.seq = r.base + 1;    // 复用 step2 seq
+                } else {
+                    r.seq = ++fresh;
+                    llama_memory_seq_cp(llama_get_memory(g_ctx),
+                                        r.base + 1, r.seq, 0, -1);
+                }
+            }
+            seq_top = fresh;
         }
-        b3.n_tokens = K;
+        llama_batch b3 = llama_batch_init(V, 0, V);
+        for (int v = 0; v < V; v++) {
+            b3.token[v] = rows3[v].tok1;
+            b3.pos[v] = ctx_len + 1;
+            b3.n_seq_id[v] = 1;
+            b3.seq_id[v][0] = rows3[v].seq;
+            b3.logits[v] = 1;
+        }
+        b3.n_tokens = V;
         if (llama_decode(g_ctx, b3) == 0) {
-            for (int s = 0; s < K; s++) {
-                int ci = idx3[s];
-                float* l = llama_get_logits_ith(g_ctx, s);
-                if (l) ce_sum[ci] += kCeW3 * cross_entropy(l, vs, cands[ci][2]);
-                else   ce_sum[ci] = -1e10;
+            for (int v = 0; v < V; v++) {
+                float* l = llama_get_logits_ith(g_ctx, v);
+                if (!l) { for (int ci : rows3[v].cands) ce_sum[ci] = -1e10; continue; }
+                for (int ci : rows3[v].cands)
+                    ce_sum[ci] += kCeW3 * cross_entropy(l, vs, cands[ci][2]);
             }
         } else {
-            for (int ci : idx3) ce_sum[ci] = -1e10;
+            for (auto& r : rows3)
+                for (int ci : r.cands) ce_sum[ci] = -1e10;
             log_msg("WARN: step3 decode failed");
             g_prep_ready = false;  // 同 Step2：失败自愈
         }
         llama_batch_free(b3);
         auto ts3_1 = std::chrono::high_resolution_clock::now();
         ms3 = std::chrono::duration<double, std::milli>(ts3_1 - ts3_0).count();
+    } else if (V > 0) {
+        // step2 失败：idx3 候选直接置哨兵（旧实现跟随一次必败 decode，结果相同）
+        for (auto& r : rows3)
+            for (int ci : r.cands) ce_sum[ci] = -1e10;
     }
 
     // ---- worker 序列 KV 清理（2026-09-04 修"推理自停"根因，与源码版同步）----
     // seq_cp 是共享标记非复制：Step2/3 的 decode cell 在评分结束后仍归属
-    // seq 1..M。prep 命中路径无 memory_clear，同 ctx 连续评分（退格重打/
-    // 改码不换 ctx/失败重试）每轮净耗 M+K cell —— n_ctx=64 约 6~7 轮耗尽
+    // worker seq。prep 命中路径无 memory_clear，同 ctx 连续评分（退格重打/
+    // 改码不换 ctx/失败重试）每轮净耗 cell —— n_ctx=64 约 6~7 轮耗尽
     // → decode 静默失败 → 全哨兵分且 prep_ready 仍真 → 卡死失败循环，
     // 仅 commit 触发 prepare 或重部署可解（非本机实测）。评分尾部立即释放
     // worker 归属：共享 cell 只去掉一个归属方，seq0 与 prep 状态不受影响，
-    // prep 命中照常，每次评分净耗归零。
-    if (M > 0) {
+    // prep 命中照常，每次评分净耗归零。2026-11-07 起清理 1..seq_top
+    // （= 不同前缀路径数，含 step3 分叉的新 seq）。
+    if (seq_top > 0) {
         auto *mem = llama_get_memory(g_ctx);
-        for (int s = 1; s <= M; s++)
+        for (int s = 1; s <= seq_top; s++)
             llama_memory_seq_rm(mem, s, 0, -1);
     }
 
@@ -1156,9 +1217,10 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     //       KV=KV copy S2=decode cand0 S3=decode cand1 score=加权求和
     if (++g_score_log_cnt % 10 == 1 || total_ms > 100)
         log_msg("score: wait=%.0fms S1=%.0fms CE1=%.0fms KV=%.0fms S2=%.0fms "
-                "S3=%.0fms score=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d",
+                "S3=%.0fms score=%.0fms total=%.0fms prep=%d ctx_tok=%d cand=%d "
+                "r2=%d r3=%d",
                 wait_ms, ms1, ms_ce1, ms2a, ms2b, ms3, ms_score, total_ms,
-                use_prep ? 1 : 0, ctx_len, n_cands);
+                use_prep ? 1 : 0, ctx_len, n_cands, U, V);
 }
 
 // ============================================================
