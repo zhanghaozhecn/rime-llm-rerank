@@ -10,9 +10,10 @@ local llm_loaded_for = nil  -- enabled value when llm was loaded
 local FREQ_BETA = 12 -- 对数词频融合系数（v3 2026-11-06 六维联合标定
                      -- w2×w3×β×τ×γ×λ 68,640 点: 用户域标定 → wiki 平台内
                      -- 就近点 (1.05/0.45/β12/τ400/γ1/λ0.5), 见研究库 §三十三）
-                     -- fused = score + β·log(1+eff) + log(0.5·p2+0.5·p1)
-                     --   p2/p1 = 用户 bigram 项（llm_processor 维护,
-                     --   _G.user_bigram_term 查询; γ=1/λ=0.5 同为内置常数）
+                     -- fused = score + β·log(1+eff) + log(0.5·p1)
+                     --   p1 = 用户累计 Unigram 平滑概率（llm_processor 维护,
+                     --   _G.user_unigram_term 查询; 累计 Bigram 项已退役
+                     --   2026-11-08, 见研究库 §三十七）
 -- two_code_sentence 两码整句开关（2026-11-07 用户定案取代 elw）：
 -- 两码一字整句方案下勾选后，词长==⌊码长/2⌋ 的候选作为一组直接优先
 -- （组内融合分降序、同分稳定），其余候选按融合分降序在后——即原 elw
@@ -181,8 +182,8 @@ return function(translation, env)
     -- 不需过滤尾部 ASCII: Rime 编码显示在候选窗, 不写入编辑器,
     -- 外挂读到的光标前文本不会包含编码字母 (微软拼音式 inline composition 才会)
     local context = (ctx_text or ""):gsub('%s+', '')
-    -- ═══ 层1: 全体候选 用户词频+bigram 打分重排（v3 两层重排, 2026-11-07 定案）═══
-    -- 全体候选 S1 = FREQ_BETA·log1p(eff) + bigram 项, 稳定降序（同分保引擎序）,
+    -- ═══ 层1: 全体候选 用户词频打分重排（v3 两层重排, 2026-11-07 定案）═══
+    -- 全体候选 S1 = FREQ_BETA·log1p(eff) + 累计 Unigram 项, 稳定降序（同分保引擎序）,
     -- 取前 max_candidates 进 LLM 评分（层2 三项融合重排）, 其余按层1 序透传。
     -- 目标在层1 前 k 外 → 必然不在首位（评测 sweep_2layer 同语义, 全窗参评）。
     -- 文件序无关性: 引擎调频与否仅影响冷词同分打破（目标卷入 ≤0.05pp 窗,
@@ -190,7 +191,7 @@ return function(translation, env)
     local layer1 = {}
     local s1_of = {}
     do
-        local fe, bt = _G.user_freq_eff, _G.user_bigram_term
+        local fe, bt = _G.user_freq_eff, _G.user_unigram_term
         for i, c in ipairs(all) do
             local n = fe and fe(c.text) or 0
             local s = FREQ_BETA * math.log(1 + n)
@@ -304,21 +305,22 @@ return function(translation, env)
         end
         -- 统一结合公式 (2026-09-03 冷启动标定; 2026-11-02 连续文章语料重标定;
         -- 2026-11-05 β 退出配置面 → FREQ_BETA 内置常数;
-        -- **2026-11-06 v3: 六维联合标定 + 用户 bigram 项上线**):
+        -- 2026-11-06 v3: 六维联合标定 + 用户 bigram 项上线;
+        -- **2026-11-08: 累计 Bigram 项退役**（cohort 生产量级评测实证真实用户龄
+        -- fired ~2%、剔除零损失, 见研究库 §三十七——保留历史结论, 公式去掉 p2）):
         --   fused(w) = score(w) + FREQ_BETA·log(1+eff(w))
-        --              + log(0.5·p2+0.5·p1)     ← 用户 bigram 项 (v3)
+        --              + log(0.5·p1)     ← 用户累计 Unigram 项
         -- score = 原始 LLM 分 (−CE, 对数概率域); eff = librime algo::formula_d
         -- 指数衰减计数 (**τ=400** tick 内置常数, tick=每词提交+1, 引擎调频同源;
         -- llm_processor 维护, _G.user_freq_eff 查询)。对数域加法:
         --   ① 词频无上限: 强个人高频词可翻盘 CE 分差 (FREQ_BETA=12, v3 六维
         --      联合标定用户域标定→wiki 平台就近);
-        --   ② 用户 bigram 项 (v3): p2 = bi[前词,候选]/c1[前词] (原始计数不衰减,
-        --      fired=见过), p1 = (uni+1)/(n_seen+2万) 兜底; fired 时
-        --      log(0.5·p2+0.5·p1), 否则 log(0.5·p1)——与标定语义逐字一致;
-        --      冷启动全等值自动无害退化; llm_processor 维护 _G.user_bigram_term;
+        --   ② 用户累计 Unigram 项: p1 = (uni+1)/(n_seen+2万) (原始计数不衰减),
+        --      项值 log(0.5·p1)——与原标定语义的未 fired 形态逐字一致;
+        --      冷启动全等值自动无害退化; llm_processor 维护 _G.user_unigram_term;
         --   ③ expected_length_weight (elw) 已退役 (2026-11-07): 整句偏好改由
         --      two_code_sentence 开关直接实现 (见下方满长组优先块)。
-        --   ④ 冷启动 eff≡0 且 bigram 无计数时自动退化为 score 序, 成熟期三项叠加。
+        --   ④ 冷启动 eff≡0 且 uni 无计数时自动退化为 score 序, 成熟期三项叠加。
         -- 失败哨兵分 (≤-1e9) 排尾部不参与; 同分稳定保序 (融合序)。
         local fused_scores = nil
         if #ordered > 1 and scores then
@@ -329,15 +331,15 @@ return function(translation, env)
                 local s = scores[c.text]
                 if is_valid_llm_score(s) then
                     local n = freq_eff and freq_eff(c.text) or 0
-                    local bi_term = _G.user_bigram_term
-                            and _G.user_bigram_term(c.text) or 0
-                    local t = s + FREQ_BETA * math.log(1 + n) + bi_term
+                    local u1_term = _G.user_unigram_term
+                            and _G.user_unigram_term(c.text) or 0
+                    local t = s + FREQ_BETA * math.log(1 + n) + u1_term
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = n,
                                         fb = FREQ_BETA * math.log(1 + n),
-                                        bi = bi_term,
+                                        u1 = u1_term,
                                         fused = t, cerank = i }
                     end
                 else
@@ -397,9 +399,9 @@ return function(translation, env)
                     local ce_str = (d.ce and d.ce > -1e9)
                         and string.format("%8.3f", d.ce) or "   -sent"
                     table.insert(dbg, string.format(
-                        "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f bi+%6.3f 满=%d key=%8.3f  原次序%d→%d",
+                        "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%8.3f  原次序%d→%d",
                         i, c.text, ce_str, d.eff or 0, d.fb or 0,
-                        d.bi or 0, d.full and 1 or 0, d.fused or 0,
+                        d.u1 or 0, d.full and 1 or 0, d.fused or 0,
                         d.cerank or 0, final_rank[c.text] or 0))
                 end
             end

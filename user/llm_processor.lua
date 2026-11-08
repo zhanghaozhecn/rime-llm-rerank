@@ -159,14 +159,16 @@ _G.user_freq_eff = function(w)
     return e.d * math.exp((e.t - (_G.user_freq_tick or e.t)) / FREQ_TAU)
 end
 
--- === 用户 bigram 计数 (v3 2026-11-06 六维联合标定: γ=1, λ=0.5) ===
--- 融合项 = log(0.5·p2 + 0.5·p1) [fired=b 见过] / log(0.5·p1) [未 fired];
--- p1 = (uni[x]+1)/(n_seen+20000), p2 = bi[h2,x]/c1[h2]。
+-- === 用户累计 Unigram 计数 (v3 2026-11-06; 累计 Bigram 退役 2026-11-08) ===
+-- 融合项 = log(0.5·p1);  p1 = (uni[x]+1)/(n_seen+20000)。
+-- （曾配套累计 Bigram 项 log(0.5·p2+0.5·p1)——cohort 生产量级评测实证其在
+--   真实用户龄仅 fired ~2%、剔除零损失（研究库 §三十七），2026-11-08 退役：
+--   停记 b 行、查询只剩 p1；旧 user_bigram.tsv 里的 b 行读取时忽略。）
 -- 口径 = 研究库 §三十二(续): 只计含中文字符的词 (纯标点不计——与标定的
--- 词典词流同源); h2 = 上一个中文提交词 (标点跳过不清空); **原始计数不衰减**
--- (τ 衰减只作用于 eff 单词项; 原始计数是标定语义本身, 冷启动自然回退)。
--- 存储: user_bigram.tsv, 首行 "#n=N" (n_seen), 行 "u\t词\t次数" /
--- "b\t前词\t词\t次数"; c1[前词] 载入时由 b 行合计, 不落盘。
+-- 词典词流同源); **原始计数不衰减** (τ 衰减只作用于 eff 单词项; 原始计数
+-- 是标定语义本身, 冷启动自然回退)。
+-- 存储: user_bigram.tsv (文件名历史沿用), 首行 "#n=N" (n_seen),
+-- 行 "u\t词\t次数"。
 -- 文件有界: 用户一年 ~10 万行 ≈ 3MB, 原始计数不修剪 (标定语义)。
 local function bigram_file()
     return rime_api.get_user_data_dir() .. "\\user_bigram.tsv"
@@ -175,7 +177,7 @@ local BIGRAM_VCAP = 20000
 local bigram_dirty = 0
 local function bigram_load()
     if _G.user_uni then return end
-    _G.user_uni, _G.user_bi, _G.user_c1 = {}, {}, {}
+    _G.user_uni = {}
     _G.user_nseen = 0
     local f = io.open(bigram_file(), "r")
     if f then
@@ -184,14 +186,11 @@ local function bigram_load()
             if n then
                 _G.user_nseen = tonumber(n)
             else
-                local kind, a, b, cnt = line:match("^(%a)\t(.-)\t(.-)\t(%d+)$")
+                local kind, a, cnt = line:match("^(%a)\t(.-)\t(%d+)$")
                 if kind == "u" then
                     _G.user_uni[a] = tonumber(cnt)
-                elseif kind == "b" then
-                    local key = a .. "\t" .. b
-                    _G.user_bi[key] = tonumber(cnt)
-                    _G.user_c1[a] = (_G.user_c1[a] or 0) + tonumber(cnt)
                 end
+                -- 旧版 b 行（前词\t词\t次数）: 累计 Bigram 已退役, 忽略
             end
         end
         f:close()
@@ -203,10 +202,6 @@ local function bigram_save()
         f:write("#n=" .. (_G.user_nseen or 0) .. "\n")
         for w, c in pairs(_G.user_uni) do
             f:write("u\t" .. w .. "\t" .. c .. "\n")
-        end
-        for key, c in pairs(_G.user_bi) do
-            local a, b = key:match("^(.-)\t(.+)$")
-            f:write("b\t" .. a .. "\t" .. b .. "\t" .. c .. "\n")
         end
         f:close()
     end
@@ -221,35 +216,21 @@ local function bigram_bump(word)
     if not is_cjk then return end
     _G.user_nseen = (_G.user_nseen or 0) + 1
     _G.user_uni[word] = (_G.user_uni[word] or 0) + 1
-    local h2 = _G.user_last_cjk
-    if h2 then
-        local key = h2 .. "\t" .. word
-        _G.user_bi[key] = (_G.user_bi[key] or 0) + 1
-        _G.user_c1[h2] = (_G.user_c1[h2] or 0) + 1
-    end
-    _G.user_last_cjk = word
     bigram_dirty = bigram_dirty + 1
     if bigram_dirty >= FREQ_FLUSH then
         bigram_save()
         bigram_dirty = 0
     end
 end
--- 融合项查询 (llm_filter): fired = bi[h2,x]>0 且 c1[h2]>0
-_G.user_bigram_term = function(x)
+-- 融合项查询 (llm_filter): 累计 Unigram 项
+-- δ=1（log p1）：cohort 终审 2026-11-08（大词典链 12 万窗 GPU 宇宙）——
+-- (β=12, δ=1) 全 6 龄距档内 argmax ≤0.06pp、5/6 龄优于旧尺度 δ=0.5；
+-- 用户域（llm_training 真实词流）独立互证方向（旧 log(0.5·p1) 是 δ=0.5）
+_G.user_unigram_term = function(x)
     bigram_load()
     local p1 = ((_G.user_uni[x] or 0) + 1)
         / ((_G.user_nseen or 0) + BIGRAM_VCAP)
-    local h2 = _G.user_last_cjk
-    if h2 then
-        local cc = _G.user_c1[h2]
-        if cc and cc > 0 then
-            local b = _G.user_bi[h2 .. "\t" .. x] or 0
-            if b > 0 then
-                return math.log(0.5 * (b / cc) + 0.5 * p1)
-            end
-        end
-    end
-    return math.log(0.5 * p1)
+    return math.log(p1)
 end
 
 local function find_overlap(prev, curr)
