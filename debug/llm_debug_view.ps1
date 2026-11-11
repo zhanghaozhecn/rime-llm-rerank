@@ -94,11 +94,11 @@ $Y_STATUS = 8;  $H_STATUS = 22
 $Y_INFO   = 34; $H_INFO = 20
 $Y_CTX    = 58; $H_CTX = 42
 $Y_GRID   = 104; $H_GRID = 298
-$X_GRID   = 8;   $W_GRID = 560
-$X_HIST   = 576; $W_HIST = 196
+$X_GRID   = 8;   $W_GRID = 728
+$X_HIST   = 744; $W_HIST = 204
 $Y_EVT    = 410; $H_EVT = 96
 $Y_FOOT   = 512       # 公式 / 列义 / 数据源 三行灰注（各 +16）
-$CW = 792       # ClientSize 宽（= X_HIST + W_HIST + 8）
+$CW = 976       # ClientSize 宽（= X_HIST + W_HIST + 8）
 $CH = 576       # ClientSize 高（2026-11-11 加公式两行）
 
 $form = [System.Windows.Forms.Form]::new()
@@ -119,19 +119,19 @@ function New-Lbl([int]$x, [int]$y, [int]$w, [int]$h) {
   $form.Controls.Add($l)
   return $l
 }
-$lblStatus = New-Lbl 8 $Y_STATUS 520 $H_STATUS
+$lblStatus = New-Lbl 8 $Y_STATUS 700 $H_STATUS
 $lblStatus.Text = '等待连接…（先在方案开启 llm_rerank/debug_fusion 并重新部署，然后打字）'
 $lblStatus.ForeColor = [System.Drawing.Color]::DimGray
 
-$lblInfo = New-Lbl 8 $Y_INFO 764 $H_INFO
+$lblInfo = New-Lbl 8 $Y_INFO 944 $H_INFO
 $lblInfo.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $lblInfo.Text = '—'
 
-$lblCtx = New-Lbl 8 $Y_CTX 764 $H_CTX
+$lblCtx = New-Lbl 8 $Y_CTX 944 $H_CTX
 $lblCtx.Text = '上文：—'
 
 $btnPause = [System.Windows.Forms.Button]::new()
-$btnPause.Location = [System.Drawing.Point]::new(536, $Y_STATUS - 2)
+$btnPause.Location = [System.Drawing.Point]::new(704, $Y_STATUS - 2)
 $btnPause.Size = [System.Drawing.Size]::new(64, 24)
 $btnPause.Text = '暂停'
 $btnPause.FlatStyle = 'Flat'
@@ -139,14 +139,14 @@ $btnPause.UseVisualStyleBackColor = $false
 $form.Controls.Add($btnPause)
 
 $chkTop = [System.Windows.Forms.CheckBox]::new()
-$chkTop.Location = [System.Drawing.Point]::new(608, $Y_STATUS)
+$chkTop.Location = [System.Drawing.Point]::new(776, $Y_STATUS)
 $chkTop.Size = [System.Drawing.Size]::new(52, 22)
 $chkTop.Text = '置顶'
 $chkTop.BackColor = [System.Drawing.Color]::White
 $form.Controls.Add($chkTop)
 
 $btnClear = [System.Windows.Forms.Button]::new()
-$btnClear.Location = [System.Drawing.Point]::new(668, $Y_STATUS - 2)
+$btnClear.Location = [System.Drawing.Point]::new(836, $Y_STATUS - 2)
 $btnClear.Size = [System.Drawing.Size]::new(52, 24)
 $btnClear.Text = '清空'
 $btnClear.FlatStyle = 'Flat'
@@ -170,9 +170,12 @@ $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridVie
 # 列（2026-11-11 协议 v2）：频两项 = 原始值（衰减频 = eff 衰减计数、
 # 累计频 = 累计 unigram 原始计数，都未乘系数）；CE 列加宽容纳展开的
 # CE1/CE2/CE3（点 CE 单元格切换，默认不展开）
+# 方案 B / 计数-得分式命名（2026-11-11 用户定案）：CE 三子项常显；
+# 词频得分/累计得分 = 真正进融合的项，括号内是原始证据
 $cols = @(
-  @('#', 24), @('词', 58), @('CE', 126), @('用户频', 56), @('衰减频', 56),
-  @('累计频', 54), @('融合', 64), @('满', 28), @('序变', 48), @('窗内', 46))
+  @('#', 24), @('词', 58), @('C1/C2/C3', 128), @('CE和', 58),
+  @('词频得分', 88), @('累计得分', 88),
+  @('用户频分', 66), @('融合分', 62), @('满', 26), @('CE→终', 58), @('窗', 30))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
   $grid.Columns[$i].Width = $c[1]
@@ -187,23 +190,23 @@ $form.Controls.Add($hist)
 
 $evt = [System.Windows.Forms.ListBox]::new()
 $evt.Location = [System.Drawing.Point]::new(8, $Y_EVT)
-$evt.Size = [System.Drawing.Size]::new(764, $H_EVT)
+$evt.Size = [System.Drawing.Size]::new(944, $H_EVT)
 $evt.HorizontalScrollbar = $true
 $form.Controls.Add($evt)
 
 # 公式与列义两行灰注（2026-11-11 用户定案：空白处显示融合公式 + 层1/满/
 # 展开说明；点 CE 格展开 CE1/2/3，默认不展开）
-$lblFx = New-Lbl 8 $Y_FOOT 764 16
+$lblFx = New-Lbl 8 $Y_FOOT 944 16
 $lblFx.ForeColor = [System.Drawing.Color]::Gray
 $lblFx.Font = [System.Drawing.Font]::new('Segoe UI', 8)
-$lblFx.Text = '融合分 = CE + β·log(1+衰减频) + log(p1)，β=12；p1=(累计频+1)/(全词数+2万)；用户频 = β·log(1+衰减频)+log(p1)'
+$lblFx.Text = '融合分 = CE + 词频得分 + 累计得分；词频得分 = 12·log(1+衰减计数)；累计得分 = log((累计次数+1)/(全词数+2万))；用户频分 = 词频得分+累计得分'
 
-$lblLeg = New-Lbl 8 ($Y_FOOT + 16) 764 16
+$lblLeg = New-Lbl 8 ($Y_FOOT + 16) 944 16
 $lblLeg.ForeColor = [System.Drawing.Color]::Gray
 $lblLeg.Font = [System.Drawing.Font]::new('Segoe UI', 8)
-$lblLeg.Text = '用户频 = 词频预排分（全体候选按它降序取前5进 LLM 评分）；满 = 两码整句满长组；窗内=0 = 尾窗未进 LLM（灰字）；点 CE 格展开 CE1/2/3'
+$lblLeg.Text = '括号内为原始证据（衰减计数 / 累计次数）；用户频分 = 全体候选的预排分，按其降序取前5进 LLM；满 = 两码整句满长组；窗=0 = 尾窗未进 LLM（灰字）'
 
-$lblFoot = New-Lbl 8 ($Y_FOOT + 32) 764 16
+$lblFoot = New-Lbl 8 ($Y_FOOT + 32) 944 16
 $lblFoot.ForeColor = [System.Drawing.Color]::Gray
 $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', 8)
 $lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码命中'
@@ -217,16 +220,24 @@ function Update-Current {
     return
   }
   $inv = $script:invList[$script:viewIdx]
-  $script:lblInfo.Text = ('{0}  输入 {1}   预解 {2}   {3}ms   tick {4}   就绪 {5}   n={6}   来源 {7}' -f
-    $inv.t, $inv.input,
+  $script:lblInfo.Text = ('{0}  输入 {1}   来源 {2}   预解 {3}   {4}ms   tick {5}   全词数 {6}   n={7}   就绪 {8}' -f
+    $inv.t, $inv.input, $inv.src,
     $(if ($inv.prep) { $inv.prep } else { '-' }),
-    $inv.ms, $inv.tick, $inv.ready, $inv.n, $inv.src)
+    $inv.ms, $inv.tick,
+    $(if ($inv.nseen) { $inv.nseen } else { '-' }),
+    $inv.n, $inv.ready)
   $script:lblCtx.Text = '上文：' + $(if ($inv.ctx) { $inv.ctx } else { '（空）' })
   $script:grid.Rows.Clear()
   $i = 0
   foreach ($r in $inv.rows) {
-    [void]$script:grid.Rows.Add(($i + 1), $r.word, (Get-CeText $r), $r.s1,
-      $r.eff, $r.uni, $r.fused,
+    $fbTxt = $r.fb
+    if ($r.fb -and $r.eff) { $fbTxt = $r.fb + '(' + (Format-CeShort $r.eff) + ')' }
+    elseif (-not $r.fb -and $r.eff) { $fbTxt = Format-CeShort $r.eff }
+    $u1Txt = $r.u1
+    if ($r.u1 -and $r.uni) { $u1Txt = $r.u1 + '(' + $r.uni + ')' }
+    elseif (-not $r.u1 -and $r.uni) { $u1Txt = $r.uni }
+    [void]$script:grid.Rows.Add(($i + 1), $r.word, (Get-CeText $r),
+      $(if ($r.ce) { $r.ce } else { '·' }), $fbTxt, $u1Txt, $r.s1, $r.fused,
       $r.full, ($r.cerank + '→' + $r.fin), $r.win)
     if ($r.win -eq '0') {
       $script:grid.Rows[$i].DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gray
@@ -248,10 +259,7 @@ function Format-CeShort {
 }
 function Get-CeText {
   param($r)
-  $has = ($r.ce1 -or $r.ce2 -or $r.ce3)
-  if (-not $r.ceExpanded -or -not $has) {
-    if ($r.ce) { return $r.ce } else { return '·' }
-  }
+  if (-not ($r.ce1 -or $r.ce2 -or $r.ce3)) { return '·' }
   return ((Format-CeShort $r.ce1) + '/' + (Format-CeShort $r.ce2) + '/' +
           (Format-CeShort $r.ce3))
 }
@@ -313,6 +321,7 @@ function Handle-Line {
                 ctx = $f[5]; tick = $f[6]; ms = $f[7]; ready = $f[8]
                 n = $f[9]
                 prep = $(if ($f.Count -gt 10) { $f[10] } else { '' })
+                nseen = $(if ($f.Count -gt 11) { $f[11] } else { '' })
                 rows = [System.Collections.Generic.List[object]]::new() }
       $script:invList.Add($inv)
       while ($script:invList.Count -gt 50) { $script:invList.RemoveAt(0) }
@@ -335,7 +344,8 @@ function Handle-Line {
                        ce1 = $(if ($f.Count -gt 12) { $f[12] } else { '' })
                        ce2 = $(if ($f.Count -gt 13) { $f[13] } else { '' })
                        ce3 = $(if ($f.Count -gt 14) { $f[14] } else { '' })
-                       ceExpanded = $false })
+                       fb = $(if ($f.Count -gt 15) { $f[15] } else { '' })
+                       u1 = $(if ($f.Count -gt 16) { $f[16] } else { '' }) })
       if (-not $script:paused -and $script:viewIdx -eq ($script:invList.Count - 1)) {
         Update-Current
       }

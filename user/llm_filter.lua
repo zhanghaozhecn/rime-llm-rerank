@@ -444,10 +444,13 @@ return function(translation, env)
             local prep = (okp and ph) and "1" or "0"
             -- L 第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），
             -- 保留位置发 "-"（旧查看器显示"评缓 -"，字段数不变免错位）
-            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s",
+            -- 尾两字段: prep=预解码命中, nseen=累计 unigram 全词数
+            --（累计得分 log((累计次数+1)/(nseen+2万)) 的分母，调试要能手算）
+            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s|%s",
                 os.date("%H:%M:%S"), live_esc(input), "-",
                 live_esc(ctx_src), live_esc(context),
-                tostring(_G.user_freq_tick), ev_ms, live_ready, #cands, prep))
+                tostring(_G.user_freq_tick), ev_ms, live_ready, #cands, prep,
+                tostring(_G.user_nseen or 0)))
             local winset = {}
             for _, w in ipairs(l1win) do winset[w] = true end
             local emitted = 0
@@ -468,7 +471,9 @@ return function(translation, env)
                     tostring(fin), winset[c.text] and "1" or "0",
                     d3 and live_fmt3(d3[1]) or "",
                     d3 and live_fmt3(d3[2]) or "",
-                    d3 and live_fmt3(d3[3]) or ""
+                    d3 and live_fmt3(d3[3]) or "",
+                    d and live_fmt3(d.fb) or "",   -- 词频得分 β·log1p(eff)
+                    d and live_fmt3(d.u1) or ""    -- 累计得分 log(p1)
                 }, "|"))
             end
             for i, c in ipairs(ordered) do live_c(c, i) end
