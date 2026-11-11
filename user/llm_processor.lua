@@ -238,14 +238,14 @@ local function bigram_bump(word)
     end
 end
 -- 融合项查询 (llm_filter): 累计 Unigram 项
--- δ=1（log p1）：cohort 终审 2026-11-08（大词典链 12 万窗 GPU 宇宙）——
--- (β=12, δ=1) 全 6 龄距档内 argmax ≤0.06pp、5/6 龄优于旧尺度 δ=0.5；
--- 用户域（llm_training 真实词流）独立互证方向（旧 log(0.5·p1) 是 δ=0.5）
+-- 2026-11-11 简化：log(uni+1)。原 log p1=(uni+1)/(n_seen+2万) 的分母与 δ
+-- 缩放均为窗内常数（同窗所有候选同减同值），对排序零影响——log(a/b)=
+-- log a − log b，常数项不改变大小关系，位级等价去除（用户定案）。
+-- 概率语义（log p1）与 δ=0.5/1 cohort 终审记录见研究库历史口径；
+-- uni 原始计数不衰减，存储 user_bigram.tsv 与 #n=N 头行不变。
 _G.user_unigram_term = function(x)
     bigram_load()
-    local p1 = ((_G.user_uni[x] or 0) + 1)
-        / ((_G.user_nseen or 0) + BIGRAM_VCAP)
-    return math.log(p1)
+    return math.log(((_G.user_uni[x] or 0) + 1))
 end
 
 local function find_overlap(prev, curr)
