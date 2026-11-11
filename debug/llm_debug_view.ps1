@@ -99,11 +99,11 @@ $Y_STATUS = 8;  $H_STATUS = 22
 $Y_INFO   = 34; $H_INFO = 20
 $Y_CTX    = 58; $H_CTX = 42
 $Y_GRID   = 104; $H_GRID = 314
-$X_GRID   = 8;   $W_GRID = 1034
-$X_HIST   = 1050; $W_HIST = 204
+$X_GRID   = 8;   $W_GRID = 914
+$X_HIST   = 930; $W_HIST = 204
 $Y_EVT    = 426; $H_EVT = 96
 $Y_FOOT   = 528       # 数据源一行灰注（公式行已删——公式体现在分数格内）
-$CW = 1266      # ClientSize 宽（= X_HIST + W_HIST + 12）
+$CW = 1146      # ClientSize 宽（= X_HIST + W_HIST + 12）
 $CH = 548       # ClientSize 高
 
 $form = [System.Windows.Forms.Form]::new()
@@ -128,11 +128,11 @@ $lblStatus = New-Lbl 8 $Y_STATUS 700 $H_STATUS
 $lblStatus.Text = '等待连接…（先在方案开启 llm_rerank/debug_fusion 并重新部署，然后打字）'
 $lblStatus.ForeColor = [System.Drawing.Color]::DimGray
 
-$lblInfo = New-Lbl 8 $Y_INFO 1246 $H_INFO
+$lblInfo = New-Lbl 8 $Y_INFO 1126 $H_INFO
 $lblInfo.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $lblInfo.Text = '—'
 
-$lblCtx = New-Lbl 8 $Y_CTX 1246 $H_CTX
+$lblCtx = New-Lbl 8 $Y_CTX 1126 $H_CTX
 $lblCtx.Text = '上文：—'
 
 $btnPause = [System.Windows.Forms.Button]::new()
@@ -181,7 +181,7 @@ $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridVie
 # 总分置前 = 纯分值（三项已各自带过程，不重复连加式）
 $cols = @(
   @('#', 26), @('词', 64), @('总分', 76), @('CE', 362), @('衰减词频分', 172),
-  @('累计词频', 260), @('满', 26), @('窗', 30))
+  @('累计词频', 140), @('满', 26), @('窗', 30))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
   $grid.Columns[$i].Width = $c[1]
@@ -196,13 +196,13 @@ $form.Controls.Add($hist)
 
 $evt = [System.Windows.Forms.ListBox]::new()
 $evt.Location = [System.Drawing.Point]::new(8, $Y_EVT)
-$evt.Size = [System.Drawing.Size]::new(1246, $H_EVT)
+$evt.Size = [System.Drawing.Size]::new(1126, $H_EVT)
 $evt.HorizontalScrollbar = $true
 $form.Controls.Add($evt)
 
 # 公式行/列义行已删（2026-11-11 用户定案：计算过程直接写在分数格里，
 # 无需再对照底部公式）；只剩数据源一行灰注
-$lblFoot = New-Lbl 8 $Y_FOOT 1246 16
+$lblFoot = New-Lbl 8 $Y_FOOT 1126 16
 $lblFoot.ForeColor = [System.Drawing.Color]::Gray
 $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', 8)
 $lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码命中'
@@ -242,7 +242,7 @@ function Update-Current {
   foreach ($r in $inv.rows) {
     [void]$script:grid.Rows.Add(($i + 1), $r.word, (Get-FusedProc $r $wFuL),
       (Get-CeProc $r $wCeL $wCeC), (Get-FbProc $r $wFbL $wFbE),
-      (Get-U1Proc $r $inv $wU1L $wUni), $r.full, $r.win)
+      (Get-U1Proc $r $wU1L $wUni), $r.full, $r.win)
     if ($r.win -eq '0') {
       $script:grid.Rows[$i].DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gray
     }
@@ -287,26 +287,26 @@ function Get-CeProc($r, $wL, $wC) {
   return $t + ')'
 }
 
-# 衰减词频分格：β·log(1+eff)，β=12 内置常数；$wL=分数宽 $wE=eff 宽
+# 衰减词频分格：β·ln(1+eff)，β=12 内置常数（log/ln = 自然对数）；
+# $wL=分数宽 $wE=eff 宽
 function Get-FbProc($r, $wL, $wE) {
   $fb = Get-Num $r.fb
   if ($null -eq $fb) { return '—' }
   $lead = Pad-L (Format-F3 $fb) $wL
   $eff = Get-Num $r.eff
   if ($null -eq $eff) { return $lead }
-  return $lead + '=12·log(1+' + (Pad-L ('{0:F2}' -f $eff) $wE) + ')'
+  return $lead + '=12·ln(1+' + (Pad-L ('{0:F2}' -f $eff) $wE) + ')'
 }
 
-# 累计词频格：log((uni+1)/(n_seen+20000))，平滑量在格里可见；
+# 累计词频格：ln(uni+1)（2026-11-11 公式简化，分母为窗内常数已去除）；
 # $wL=分数宽 $wU=累计次数（整数）宽
-function Get-U1Proc($r, $inv, $wL, $wU) {
+function Get-U1Proc($r, $wL, $wU) {
   $u1 = Get-Num $r.u1
   if ($null -eq $u1) { return '—' }
   $lead = Pad-L (Format-F3 $u1) $wL
   $uni = Get-Num $r.uni
-  $nseen = Get-Num $inv.nseen
-  if ($null -eq $uni -or $null -eq $nseen) { return $lead }
-  return $lead + ('=log(({0}+1)/({1}+20000))' -f (Pad-L ([string][int]$uni) $wU), [int]$nseen)
+  if ($null -eq $uni) { return $lead }
+  return $lead + ('=ln({0}+1)' -f (Pad-L ([string][int]$uni) $wU))
 }
 
 # 总分格：融合分值（三项已各自带过程，不重复连加式；$wL=分数宽）
