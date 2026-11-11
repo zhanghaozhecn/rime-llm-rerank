@@ -18,7 +18,7 @@
                                                        full=两码整句满长 cerank=CE 序名次
                                                        fin=最终位置 win=1 层2窗内/0 尾窗透传
                                                        ce1/2/3=各分位原始 CE（未乘权重）
-                                                       fb=β·log1p(eff) u1=log(p1)
+                                                       fb=β·log1p(eff) u1=ln(uni+1)
    S|HH:MM:SS|reason|input|src                        跳过原因：pattern/ctx_empty/
                                                        not_ready/ctx_short/scores_nil/
                                                        score_failed/few_candidates
@@ -99,11 +99,11 @@ $Y_STATUS = 8;  $H_STATUS = 22
 $Y_INFO   = 34; $H_INFO = 20
 $Y_CTX    = 58; $H_CTX = 42
 $Y_GRID   = 104; $H_GRID = 314
-$X_GRID   = 8;   $W_GRID = 914
-$X_HIST   = 930; $W_HIST = 204
+$X_GRID   = 8;   $W_GRID = 836
+$X_HIST   = 852; $W_HIST = 204
 $Y_EVT    = 426; $H_EVT = 96
 $Y_FOOT   = 528       # 数据源一行灰注（公式行已删——公式体现在分数格内）
-$CW = 1146      # ClientSize 宽（= X_HIST + W_HIST + 12）
+$CW = 1068      # ClientSize 宽（= X_HIST + W_HIST + 12）
 $CH = 548       # ClientSize 高
 
 $form = [System.Windows.Forms.Form]::new()
@@ -128,11 +128,11 @@ $lblStatus = New-Lbl 8 $Y_STATUS 700 $H_STATUS
 $lblStatus.Text = '等待连接…（先在方案开启 llm_rerank/debug_fusion 并重新部署，然后打字）'
 $lblStatus.ForeColor = [System.Drawing.Color]::DimGray
 
-$lblInfo = New-Lbl 8 $Y_INFO 1126 $H_INFO
+$lblInfo = New-Lbl 8 $Y_INFO 1048 $H_INFO
 $lblInfo.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $lblInfo.Text = '—'
 
-$lblCtx = New-Lbl 8 $Y_CTX 1126 $H_CTX
+$lblCtx = New-Lbl 8 $Y_CTX 1048 $H_CTX
 $lblCtx.Text = '上文：—'
 
 $btnPause = [System.Windows.Forms.Button]::new()
@@ -180,8 +180,8 @@ $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridVie
 # 列宽与源码版 WeaselLLMDebug 同值（GDI 实测取宽 + 对齐补空格的余量）；
 # 总分置前 = 纯分值（三项已各自带过程，不重复连加式）
 $cols = @(
-  @('#', 26), @('词', 64), @('总分', 76), @('CE', 362), @('衰减词频分', 172),
-  @('累计词频', 140), @('满', 26), @('窗', 30))
+  @('#', 26), @('词', 64), @('总分', 64), @('CE', 310), @('衰减词频分', 140),
+  @('累计词频分', 112), @('匹配词长', 72), @('窗', 30))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
   $grid.Columns[$i].Width = $c[1]
@@ -196,13 +196,13 @@ $form.Controls.Add($hist)
 
 $evt = [System.Windows.Forms.ListBox]::new()
 $evt.Location = [System.Drawing.Point]::new(8, $Y_EVT)
-$evt.Size = [System.Drawing.Size]::new(1126, $H_EVT)
+$evt.Size = [System.Drawing.Size]::new(1048, $H_EVT)
 $evt.HorizontalScrollbar = $true
 $form.Controls.Add($evt)
 
 # 公式行/列义行已删（2026-11-11 用户定案：计算过程直接写在分数格里，
 # 无需再对照底部公式）；只剩数据源一行灰注
-$lblFoot = New-Lbl 8 $Y_FOOT 1126 16
+$lblFoot = New-Lbl 8 $Y_FOOT 1048 16
 $lblFoot.ForeColor = [System.Drawing.Color]::Gray
 $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', 8)
 $lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码命中'
@@ -228,15 +228,15 @@ function Update-Current {
   # 右对齐（补空格）——等宽字体下小数点逐位对齐，整数部分位数不同不再错位
   $wCeL = 0; $wCeC = 0; $wFbL = 0; $wFbE = 0; $wU1L = 0; $wUni = 0; $wFuL = 0
   foreach ($r in $inv.rows) {
-    $v = Get-Num $r.ce;   if ($null -ne $v) { $wCeL = [Math]::Max($wCeL, (Format-F3 $v).Length) }
+    $v = Get-Num $r.ce;   if ($null -ne $v) { $wCeL = [Math]::Max($wCeL, (Format-F1 $v).Length) }
     foreach ($raw in @($r.ce1, $r.ce2, $r.ce3)) {
-      $v = Get-Num $raw;  if ($null -ne $v) { $wCeC = [Math]::Max($wCeC, (Format-F3 $v).Length) }
+      $v = Get-Num $raw;  if ($null -ne $v) { $wCeC = [Math]::Max($wCeC, (Format-F1 $v).Length) }
     }
-    $v = Get-Num $r.fb;   if ($null -ne $v) { $wFbL = [Math]::Max($wFbL, (Format-F3 $v).Length) }
-    $v = Get-Num $r.eff;  if ($null -ne $v) { $wFbE = [Math]::Max($wFbE, ('{0:F2}' -f $v).Length) }
-    $v = Get-Num $r.u1;   if ($null -ne $v) { $wU1L = [Math]::Max($wU1L, (Format-F3 $v).Length) }
+    $v = Get-Num $r.fb;   if ($null -ne $v) { $wFbL = [Math]::Max($wFbL, (Format-F1 $v).Length) }
+    $v = Get-Num $r.eff;  if ($null -ne $v) { $wFbE = [Math]::Max($wFbE, (Format-F1 $v).Length) }
+    $v = Get-Num $r.u1;   if ($null -ne $v) { $wU1L = [Math]::Max($wU1L, (Format-F1 $v).Length) }
     $v = Get-Num $r.uni;  if ($null -ne $v) { $wUni = [Math]::Max($wUni, ([string][int]$v).Length) }
-    $v = Get-Num $r.fused; if ($null -ne $v) { $wFuL = [Math]::Max($wFuL, (Format-F3 $v).Length) }
+    $v = Get-Num $r.fused; if ($null -ne $v) { $wFuL = [Math]::Max($wFuL, (Format-F1 $v).Length) }
   }
   $i = 0
   foreach ($r in $inv.rows) {
@@ -260,7 +260,7 @@ function Get-Num([string]$s) {
   if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return $null }
   return $d
 }
-function Format-F3([double]$v) { return '{0:F3}' -f $v }
+function Format-F1([double]$v) { return '{0:F1}' -f $v }
 # 左补空格到指定宽（右对齐）：小数位数一致时小数点即逐位对齐
 function Pad-L([string]$s, [int]$w) {
   if ($s.Length -ge $w) { return $s }
@@ -269,18 +269,19 @@ function Pad-L([string]$s, [int]$w) {
 
 # CE 格：加权 CE 与其三分量。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
 # 交叉熵、正值；分值取负号进融合），故等号右为带负号的括号和。
+# 权重 1.00/1.05/0.45 = 标定常数，原样显示不四舍五入；数据浮点统一 1 位小数。
 # $wL = 分数列内最宽值宽，$wC = 三分量列内最宽值宽
 function Get-CeProc($r, $wL, $wC) {
   $ce = Get-Num $r.ce
   if ($null -eq $ce) { return '—' }
-  $lead = Pad-L (Format-F3 $ce) $wL
+  $lead = Pad-L (Format-F1 $ce) $wL
   $t = $lead + '=-('
   $any = $false
   foreach ($pair in @(@('1.00', $r.ce1), @('1.05', $r.ce2), @('0.45', $r.ce3))) {
     $v = Get-Num $pair[1]
     if ($null -eq $v) { continue }
     if ($any) { $t += '+' }
-    $t += $pair[0] + '·' + (Pad-L (Format-F3 $v) $wC)
+    $t += $pair[0] + '·' + (Pad-L (Format-F1 $v) $wC)
     $any = $true
   }
   if (-not $any) { return $lead }
@@ -292,28 +293,28 @@ function Get-CeProc($r, $wL, $wC) {
 function Get-FbProc($r, $wL, $wE) {
   $fb = Get-Num $r.fb
   if ($null -eq $fb) { return '—' }
-  $lead = Pad-L (Format-F3 $fb) $wL
+  $lead = Pad-L (Format-F1 $fb) $wL
   $eff = Get-Num $r.eff
   if ($null -eq $eff) { return $lead }
-  return $lead + '=12·ln(1+' + (Pad-L ('{0:F2}' -f $eff) $wE) + ')'
+  return $lead + '=12·ln(1+' + (Pad-L (Format-F1 $eff) $wE) + ')'
 }
 
-# 累计词频格：ln(uni+1)（2026-11-11 公式简化，分母为窗内常数已去除）；
-# $wL=分数宽 $wU=累计次数（整数）宽
+# 累计词频分格：ln(1+uni)（与衰减词频分格统一 1 在前；2026-11-11 公式
+# 简化，分母为窗内常数已去除）；$wL=分数宽 $wU=累计次数（整数）宽
 function Get-U1Proc($r, $wL, $wU) {
   $u1 = Get-Num $r.u1
   if ($null -eq $u1) { return '—' }
-  $lead = Pad-L (Format-F3 $u1) $wL
+  $lead = Pad-L (Format-F1 $u1) $wL
   $uni = Get-Num $r.uni
   if ($null -eq $uni) { return $lead }
-  return $lead + ('=ln({0}+1)' -f (Pad-L ([string][int]$uni) $wU))
+  return $lead + ('=ln(1+{0})' -f (Pad-L ([string][int]$uni) $wU))
 }
 
 # 总分格：融合分值（三项已各自带过程，不重复连加式；$wL=分数宽）
 function Get-FusedProc($r, $wL) {
   $fu = Get-Num $r.fused
   if ($null -eq $fu) { return '—' }
-  return Pad-L (Format-F3 $fu) $wL
+  return Pad-L (Format-F1 $fu) $wL
 }
 
 function Add-Event {
