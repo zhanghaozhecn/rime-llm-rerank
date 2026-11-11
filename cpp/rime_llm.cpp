@@ -32,6 +32,7 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
+#include <array>
 #include <cstring>
 #include <cstdarg>
 #include <cstdlib>
@@ -83,6 +84,8 @@ static std::atomic<bool>    g_loaded{false};
 static std::atomic<bool>    g_loading{false};
 static std::vector<double>      g_last_scores;
 static std::vector<std::string> g_last_cands;
+static std::vector<std::array<double, 3>> g_last_ce3;  // 与 g_last_cands 对齐的 CE 三分量（调试 get_ce3）
+static bool                     g_last_prep_hit = false;  // 上次 score 的预解码命中（调试）
 
 // ============================================================
 // 预解码状态：prepare() 在 commit 后异步执行 Step 1 + KV copy
@@ -1070,8 +1073,13 @@ static double ce_target(const float * logits, int target_id, float m, double lse
 // ============================================================
 static void score_batch(const std::vector<llama_token> & ctx_ids,
                          const std::vector<std::vector<llama_token>> & cands,
-                         std::vector<double> & scores_out) {
+                         std::vector<double> & scores_out,
+                         std::vector<std::array<double, 3>> * ce3_out = nullptr,
+                         bool * prep_hit_out = nullptr) {
     scores_out.assign(cands.size(), -1e10);
+    if (ce3_out)  // 三分量初值 NaN（缺 token / 失败位 → 调试端显示空）
+        ce3_out->assign(cands.size(), {NAN, NAN, NAN});
+    if (prep_hit_out) *prep_hit_out = false;
     int n_cands = (int)cands.size();
     if (n_cands == 0) return;
 
@@ -1096,6 +1104,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     // 检测预解码状态：ctx 完全匹配 且 seq0 未被其他 decode 覆盖 → 跳过 Step 1
     // 代次匹配防止: 完整流程 score 覆盖 seq0 后, 旧 prep 状态被误用 (KV 与 logits 不一致)
     bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen;
+    if (prep_hit_out) *prep_hit_out = use_prep;
     const float * ctx_logits = nullptr;  // 直接指向 prep 存储，免全量 vector 拷贝
     float m0 = 0;
     double lse0 = 0;
@@ -1148,7 +1157,9 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     auto ts_ce1_0 = std::chrono::high_resolution_clock::now();
     std::vector<double> ce_sum(n_cands, 0);
     for (int i = 0; i < n_cands; i++) {
-        ce_sum[i] = kCeW1 * ce_target(ctx_logits, cands[i][0], m0, lse0);
+        double c1 = ce_target(ctx_logits, cands[i][0], m0, lse0);
+        ce_sum[i] = kCeW1 * c1;
+        if (ce3_out) (*ce3_out)[i][0] = c1;  // 原始分量（未乘权重，调试展开用）
     }
     auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
     double ms_ce1 =
@@ -1214,12 +1225,20 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         if (step2_ok) {
             for (int u = 0; u < U; u++) {
                 float* l = llama_get_logits_ith(g_ctx, u);
-                if (!l) { for (int ci : r2_cands[u]) ce_sum[ci] = -1e10; continue; }
-                for (int ci : r2_cands[u])
-                    ce_sum[ci] += kCeW2 * cross_entropy(l, vs, cands[ci][1]);
+                if (!l) {
+                    for (int ci : r2_cands[u]) ce_sum[ci] = -1e10;
+                    if (ce3_out) for (int ci : r2_cands[u]) (*ce3_out)[ci] = {NAN, NAN, NAN};
+                    continue;
+                }
+                for (int ci : r2_cands[u]) {
+                    double c2 = cross_entropy(l, vs, cands[ci][1]);
+                    ce_sum[ci] += kCeW2 * c2;
+                    if (ce3_out) (*ce3_out)[ci][1] = c2;
+                }
             }
         } else {
             for (int ci : idx2) ce_sum[ci] = -1e10;
+            if (ce3_out) for (int ci : idx2) (*ce3_out)[ci] = {NAN, NAN, NAN};
             log_msg("WARN: step2 decode failed");
             // 失败自愈：prep 命中路径无 memory_clear，decode 失败多为 KV 耗尽
             // （见下方 worker 清理说明）——置无效强制下次 score 走全流程重建
@@ -1265,13 +1284,23 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         if (llama_decode(g_ctx, b3) == 0) {
             for (int v = 0; v < V; v++) {
                 float* l = llama_get_logits_ith(g_ctx, v);
-                if (!l) { for (int ci : rows3[v].cands) ce_sum[ci] = -1e10; continue; }
-                for (int ci : rows3[v].cands)
-                    ce_sum[ci] += kCeW3 * cross_entropy(l, vs, cands[ci][2]);
+                if (!l) {
+                    for (int ci : rows3[v].cands) ce_sum[ci] = -1e10;
+                    if (ce3_out) for (int ci : rows3[v].cands) (*ce3_out)[ci] = {NAN, NAN, NAN};
+                    continue;
+                }
+                for (int ci : rows3[v].cands) {
+                    double c3 = cross_entropy(l, vs, cands[ci][2]);
+                    ce_sum[ci] += kCeW3 * c3;
+                    if (ce3_out) (*ce3_out)[ci][2] = c3;
+                }
             }
         } else {
             for (auto& r : rows3)
                 for (int ci : r.cands) ce_sum[ci] = -1e10;
+            if (ce3_out)
+                for (auto& r : rows3)
+                    for (int ci : r.cands) (*ce3_out)[ci] = {NAN, NAN, NAN};
             log_msg("WARN: step3 decode failed");
             g_prep_ready = false;  // 同 Step2：失败自愈
         }
@@ -1282,6 +1311,9 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         // step2 失败：idx3 候选直接置哨兵（旧实现跟随一次必败 decode，结果相同）
         for (auto& r : rows3)
             for (int ci : r.cands) ce_sum[ci] = -1e10;
+        if (ce3_out)
+            for (auto& r : rows3)
+                for (int ci : r.cands) (*ce3_out)[ci] = {NAN, NAN, NAN};
     }
 
     // ---- worker 序列 KV 清理（2026-09-04 修"推理自停"根因，与源码版同步）----
@@ -1456,8 +1488,10 @@ static int lua_score(lua_State * L) {
     }
 
     std::vector<double> scores;
+    std::vector<std::array<double, 3>> ce3;
+    bool prep_hit = false;
     try {
-        score_batch(ctx_ids, cand_ids, scores);
+        score_batch(ctx_ids, cand_ids, scores, &ce3, &prep_hit);
     } catch (...) {
         log_msg("ERROR: exception in score_batch");
         lua_pushnil(L);
@@ -1472,6 +1506,8 @@ static int lua_score(lua_State * L) {
 
     g_last_scores = scores;
     g_last_cands  = cand_texts;
+    g_last_ce3    = ce3;
+    g_last_prep_hit = prep_hit;
 
     lua_newtable(L);
     for (int i = 0; i < (int)order.size(); i++) {
@@ -1486,6 +1522,25 @@ static int lua_get_scores(lua_State * L) {
     lua_newtable(L);
     for (size_t i = 0; i < g_last_cands.size(); i++) {
         lua_pushnumber(L, g_last_scores[i]);
+        lua_setfield(L, -2, g_last_cands[i].c_str());
+    }
+    return 1;
+}
+
+// 上次 score 的 CE 三分量（2026-11-11 调试窗口协议 v2）：text → {c1, c2, c3}
+// ——未乘 kCeW 权重的原始分量；缺 token / 评分失败位 = nil（lua 侧显示空）
+static int lua_get_ce3(lua_State * L) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    lua_newtable(L);
+    for (size_t i = 0; i < g_last_cands.size(); i++) {
+        const auto & t = g_last_ce3[i];
+        lua_createtable(L, 3, 0);
+        for (int k = 0; k < 3; k++) {
+            if (t[k] == t[k] && t[k] > -1e9) {   // NaN / 哨兵 → 不设（nil）
+                lua_pushnumber(L, t[k]);
+                lua_rawseti(L, -2, k + 1);
+            }
+        }
         lua_setfield(L, -2, g_last_cands[i].c_str());
     }
     return 1;
@@ -1638,6 +1693,8 @@ static int lua_index(lua_State * L) {
     const char * key = luaL_checkstring(L, 2);
     if (strcmp(key, "is_ready") == 0)       lua_pushcfunction(L, lua_is_ready);
     else if (strcmp(key, "get_scores") == 0) lua_pushcfunction(L, lua_get_scores);
+    else if (strcmp(key, "get_ce3") == 0)    lua_pushcfunction(L, lua_get_ce3);
+    else if (strcmp(key, "prep_hit") == 0)   lua_pushboolean(L, g_last_prep_hit ? 1 : 0);
     else if (strcmp(key, "score") == 0)     lua_pushcfunction(L, lua_score);
     else if (strcmp(key, "prepare") == 0)   lua_pushcfunction(L, lua_prepare);
     else if (strcmp(key, "llm_context") == 0)    lua_pushcfunction(L, lua_llm_context);

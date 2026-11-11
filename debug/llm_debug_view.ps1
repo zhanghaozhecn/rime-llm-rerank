@@ -94,12 +94,12 @@ $Y_STATUS = 8;  $H_STATUS = 22
 $Y_INFO   = 34; $H_INFO = 20
 $Y_CTX    = 58; $H_CTX = 42
 $Y_GRID   = 104; $H_GRID = 298
-$X_GRID   = 8;   $W_GRID = 548
-$X_HIST   = 564; $W_HIST = 208
-$Y_EVT    = 410; $H_EVT = 116
-$Y_FOOT   = 532
-$CW = 780       # ClientSize 宽（= X_HIST + W_HIST + 8）
-$CH = 554       # ClientSize 高
+$X_GRID   = 8;   $W_GRID = 560
+$X_HIST   = 576; $W_HIST = 196
+$Y_EVT    = 410; $H_EVT = 96
+$Y_FOOT   = 512       # 公式 / 列义 / 数据源 三行灰注（各 +16）
+$CW = 792       # ClientSize 宽（= X_HIST + W_HIST + 8）
+$CH = 576       # ClientSize 高（2026-11-11 加公式两行）
 
 $form = [System.Windows.Forms.Form]::new()
 $form.Text = 'LLM 实时调试 — rime-llm-rerank（插件版）'
@@ -167,11 +167,12 @@ $grid.SelectionMode = 'FullRowSelect'
 $grid.AutoSizeColumnsMode = 'None'
 # 列头禁换行 + 短文案：窄列两行表头会被默认行高裁掉下半行（2026-11-10 实测）
 $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::False
-# 列: # 词 CE 层1(s1) 频+(fb) u1+ 融合 满 序变(CE序→终) 窗内 —— eff 原始值
-# 不进协议，词频证据看 频+（β·log1p(eff)）与 层1（s1=频+u1）两列
+# 列（2026-11-11 协议 v2）：频两项 = 原始值（衰减频 = eff 衰减计数、
+# 累计频 = 累计 unigram 原始计数，都未乘系数）；CE 列加宽容纳展开的
+# CE1/CE2/CE3（点 CE 单元格切换，默认不展开）
 $cols = @(
-  @('#', 24), @('词', 58), @('CE', 62), @('层1', 56), @('频+', 56),
-  @('u1+', 56), @('融合', 62), @('满', 34), @('序变', 44), @('窗内', 44))
+  @('#', 24), @('词', 58), @('CE', 126), @('层1', 56), @('衰减频', 56),
+  @('累计频', 54), @('融合', 64), @('满', 28), @('序变', 48), @('窗内', 46))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
   $grid.Columns[$i].Width = $c[1]
@@ -190,10 +191,22 @@ $evt.Size = [System.Drawing.Size]::new(764, $H_EVT)
 $evt.HorizontalScrollbar = $true
 $form.Controls.Add($evt)
 
-$lblFoot = New-Lbl 8 $Y_FOOT 764 16
+# 公式与列义两行灰注（2026-11-11 用户定案：空白处显示融合公式 + 层1/满/
+# 展开说明；点 CE 格展开 CE1/2/3，默认不展开）
+$lblFx = New-Lbl 8 $Y_FOOT 764 16
+$lblFx.ForeColor = [System.Drawing.Color]::Gray
+$lblFx.Font = [System.Drawing.Font]::new('Segoe UI', 8)
+$lblFx.Text = '融合分 = CE + β·log(1+衰减频) + log(p1)，β=12；p1=(累计频+1)/(全词数+2万)；层1 = β·log(1+衰减频)+log(p1)'
+
+$lblLeg = New-Lbl 8 ($Y_FOOT + 16) 764 16
+$lblLeg.ForeColor = [System.Drawing.Color]::Gray
+$lblLeg.Font = [System.Drawing.Font]::new('Segoe UI', 8)
+$lblLeg.Text = '层1 = 词频预排分（全体候选按层1降序取前5进 LLM 评分）；满 = 两码整句满长组；窗内=0 = 层1尾窗未进 LLM（灰字）；点 CE 格展开 CE1/2/3'
+
+$lblFoot = New-Lbl 8 ($Y_FOOT + 32) 764 16
 $lblFoot.ForeColor = [System.Drawing.Color]::Gray
 $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', 8)
-$lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 窗内=0 行 = 层1 尾窗透传（灰字）'
+$lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 评缓=评分缓存，预解=上文 KV 预解码'
 
 # ── 显示更新 ─────────────────────────────────────────────────────────────
 function Update-Current {
@@ -204,20 +217,43 @@ function Update-Current {
     return
   }
   $inv = $script:invList[$script:viewIdx]
-  $script:lblInfo.Text = ('{0}  输入 {1}   缓存 {2}   {3}ms   tick {4}   就绪 {5}   n={6}   来源 {7}' -f
-    $inv.t, $inv.input, $inv.cache, $inv.ms, $inv.tick, $inv.ready, $inv.n, $inv.src)
+  $script:lblInfo.Text = ('{0}  输入 {1}   评缓 {2}   预解 {3}   {4}ms   tick {5}   就绪 {6}   n={7}   来源 {8}' -f
+    $inv.t, $inv.input, $inv.cache,
+    $(if ($inv.prep) { $inv.prep } else { '-' }),
+    $inv.ms, $inv.tick, $inv.ready, $inv.n, $inv.src)
   $script:lblCtx.Text = '上文：' + $(if ($inv.ctx) { $inv.ctx } else { '（空）' })
   $script:grid.Rows.Clear()
   $i = 0
   foreach ($r in $inv.rows) {
-    [void]$script:grid.Rows.Add(($i + 1), $r.word,
-      $(if ($r.ce) { $r.ce } else { '·' }), $r.s1, $r.fb, $r.u1, $r.fused,
+    [void]$script:grid.Rows.Add(($i + 1), $r.word, (Get-CeText $r), $r.s1,
+      $r.eff, $r.uni, $r.fused,
       $r.full, ($r.cerank + '→' + $r.fin), $r.win)
     if ($r.win -eq '0') {
       $script:grid.Rows[$i].DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gray
     }
     $i++
   }
+}
+
+# CE 单元格文本：收起 = CE 值（或 ·）；展开 = CE1/CE2/CE3 原始分量
+#（未乘 kCeW 权重；缺分量位显示 ·）。展开态压成 2 位小数——3 位时三段
+# 放不进列宽（2026-11-11 实测截断）
+function Format-CeShort {
+  param($v)
+  if (-not $v) { return '·' }
+  $s = [string]$v
+  $dot = $s.IndexOf('.')
+  if ($dot -lt 0 -or $dot + 2 -ge $s.Length) { return $s }
+  return $s.Substring(0, $dot + 3)
+}
+function Get-CeText {
+  param($r)
+  $has = ($r.ce1 -or $r.ce2 -or $r.ce3)
+  if (-not $r.ceExpanded -or -not $has) {
+    if ($r.ce) { return $r.ce } else { return '·' }
+  }
+  return ((Format-CeShort $r.ce1) + '/' + (Format-CeShort $r.ce2) + '/' +
+          (Format-CeShort $r.ce3))
 }
 
 function Add-Event {
@@ -275,7 +311,9 @@ function Handle-Line {
       if ($f.Count -lt 10) { return }
       $inv = @{ t = $f[1]; input = $f[2]; cache = $f[3]; src = $f[4]
                 ctx = $f[5]; tick = $f[6]; ms = $f[7]; ready = $f[8]
-                n = $f[9]; rows = [System.Collections.Generic.List[object]]::new() }
+                n = $f[9]
+                prep = $(if ($f.Count -gt 10) { $f[10] } else { '' })
+                rows = [System.Collections.Generic.List[object]]::new() }
       $script:invList.Add($inv)
       while ($script:invList.Count -gt 50) { $script:invList.RemoveAt(0) }
       $script:viewIdx = $script:invList.Count - 1
@@ -289,9 +327,15 @@ function Handle-Line {
       if ($f.Count -lt 12) { return }
       if ($script:invList.Count -eq 0) { return }
       $inv = $script:invList[$script:invList.Count - 1]
+      # 协议 v2：第 5/6 字段 = 衰减频(eff)/累计频(uni) 原始值；12/13/14 =
+      # CE 三分量原始值（旧服务端只有 12 个字段 → 三分量为空，退化为旧显示）
       $inv.rows.Add(@{ eng = $f[1]; word = $f[2]; s1 = $f[3]; ce = $f[4]
-                       fb = $f[5]; u1 = $f[6]; fused = $f[7]; full = $f[8]
-                       cerank = $f[9]; fin = $f[10]; win = $f[11] })
+                       eff = $f[5]; uni = $f[6]; fused = $f[7]; full = $f[8]
+                       cerank = $f[9]; fin = $f[10]; win = $f[11]
+                       ce1 = $(if ($f.Count -gt 12) { $f[12] } else { '' })
+                       ce2 = $(if ($f.Count -gt 13) { $f[13] } else { '' })
+                       ce3 = $(if ($f.Count -gt 14) { $f[14] } else { '' })
+                       ceExpanded = $false })
       if (-not $script:paused -and $script:viewIdx -eq ($script:invList.Count - 1)) {
         Update-Current
       }
@@ -343,6 +387,20 @@ $hist.Add_SelectedIndexChanged({
     if ($script:viewIdx -lt 0) { $script:viewIdx = 0 }
     if ($script:viewIdx -ge $script:invList.Count) { $script:viewIdx = $script:invList.Count - 1 }
     Update-Current
+  }
+})
+# CE 单元格点击 → 展开/收起 CE1/CE2/CE3（2026-11-11 用户定案：默认不展开）。
+# 只改该单元格，不整表重建（保持选择与滚动位置）。
+$grid.Add_CellClick({
+  param($s, $e)
+  if ($e.ColumnIndex -eq 2 -and $e.RowIndex -ge 0 -and
+      $script:viewIdx -ge 0 -and $script:viewIdx -lt $script:invList.Count) {
+    $rows = $script:invList[$script:viewIdx].rows
+    if ($e.RowIndex -lt $rows.Count) {
+      $r = $rows[$e.RowIndex]
+      $r.ceExpanded = -not $r.ceExpanded
+      $s.Rows[$e.RowIndex].Cells[2].Value = Get-CeText $r
+    }
   }
 })
 

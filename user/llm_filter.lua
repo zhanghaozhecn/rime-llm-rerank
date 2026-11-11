@@ -367,6 +367,13 @@ return function(translation, env)
         local fused_scores = nil
         if #ordered > 1 and scores then
             local freq_eff = _G.user_freq_eff
+            -- CE 三分量（2026-11-11 协议 v2）：get_ce3 = text → {c1,c2,c3}
+            -- 原始分量（未乘权重）；旧 DLL 无此函数时静默缺省
+            local ce3map = nil
+            if llm.get_ce3 then
+                local okc, m = pcall(llm.get_ce3)
+                if okc and type(m) == "table" then ce3map = m end
+            end
             fused_scores = {}
             local arr = {}
             for i, c in ipairs(ordered) do
@@ -382,6 +389,9 @@ return function(translation, env)
                         dbg[c.text] = { ce = s, eff = n,
                                         fb = FREQ_BETA * math.log(1 + n),
                                         u1 = u1_term,
+                                        uni = _G.user_uni and
+                                              _G.user_uni[c.text] or 0,
+                                        ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = t, cerank = i }
                     end
                 else
@@ -392,6 +402,9 @@ return function(translation, env)
                     arr[i] = { c = c, t = s1 or -math.huge, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = 0, fb = 0,
+                                        uni = _G.user_uni and
+                                              _G.user_uni[c.text] or 0,
+                                        ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = s1 or -1 / 0, cerank = i,
                                         invalid = true }
                     end
@@ -435,14 +448,23 @@ return function(translation, env)
             local all_rank = {}
             for i, c in ipairs(all) do all_rank[c.text] = i end
 
-            -- 实时调试（2026-11-10）：L 头行（完整上文，不截断）+ 逐候选
-            -- C 行（含层1 透传尾窗，上限 20 行；win=1 层2窗内/0 尾窗透传，
-            -- ce 空串=无 CE 分，fin=最终输出位置）。与 debug.txt 人类格式
-            -- 互补，供查看器（debug\llm_debug_view.ps1）渲染。
-            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d",
+            -- 实时调试（2026-11-10；2026-11-11 协议 v2：频两项改发原始值
+            -- eff/uni——"显示未乘系数的数字"，尾接 CE 三分量 ce1/ce2/ce3
+            -- （未乘 kCeW 权重，查看器点击 CE 单元格展开）；L 尾加 prep=预解码命中）：
+            -- L 头行（完整上文，不截断）+ 逐候选 C 行（含层1 透传尾窗，上限
+            -- 20 行；win=1 层2窗内/0 尾窗透传，ce 空串=无 CE 分，fin=最终
+            -- 输出位置）。与 debug.txt 人类格式互补，供查看器渲染。
+            local prep = "0"
+            if dbg_cache == "HIT" then
+                prep = "1"  -- 评分缓存命中 = 整段推理热路径
+            else
+                local okp, ph = pcall(function() return llm.prep_hit end)
+                prep = (okp and ph) and "1" or "0"
+            end
+            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s",
                 os.date("%H:%M:%S"), live_esc(input), dbg_cache,
                 live_esc(ctx_src), live_esc(context),
-                tostring(_G.user_freq_tick), ev_ms, live_ready, #cands))
+                tostring(_G.user_freq_tick), ev_ms, live_ready, #cands, prep))
             local winset = {}
             for _, w in ipairs(l1win) do winset[w] = true end
             local emitted = 0
@@ -450,16 +472,20 @@ return function(translation, env)
                 if emitted >= 20 then return end
                 emitted = emitted + 1
                 local d = dbg[c.text]
+                local d3 = d and d.ce3
                 live(table.concat({
                     "C", tostring(all_rank[c.text] or 0), live_esc(c.text),
                     live_fmt3(s1_of[c.text]),
                     (d and d.ce and d.ce > -1e9) and live_fmt3(d.ce) or "",
-                    d and live_fmt3(d.fb) or "",
-                    d and live_fmt3(d.u1) or "",
+                    d and live_fmt3(d.eff) or "",
+                    tostring(d and d.uni or 0),
                     d and live_fmt3(d.fused) or "",
                     (d and d.full) and "1" or "0",
                     tostring(d and d.cerank or 0),
-                    tostring(fin), winset[c.text] and "1" or "0"
+                    tostring(fin), winset[c.text] and "1" or "0",
+                    d3 and live_fmt3(d3[1]) or "",
+                    d3 and live_fmt3(d3[2]) or "",
+                    d3 and live_fmt3(d3[3]) or ""
                 }, "|"))
             end
             for i, c in ipairs(ordered) do live_c(c, i) end
