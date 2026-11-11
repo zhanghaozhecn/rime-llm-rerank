@@ -9,11 +9,16 @@
    L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n      每次触发评分的调用头
                                                        （ctx=完整上文；cache=HIT 时 ms=0；
                                                         src ∈ tsf/com/uia/rime）
-   C|eng|word|s1|ce|fb|u1|fused|full|cerank|fin|win    逐候选按最终序（上限 20 行）：
-                                                       eng=引擎原序 s1=层1分 ce=CE 分（空=无分）
-                                                       fb=β·log1p(eff) u1=log(p1)
+   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1
+                                                       逐候选按最终序（上限 20 行）：
+                                                       eng=引擎原序 s1=层1分(=fb+u1)
+                                                       ce=加权 CE（空=无分）
+                                                       eff=衰减计数 uni=累计次数
+                                                       fused=融合分（无 CE 时 = fb+u1）
                                                        full=两码整句满长 cerank=CE 序名次
                                                        fin=最终位置 win=1 层2窗内/0 尾窗透传
+                                                       ce1/2/3=各分位原始 CE（未乘权重）
+                                                       fb=β·log1p(eff) u1=log(p1)
    S|HH:MM:SS|reason|input|src                        跳过原因：pattern/ctx_empty/
                                                        not_ready/ctx_short/scores_nil/
                                                        score_failed/few_candidates
@@ -93,13 +98,13 @@ $script:verInfo = ''
 $Y_STATUS = 8;  $H_STATUS = 22
 $Y_INFO   = 34; $H_INFO = 20
 $Y_CTX    = 58; $H_CTX = 42
-$Y_GRID   = 104; $H_GRID = 298
-$X_GRID   = 8;   $W_GRID = 728
-$X_HIST   = 744; $W_HIST = 204
-$Y_EVT    = 410; $H_EVT = 96
-$Y_FOOT   = 512       # 公式 / 列义 / 数据源 三行灰注（各 +16）
-$CW = 976       # ClientSize 宽（= X_HIST + W_HIST + 8）
-$CH = 576       # ClientSize 高（2026-11-11 加公式两行）
+$Y_GRID   = 104; $H_GRID = 314
+$X_GRID   = 8;   $W_GRID = 1158
+$X_HIST   = 1174; $W_HIST = 204
+$Y_EVT    = 426; $H_EVT = 96
+$Y_FOOT   = 528       # 数据源一行灰注（公式行已删——公式体现在分数格内）
+$CW = 1390      # ClientSize 宽（= X_HIST + W_HIST + 12）
+$CH = 548       # ClientSize 高
 
 $form = [System.Windows.Forms.Form]::new()
 $form.Text = 'LLM 实时调试 — rime-llm-rerank（插件版）'
@@ -123,11 +128,11 @@ $lblStatus = New-Lbl 8 $Y_STATUS 700 $H_STATUS
 $lblStatus.Text = '等待连接…（先在方案开启 llm_rerank/debug_fusion 并重新部署，然后打字）'
 $lblStatus.ForeColor = [System.Drawing.Color]::DimGray
 
-$lblInfo = New-Lbl 8 $Y_INFO 944 $H_INFO
+$lblInfo = New-Lbl 8 $Y_INFO 1370 $H_INFO
 $lblInfo.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $lblInfo.Text = '—'
 
-$lblCtx = New-Lbl 8 $Y_CTX 944 $H_CTX
+$lblCtx = New-Lbl 8 $Y_CTX 1370 $H_CTX
 $lblCtx.Text = '上文：—'
 
 $btnPause = [System.Windows.Forms.Button]::new()
@@ -156,6 +161,8 @@ $form.Controls.Add($btnClear)
 $grid = [System.Windows.Forms.DataGridView]::new()
 $grid.Location = [System.Drawing.Point]::new($X_GRID, $Y_GRID)
 $grid.Size = [System.Drawing.Size]::new($W_GRID, $H_GRID)
+# 等宽字体：分数格内"得分=计算过程"的各成分才能逐位对齐（2026-11-11 用户定案）
+$grid.Font = [System.Drawing.Font]::new('Consolas', 9)
 $grid.ReadOnly = $true
 $grid.AllowUserToAddRows = $false
 $grid.AllowUserToResizeRows = $false
@@ -167,15 +174,13 @@ $grid.SelectionMode = 'FullRowSelect'
 $grid.AutoSizeColumnsMode = 'None'
 # 列头禁换行 + 短文案：窄列两行表头会被默认行高裁掉下半行（2026-11-10 实测）
 $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::False
-# 列（2026-11-11 协议 v2）：频两项 = 原始值（衰减频 = eff 衰减计数、
-# 累计频 = 累计 unigram 原始计数，都未乘系数）；CE 列加宽容纳展开的
-# CE1/CE2/CE3（点 CE 单元格切换，默认不展开）
-# 方案 B / 计数-得分式命名（2026-11-11 用户定案）：CE 三子项常显；
-# 词频得分/累计得分 = 真正进融合的项，括号内是原始证据
+# 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
+# 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 3 位小数，
+# 等宽字体逐位对齐），公式不再单独展示；其余列只剩 身份(#/词) 与 状态(满/窗)
+# 列宽与源码版 WeaselLLMDebug 同值（GDI 实测取宽，含 3 位整数最坏情况）
 $cols = @(
-  @('#', 24), @('词', 58), @('C1/C2/C3', 128), @('CE和', 58),
-  @('词频得分', 88), @('累计得分', 88),
-  @('用户频分', 66), @('融合分', 62), @('满', 26), @('CE→终', 58), @('窗', 30))
+  @('#', 26), @('词', 64), @('CE', 330), @('衰减词频分', 172),
+  @('累计词频', 260), @('总分', 232), @('满', 26), @('窗', 30))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
   $grid.Columns[$i].Width = $c[1]
@@ -190,23 +195,13 @@ $form.Controls.Add($hist)
 
 $evt = [System.Windows.Forms.ListBox]::new()
 $evt.Location = [System.Drawing.Point]::new(8, $Y_EVT)
-$evt.Size = [System.Drawing.Size]::new(944, $H_EVT)
+$evt.Size = [System.Drawing.Size]::new(1370, $H_EVT)
 $evt.HorizontalScrollbar = $true
 $form.Controls.Add($evt)
 
-# 公式与列义两行灰注（2026-11-11 用户定案：空白处显示融合公式 + 层1/满/
-# 展开说明；点 CE 格展开 CE1/2/3，默认不展开）
-$lblFx = New-Lbl 8 $Y_FOOT 944 16
-$lblFx.ForeColor = [System.Drawing.Color]::Gray
-$lblFx.Font = [System.Drawing.Font]::new('Segoe UI', 8)
-$lblFx.Text = '融合分 = CE + 词频得分 + 累计得分；词频得分 = 12·log(1+衰减计数)；累计得分 = log((累计次数+1)/(全词数+2万))；用户频分 = 词频得分+累计得分'
-
-$lblLeg = New-Lbl 8 ($Y_FOOT + 16) 944 16
-$lblLeg.ForeColor = [System.Drawing.Color]::Gray
-$lblLeg.Font = [System.Drawing.Font]::new('Segoe UI', 8)
-$lblLeg.Text = '括号内为原始证据（衰减计数 / 累计次数）；用户频分 = 全体候选的预排分，按其降序取前5进 LLM；满 = 两码整句满长组；窗=0 = 尾窗未进 LLM（灰字）'
-
-$lblFoot = New-Lbl 8 ($Y_FOOT + 32) 944 16
+# 公式行/列义行已删（2026-11-11 用户定案：计算过程直接写在分数格里，
+# 无需再对照底部公式）；只剩数据源一行灰注
+$lblFoot = New-Lbl 8 $Y_FOOT 1370 16
 $lblFoot.ForeColor = [System.Drawing.Color]::Gray
 $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', 8)
 $lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码命中'
@@ -230,15 +225,9 @@ function Update-Current {
   $script:grid.Rows.Clear()
   $i = 0
   foreach ($r in $inv.rows) {
-    $fbTxt = $r.fb
-    if ($r.fb -and $r.eff) { $fbTxt = $r.fb + '(' + (Format-CeShort $r.eff) + ')' }
-    elseif (-not $r.fb -and $r.eff) { $fbTxt = Format-CeShort $r.eff }
-    $u1Txt = $r.u1
-    if ($r.u1 -and $r.uni) { $u1Txt = $r.u1 + '(' + $r.uni + ')' }
-    elseif (-not $r.u1 -and $r.uni) { $u1Txt = $r.uni }
-    [void]$script:grid.Rows.Add(($i + 1), $r.word, (Get-CeText $r),
-      $(if ($r.ce) { $r.ce } else { '·' }), $fbTxt, $u1Txt, $r.s1, $r.fused,
-      $r.full, ($r.cerank + '→' + $r.fin), $r.win)
+    [void]$script:grid.Rows.Add(($i + 1), $r.word, (Get-CeProc $r),
+      (Get-FbProc $r), (Get-U1Proc $r $inv), (Get-FusedProc $r),
+      $r.full, $r.win)
     if ($r.win -eq '0') {
       $script:grid.Rows[$i].DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gray
     }
@@ -246,22 +235,69 @@ function Update-Current {
   }
 }
 
-# CE 单元格文本：收起 = CE 值（或 ·）；展开 = CE1/CE2/CE3 原始分量
-#（未乘 kCeW 权重；缺分量位显示 ·）。展开态压成 2 位小数——3 位时三段
-# 放不进列宽（2026-11-11 实测截断）
-function Format-CeShort {
-  param($v)
-  if (-not $v) { return '·' }
-  $s = [string]$v
-  $dot = $s.IndexOf('.')
-  if ($dot -lt 0 -or $dot + 2 -ge $s.Length) { return $s }
-  return $s.Substring(0, $dot + 3)
+# ── 分数格 = "得分=计算过程"（2026-11-11 用户定案）─────────────────────────
+# 数值字段解析：空串/NaN/非数 → $null（生产端 live_num/live_fmt3 对无分发空串）
+function Get-Num([string]$s) {
+  if (-not $s) { return $null }
+  try {
+    $d = [double]::Parse($s, [System.Globalization.CultureInfo]::InvariantCulture)
+  } catch { return $null }
+  if ([double]::IsNaN($d) -or [double]::IsInfinity($d)) { return $null }
+  return $d
 }
-function Get-CeText {
-  param($r)
-  if (-not ($r.ce1 -or $r.ce2 -or $r.ce3)) { return '·' }
-  return ((Format-CeShort $r.ce1) + '/' + (Format-CeShort $r.ce2) + '/' +
-          (Format-CeShort $r.ce3))
+function Format-F3([double]$v) { return '{0:F3}' -f $v }
+
+# CE 格：加权 CE 与其三分量（1.00/1.05/0.45 = kCeW 位置权重，librime
+# v3 标定内置常数）；分量缺（无分/未参与）的连加项整项省略
+function Get-CeProc($r) {
+  $ce = Get-Num $r.ce
+  if ($null -eq $ce) { return '—' }
+  $t = (Format-F3 $ce) + '='
+  $any = $false
+  foreach ($pair in @(@('1.00', $r.ce1), @('1.05', $r.ce2), @('0.45', $r.ce3))) {
+    $v = Get-Num $pair[1]
+    if ($null -eq $v) { continue }
+    if ($any) { $t += '+' }
+    $t += $pair[0] + '·' + (Format-F3 $v)
+    $any = $true
+  }
+  if (-not $any) { return Format-F3 $ce }
+  return $t
+}
+
+# 衰减词频分格：β·log(1+eff)，β=12 内置常数
+function Get-FbProc($r) {
+  $fb = Get-Num $r.fb
+  if ($null -eq $fb) { return '—' }
+  $eff = Get-Num $r.eff
+  if ($null -eq $eff) { return Format-F3 $fb }
+  return (Format-F3 $fb) + '=12·log(1+' + ('{0:F2}' -f $eff) + ')'
+}
+
+# 累计词频格：log((uni+1)/(n_seen+20000))，平滑量在格里可见
+function Get-U1Proc($r, $inv) {
+  $u1 = Get-Num $r.u1
+  if ($null -eq $u1) { return '—' }
+  $uni = Get-Num $r.uni
+  $nseen = Get-Num $inv.nseen
+  if ($null -eq $uni -or $null -eq $nseen) { return Format-F3 $u1 }
+  return (Format-F3 $u1) + ('=log(({0}+1)/({1}+20000))' -f [int]$uni, [int]$nseen)
+}
+
+# 总分格：融合分 = 各现成分的带符号连加（无 CE 的回退行自然只剩两项）
+function Get-FusedProc($r) {
+  $fu = Get-Num $r.fused
+  if ($null -eq $fu) { return '—' }
+  $t = (Format-F3 $fu) + '='
+  $any = $false
+  foreach ($raw in @($r.ce, $r.fb, $r.u1)) {
+    $v = Get-Num $raw
+    if ($null -eq $v) { continue }
+    $t += if ($any) { '{0:+0.000;-0.000}' -f $v } else { Format-F3 $v }
+    $any = $true
+  }
+  if (-not $any) { return Format-F3 $fu }
+  return $t
 }
 
 function Add-Event {
@@ -399,20 +435,7 @@ $hist.Add_SelectedIndexChanged({
     Update-Current
   }
 })
-# CE 单元格点击 → 展开/收起 CE1/CE2/CE3（2026-11-11 用户定案：默认不展开）。
-# 只改该单元格，不整表重建（保持选择与滚动位置）。
-$grid.Add_CellClick({
-  param($s, $e)
-  if ($e.ColumnIndex -eq 2 -and $e.RowIndex -ge 0 -and
-      $script:viewIdx -ge 0 -and $script:viewIdx -lt $script:invList.Count) {
-    $rows = $script:invList[$script:viewIdx].rows
-    if ($e.RowIndex -lt $rows.Count) {
-      $r = $rows[$e.RowIndex]
-      $r.ceExpanded = -not $r.ceExpanded
-      $s.Rows[$e.RowIndex].Cells[2].Value = Get-CeText $r
-    }
-  }
-})
+# CE 子项 2026-11-11 起常驻 CE 格内（计算过程直显），点击展开交互已删
 
 # ── 后台 Runspace + UI Timer ─────────────────────────────────────────────
 $script:bg = [System.Management.Automation.PowerShell]::Create()
@@ -451,6 +474,8 @@ if ([Math]::Abs($script:DpiK - 1.0) -gt 0.001) {
   $form.Font = [System.Drawing.Font]::new('Segoe UI', [float](9 * $k))
   $lblInfo.Font = [System.Drawing.Font]::new('Segoe UI', [float](9 * $k), [System.Drawing.FontStyle]::Bold)
   $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', [float](8 * $k))
+  # 显式设过字体的控件要跟着缩（表单字体不覆盖它们）
+  $grid.Font = [System.Drawing.Font]::new('Consolas', [float](9 * $k))
   $form.Scale([System.Drawing.SizeF]::new($k, $k))
 }
 
