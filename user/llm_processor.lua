@@ -289,9 +289,7 @@ local function processor(key, env)
         local mp = sc:get_string("llm_rerank/model_path")
         if mp and mp ~= "" and llm_prep and llm_prep.model_path ~= mp then
             llm_prep.model_path = mp
-            -- 模型将卸载重载, 旧模型的评分缓存作废 (2026-09-04; 源码版
-            -- unload_model 清 s_cache 同理)——不清则同码重打期间继续用旧分
-            _G.llm_filter_cache = nil
+            -- 模型将卸载重载（评分结果缓存已于 2026-11-11 删除，无需清）
         end
     end
     -- 鼠标点击检测（2026-09-11 深夜用户定案：任何点击=光标可能移动→
@@ -358,8 +356,8 @@ local function processor(key, env)
         -- (librime lua 无法清 commit_history, 旧词留在引擎里;
         --  退格会被引擎清空 commit_history → 同步段检测缩短自动重置基座)
         commit_base = #ch:to_table()
-        -- 编辑后重打相同词 (ctx+input 相同) 必须重新推理: 清空 filter 结果缓存
-        _G.llm_filter_cache = nil
+        -- 评分结果缓存已于 2026-11-11 删除（同 ctx+input 复用命中率过低）；
+        -- 每次触发都是真实推理，编辑键无需再清缓存
         -- 2026-09-12 信号层统一: COM/UIA 快照失效 + kick 延迟重读(~50ms)——
         -- 退格/导航/撤销/粘贴后旧快照不再 2.5s 新鲜窗内冒充真文; 打首词
         -- (人手 >300ms) 时新快照已就绪, 首词即有正确 AI·UIA/COM 上文

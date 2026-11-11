@@ -171,7 +171,7 @@ $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridVie
 # 累计频 = 累计 unigram 原始计数，都未乘系数）；CE 列加宽容纳展开的
 # CE1/CE2/CE3（点 CE 单元格切换，默认不展开）
 $cols = @(
-  @('#', 24), @('词', 58), @('CE', 126), @('层1', 56), @('衰减频', 56),
+  @('#', 24), @('词', 58), @('CE', 126), @('用户频', 56), @('衰减频', 56),
   @('累计频', 54), @('融合', 64), @('满', 28), @('序变', 48), @('窗内', 46))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
@@ -196,17 +196,17 @@ $form.Controls.Add($evt)
 $lblFx = New-Lbl 8 $Y_FOOT 764 16
 $lblFx.ForeColor = [System.Drawing.Color]::Gray
 $lblFx.Font = [System.Drawing.Font]::new('Segoe UI', 8)
-$lblFx.Text = '融合分 = CE + β·log(1+衰减频) + log(p1)，β=12；p1=(累计频+1)/(全词数+2万)；层1 = β·log(1+衰减频)+log(p1)'
+$lblFx.Text = '融合分 = CE + β·log(1+衰减频) + log(p1)，β=12；p1=(累计频+1)/(全词数+2万)；用户频 = β·log(1+衰减频)+log(p1)'
 
 $lblLeg = New-Lbl 8 ($Y_FOOT + 16) 764 16
 $lblLeg.ForeColor = [System.Drawing.Color]::Gray
 $lblLeg.Font = [System.Drawing.Font]::new('Segoe UI', 8)
-$lblLeg.Text = '层1 = 词频预排分（全体候选按层1降序取前5进 LLM 评分）；满 = 两码整句满长组；窗内=0 = 层1尾窗未进 LLM（灰字）；点 CE 格展开 CE1/2/3'
+$lblLeg.Text = '用户频 = 词频预排分（全体候选按它降序取前5进 LLM 评分）；满 = 两码整句满长组；窗内=0 = 尾窗未进 LLM（灰字）；点 CE 格展开 CE1/2/3'
 
 $lblFoot = New-Lbl 8 ($Y_FOOT + 32) 764 16
 $lblFoot.ForeColor = [System.Drawing.Color]::Gray
 $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', 8)
-$lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 评缓=评分缓存，预解=上文 KV 预解码'
+$lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 预解 = 上文 KV 预解码命中'
 
 # ── 显示更新 ─────────────────────────────────────────────────────────────
 function Update-Current {
@@ -217,8 +217,8 @@ function Update-Current {
     return
   }
   $inv = $script:invList[$script:viewIdx]
-  $script:lblInfo.Text = ('{0}  输入 {1}   评缓 {2}   预解 {3}   {4}ms   tick {5}   就绪 {6}   n={7}   来源 {8}' -f
-    $inv.t, $inv.input, $inv.cache,
+  $script:lblInfo.Text = ('{0}  输入 {1}   预解 {2}   {3}ms   tick {4}   就绪 {5}   n={6}   来源 {7}' -f
+    $inv.t, $inv.input,
     $(if ($inv.prep) { $inv.prep } else { '-' }),
     $inv.ms, $inv.tick, $inv.ready, $inv.n, $inv.src)
   $script:lblCtx.Text = '上文：' + $(if ($inv.ctx) { $inv.ctx } else { '（空）' })

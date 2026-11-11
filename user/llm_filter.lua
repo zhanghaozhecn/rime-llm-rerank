@@ -43,12 +43,6 @@ local cfg = {
 local lat_max   = 0
 local lat_count = 0
 
--- 结果缓存: 同一 (ctx, input) 的评分结果复用 (翻页/候选窗重建不重复推理)。
--- 存 _G 以便 llm_processor 在编辑操作 (退格/导航/回车) 时清空——
--- 编辑后重打相同词 (ctx+input 相同) 必须重新推理, 缓存会误命中导致无推理记录。
--- 翻页/候选窗重建 (无编辑) 缓存保留命中。
-_G.llm_filter_cache = _G.llm_filter_cache or nil
-
 local function is_finite_number(v)
     return type(v) == "number" and v == v
         and v > -math.huge and v < math.huge
@@ -241,26 +235,18 @@ return function(translation, env)
     -- 候选窗快照改为层1 前 k（LLM 实际评分范围; 训练语料窗口语义随生产）
     _G.llm_last_window = { input = input, cands = l1win }
 
-    -- 缓存命中: 同 (ctx, input) 的评分结果直接复用 (翻页/候选窗重建不重复推理)。
-    -- 编辑操作 (退格/导航/回车) 后 llm_processor 清空 _G.llm_filter_cache,
-    -- 重打相同词重新推理 (同 ctx+input 的旧结果不适用于编辑后的新候选窗)
-    local cache = _G.llm_filter_cache
+    -- 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在
+    -- 生产里命中率极低（每个新词的上文都变），却要维护一套失效逻辑（编辑键清
+    -- 缓存/候选集变化重放），删掉以简化。每次触发都是真实推理。
     local ok, result, scores
-    local dbg_cache = "MISS"
-    local ev_ms = 0   -- 本轮推理耗时（缓存 HIT = 0；实时调试 L 行用）
-    if cache and cache.ctx == context and cache.input == input and cache.result then
-        ok, result, scores = true, cache.result, cache.scores
-        dbg_cache = "HIT"
-    else
+    local ev_ms = 0   -- 本轮推理耗时（实时调试 L 行用）
+    do
         local t0 = os.clock()
         ok, result = pcall(function() return llm.score(context, cands) end)
         local elapsed_ms = (os.clock() - t0) * 1000
         ev_ms = elapsed_ms
         if ok and type(result) == "table" then
             scores = get_scores(cands)
-            _G.llm_filter_cache = {
-                ctx = context, input = input, result = result, scores = scores
-            }
         end
 
         -- Event log (仅真实推理时写; RIME 用户目录, 回退 %TEMP%)
@@ -309,8 +295,8 @@ return function(translation, env)
         if okr then ready = r and "1" or "0" end
         live_ready = ready
         table.insert(dbg, string.format(
-            "%s|score|input=%s|cache=%s|ctx=[%s]|src=%s|tick=%s|ready=%s|n=%d",
-            os.date("%H:%M:%S"), input, dbg_cache, ctx_tail, ctx_src,
+            "%s|score|input=%s|ctx=[%s]|src=%s|tick=%s|ready=%s|n=%d",
+            os.date("%H:%M:%S"), input, ctx_tail, ctx_src,
             tostring(_G.user_freq_tick), ready, #cands))
         if not ok then
             table.insert(dbg, "  ERROR: score pcall failed")
@@ -454,15 +440,12 @@ return function(translation, env)
             -- L 头行（完整上文，不截断）+ 逐候选 C 行（含层1 透传尾窗，上限
             -- 20 行；win=1 层2窗内/0 尾窗透传，ce 空串=无 CE 分，fin=最终
             -- 输出位置）。与 debug.txt 人类格式互补，供查看器渲染。
-            local prep = "0"
-            if dbg_cache == "HIT" then
-                prep = "1"  -- 评分缓存命中 = 整段推理热路径
-            else
-                local okp, ph = pcall(function() return llm.prep_hit end)
-                prep = (okp and ph) and "1" or "0"
-            end
+            local okp, ph = pcall(function() return llm.prep_hit end)
+            local prep = (okp and ph) and "1" or "0"
+            -- L 第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），
+            -- 保留位置发 "-"（旧查看器显示"评缓 -"，字段数不变免错位）
             live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s",
-                os.date("%H:%M:%S"), live_esc(input), dbg_cache,
+                os.date("%H:%M:%S"), live_esc(input), "-",
                 live_esc(ctx_src), live_esc(context),
                 tostring(_G.user_freq_tick), ev_ms, live_ready, #cands, prep))
             local winset = {}
