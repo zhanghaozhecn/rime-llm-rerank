@@ -52,6 +52,21 @@ local function reset_history()
     prev_hist = {}
 end
 
+-- ═══ 实时调试行广播（2026-11-10）═══
+-- debug_fusion 开时把 E（commit 落账）/R（编辑键 reset）行经 DLL 命名管道
+-- \\.\pipe\rime_llm_live 推给查看器（debug\llm_debug_view.ps1）。行协议
+-- 与 llm_filter.lua 侧一致；调用点各自已判 debug_fusion，这里只判模块。
+-- 旧 DLL 无 live_write 时静默跳过。
+local function live_esc(s)
+    return (tostring(s or "")):gsub("|", "｜"):gsub("\n", " ")
+end
+
+local function live(line)
+    if not (llm_prep and llm_prep.live_write) then return end
+    local ok = pcall(llm_prep.live_write, line)
+    if not ok then llm_prep.live_write = nil end
+end
+
 -- 异步预解码触发（归一化 + 去重，按键路径与编辑键重置路径共用）。
 -- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,
 -- 不一致会导致 prep 永远不命中 → 每次 score 完整解码 (~50ms)。
@@ -352,6 +367,8 @@ local function processor(key, env)
             pcall(llm_prep.edit_reset_context)
         end
         if sc:get_bool("llm_rerank/debug_fusion") then
+            live("R|" .. os.date("%H:%M:%S") .. "|编辑键("
+                 .. live_esc(key:repr()) .. ")→上文重置+缓存清空")
             pcall(function()
                 local f = io.open(rime_api.get_user_data_dir()
                     .. "\\rime_llm_debug.txt", "a")
@@ -417,6 +434,10 @@ local function processor(key, env)
                     bigram_bump(w)
                     local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
                     if dbg_flag then
+                        live(string.format("E|%s|%s|%.3f|%.3f|%d|%d",
+                            os.date("%H:%M:%S"), live_esc(w), before,
+                            _G.user_freq_eff(w), t_before,
+                            _G.user_freq_tick or 0))
                         pcall(function()
                             local f = io.open(rime_api.get_user_data_dir()
                                 .. "\\rime_llm_debug.txt", "a")

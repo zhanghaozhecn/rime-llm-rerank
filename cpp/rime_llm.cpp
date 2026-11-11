@@ -135,6 +135,108 @@ static void log_msg(const char * fmt, ...) {
 
 
 // ============================================================
+// 实时调试管道 rime_llm_live（2026-11-10）：lua live_write(line) 把调试
+// 行广播给外部查看器（本仓库 debug\llm_debug_view.ps1）。行协议见查看器
+// 头部注释（V/L/C/S/E/R 六类，| 分隔 UTF-8 文本行）。设计约束：
+//   - 懒启动：首次 live_write 才起接纳线程（debug_fusion 关时 lua 不调用
+//     → 零线程零开销；无连接时广播 = 一次 mutex + 空列表遍历）
+//   - 广播在 lua 调用线程（= 按键同步路径）上做，但带 50ms 超时
+//     （overlapped WriteFile）——查看器卡死/断开即踢，绝不阻塞打字
+//   - DLL 随 WeaselServer 进程生命周期加载后不卸载，接纳线程不设停机
+static const char *kLivePipeName = "\\\\.\\pipe\\rime_llm_live";
+static const char *kLiveProtoDate = "2026-11-10";
+
+static std::mutex g_live_mu;
+static std::vector<HANDLE> g_live_clients;   // 已连接查看器的管道句柄
+static std::atomic<bool> g_live_started{false};
+
+// 单句柄单次写：overlapped + 50ms 超时（超时/失败由调用方踢客户端）
+static bool live_write_raw(HANDLE h, const std::string &s) {
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) return false;
+    bool ok = false;
+    BOOL pending = WriteFile(h, s.data(), (DWORD)s.size(), NULL, &ov);
+    if (pending || GetLastError() == ERROR_IO_PENDING) {
+        DWORD written = 0;
+        // GetOverlappedResultEx = 带超时等待（Win8+；本机 Win10 起步）
+        if (GetOverlappedResultEx(h, &ov, &written, 50, FALSE))
+            ok = true;
+        else
+            CancelIo(h);   // 超时：放弃本次写，句柄由调用方关闭
+    }
+    CloseHandle(ov.hEvent);
+    return ok;
+}
+
+static void live_drop_client(HANDLE h) {
+    DisconnectNamedPipe(h);
+    CloseHandle(h);
+}
+
+// 接纳线程：每次建一个管道实例阻塞等连接，连上即推 V 行（协议版本+
+// 版本标识）并加入客户端列表，随后建下一实例。上限 8 个并发查看器。
+static void live_thread_proc() {
+    for (;;) {
+        HANDLE h = CreateNamedPipeA(kLivePipeName,
+                                    PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                    8, 64 * 1024, 64 * 1024, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            Sleep(2000);   // 管道名被占等罕见情形：慢重试，不占 CPU
+            continue;
+        }
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!ov.hEvent) {
+            CloseHandle(h);
+            Sleep(2000);
+            continue;
+        }
+        BOOL conn = ConnectNamedPipe(h, &ov);
+        if (!conn && GetLastError() == ERROR_IO_PENDING)
+            conn = WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0;
+        BOOL connected = conn || GetLastError() == ERROR_PIPE_CONNECTED;
+        CloseHandle(ov.hEvent);
+        if (!connected) {
+            CloseHandle(h);
+            Sleep(500);
+            continue;
+        }
+        std::string hello = std::string("V|rime-llm-live|1|plugin|") +
+                            kLiveProtoDate + "\n";
+        if (live_write_raw(h, hello)) {
+            std::lock_guard<std::mutex> lk(g_live_mu);
+            g_live_clients.push_back(h);
+        } else {
+            live_drop_client(h);
+        }
+    }
+}
+
+static void live_ensure_started() {
+    bool f = false;
+    if (g_live_started.compare_exchange_strong(f, true))
+        std::thread(live_thread_proc).detach();
+}
+
+// 行广播（lua 调用线程上）：无客户端 = 空遍历；有客户端 = 逐个带超时写，
+// 失败/超时即断开踢除
+static void live_broadcast(const std::string &line) {
+    live_ensure_started();
+    std::string s = line + "\n";
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    for (auto it = g_live_clients.begin(); it != g_live_clients.end(); ) {
+        if (live_write_raw(*it, s))
+            ++it;
+        else {
+            live_drop_client(*it);
+            it = g_live_clients.erase(it);
+        }
+    }
+}
+
+// ============================================================
 // 光标上文旁路（2026-09-10 插件版全功能：三层上文的前两层）
 //   COM = Word/WPS 文字文档模型（前台 OpusApp 门控；Kwps→Word 双 ProGID，
 //         WPS 双注册 Word CLSID 但以文档打开为条件，Kwps 优先无歧义）
@@ -1518,6 +1620,18 @@ static int lua_match_code(lua_State * L) {
 }
 
 // ============================================================
+// 实时调试行广播（2026-11-10）：live_write(line) — lua 侧拼好一行协议
+// 文本（V/L/C/S/E/R），C++ 只负责管道广播。旧 DLL 无此函数时 lua 侧
+// type 检查容错跳过（向后兼容）。
+// ============================================================
+static int lua_live_write(lua_State * L) {
+    const char * line = luaL_optstring(L, 1, NULL);
+    if (line && *line)
+        live_broadcast(line);
+    return 0;
+}
+
+// ============================================================
 // __index / __newindex
 // ============================================================
 static int lua_index(lua_State * L) {
@@ -1531,6 +1645,7 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "edit_reset_context") == 0) lua_pushcfunction(L, lua_edit_reset_context);
     else if (strcmp(key, "fg_changed") == 0)     lua_pushcfunction(L, lua_fg_changed);
     else if (strcmp(key, "click_happened") == 0) lua_pushcfunction(L, lua_click_happened);
+    else if (strcmp(key, "live_write") == 0)     lua_pushcfunction(L, lua_live_write);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
     else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);
     else if (strcmp(key, "min_tokens") == 0) lua_pushinteger(L, g_min_tokens);
@@ -1592,6 +1707,11 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
 
     lua_pushcfunction(L, lua_click_happened);
     lua_setfield(L, -2, "click_happened");
+
+    // 实时调试行广播（2026-11-10）：函数注册同款（setfield 直挂，
+    // 不走 __newindex 属性语义——可写属性预填充禁令不适用于函数）
+    lua_pushcfunction(L, lua_live_write);
+    lua_setfield(L, -2, "live_write");
 
     // 编码模式匹配（2026-09-30）：取代 min_code_len/max_code_len 区间，
     // 与 Rime 自身 auto_select_pattern 同语义（全串匹配）

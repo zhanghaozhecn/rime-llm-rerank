@@ -1,0 +1,389 @@
+﻿<#
+ llm_debug_view.ps1 — LLM 实时调试窗口（插件版）
+ 数据源：命名管道 \\.\pipe\rime_llm_live（rime_llm.dll 内的 live 管道服务，
+ 由 lua 在 llm_rerank/debug_fusion: true 时调用 llm.live_write 推送）。
+ 前置：方案开启 debug_fusion 并重新部署（否则管道不存在，本窗口等待连接）。
+
+ 行协议（| 分隔 UTF-8 文本行；自由文本字段已把 | 转全角｜、换行转空格）：
+   V|rime-llm-live|1|plugin|<日期>                     连接后服务端立即推
+   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n      每次触发评分的调用头
+                                                       （ctx=完整上文；cache=HIT 时 ms=0；
+                                                        src ∈ tsf/com/uia/rime）
+   C|eng|word|s1|ce|fb|u1|fused|full|cerank|fin|win    逐候选按最终序（上限 20 行）：
+                                                       eng=引擎原序 s1=层1分 ce=CE 分（空=无分）
+                                                       fb=β·log1p(eff) u1=log(p1)
+                                                       full=两码整句满长 cerank=CE 序名次
+                                                       fin=最终位置 win=1 层2窗内/0 尾窗透传
+   S|HH:MM:SS|reason|input|src                        跳过原因：pattern/ctx_empty/
+                                                       not_ready/ctx_short/scores_nil/
+                                                       score_failed/few_candidates
+   E|HH:MM:SS|word|eff0|eff1|tick0|tick1              commit 落账
+   R|HH:MM:SS|reason                                  上文重置（编辑键等）
+
+ 用法：
+   pwsh -STA -File llm_debug_view.ps1            图形窗口（推荐用 open_debug_window.bat 启动）
+   pwsh -File llm_debug_view.ps1 -Raw            控制台直打收到的行（自动化验证用）
+ 本文件必须保持 UTF-8 BOM（Windows PowerShell 5.1 无 BOM 会把中文按 ANSI 解析）。
+#>
+param([switch]$Raw)
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$PipeName = 'rime_llm_live'
+
+# ── 后台读取循环（独立 Runspace 里跑；跨线程通信只走线程安全的
+#    ConcurrentQueue，UI 只在主线程 Timer 里取——不碰跨线程控件访问）───
+$ReaderScript = {
+  param($q, $pipeName)
+  $enc = [System.Text.Encoding]::UTF8
+  while ($true) {
+    $pipe = $null
+    try {
+      $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
+        '.', $pipeName, [System.IO.Pipes.PipeDirection]::In)
+      $pipe.Connect(1500)
+      $q.Enqueue('::CONNECTED')
+      $sr = [System.IO.StreamReader]::new($pipe, $enc)
+      while ($true) {
+        $line = $sr.ReadLine()
+        if ($null -eq $line) { break }
+        if ($line.Length -gt 0) { $q.Enqueue($line) }
+      }
+    } catch {
+      # 管道不存在（debug_fusion 未开 / 服务未启动）或对端断开——外层重连
+    } finally {
+      if ($pipe) { $pipe.Dispose() }
+      $q.Enqueue('::DISCONNECTED')
+    }
+    Start-Sleep -Milliseconds 1000
+  }
+}
+
+# ── -Raw：控制台直打行流（自动化验证）────────────────────────────────────
+if ($Raw) {
+  try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+  Write-Host "等待管道 \\.\pipe\$PipeName （在方案开启 llm_rerank/debug_fusion 并重新部署后，打字即出数据；Ctrl+C 退出）"
+  $q = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+  $bg = [System.Management.Automation.PowerShell]::Create()
+  $bg.AddScript($ReaderScript).AddArgument($q).AddArgument($PipeName) | Out-Null
+  $h = $bg.BeginInvoke()
+  try {
+    while ($true) {
+      $line = $null
+      while ($q.TryDequeue([ref]$line)) { Write-Host $line }
+      Start-Sleep -Milliseconds 100
+    }
+  } finally {
+    $bg.Stop(); $bg.Dispose()
+  }
+  exit 0
+}
+
+# ── 数据状态 ─────────────────────────────────────────────────────────────
+$script:queue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+$script:invList = [System.Collections.Generic.List[object]]::new()  # 最近 50 次调用
+$script:events  = [System.Collections.Generic.List[string]]::new()  # 最近 200 条事件行
+$script:viewIdx = -1          # 当前展示的调用下标（-1 = 无）
+$script:paused  = $false
+$script:connected = $false
+$script:verInfo = ''
+
+# ── 布局常量（96 DPI 设计值；DpiK≠1 时末尾统一 字体×k + Scale(k,k)）──────
+$Y_STATUS = 8;  $H_STATUS = 22
+$Y_INFO   = 34; $H_INFO = 20
+$Y_CTX    = 58; $H_CTX = 42
+$Y_GRID   = 104; $H_GRID = 298
+$X_GRID   = 8;   $W_GRID = 548
+$X_HIST   = 564; $W_HIST = 208
+$Y_EVT    = 410; $H_EVT = 116
+$Y_FOOT   = 532
+$CW = 780       # ClientSize 宽（= X_HIST + W_HIST + 8）
+$CH = 554       # ClientSize 高
+
+$form = [System.Windows.Forms.Form]::new()
+$form.Text = 'LLM 实时调试 — rime-llm-rerank（插件版）'
+$form.FormBorderStyle = 'FixedSingle'
+$form.MaximizeBox = $false
+$form.StartPosition = 'CenterScreen'
+$form.BackColor = [System.Drawing.Color]::White
+$form.Font = [System.Drawing.Font]::new('Segoe UI', 9)
+$form.ClientSize = [System.Drawing.Size]::new($CW, $CH)
+
+function New-Lbl([int]$x, [int]$y, [int]$w, [int]$h) {
+  $l = [System.Windows.Forms.Label]::new()
+  $l.Location = [System.Drawing.Point]::new($x, $y)
+  $l.Size = [System.Drawing.Size]::new($w, $h)
+  $l.BackColor = [System.Drawing.Color]::White
+  $l.AutoEllipsis = $true
+  $form.Controls.Add($l)
+  return $l
+}
+$lblStatus = New-Lbl 8 $Y_STATUS 520 $H_STATUS
+$lblStatus.Text = '等待连接…（先在方案开启 llm_rerank/debug_fusion 并重新部署，然后打字）'
+$lblStatus.ForeColor = [System.Drawing.Color]::DimGray
+
+$lblInfo = New-Lbl 8 $Y_INFO 764 $H_INFO
+$lblInfo.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$lblInfo.Text = '—'
+
+$lblCtx = New-Lbl 8 $Y_CTX 764 $H_CTX
+$lblCtx.Text = '上文：—'
+
+$btnPause = [System.Windows.Forms.Button]::new()
+$btnPause.Location = [System.Drawing.Point]::new(536, $Y_STATUS - 2)
+$btnPause.Size = [System.Drawing.Size]::new(64, 24)
+$btnPause.Text = '暂停'
+$btnPause.FlatStyle = 'Flat'
+$btnPause.UseVisualStyleBackColor = $false
+$form.Controls.Add($btnPause)
+
+$chkTop = [System.Windows.Forms.CheckBox]::new()
+$chkTop.Location = [System.Drawing.Point]::new(608, $Y_STATUS)
+$chkTop.Size = [System.Drawing.Size]::new(52, 22)
+$chkTop.Text = '置顶'
+$chkTop.BackColor = [System.Drawing.Color]::White
+$form.Controls.Add($chkTop)
+
+$btnClear = [System.Windows.Forms.Button]::new()
+$btnClear.Location = [System.Drawing.Point]::new(668, $Y_STATUS - 2)
+$btnClear.Size = [System.Drawing.Size]::new(52, 24)
+$btnClear.Text = '清空'
+$btnClear.FlatStyle = 'Flat'
+$btnClear.UseVisualStyleBackColor = $false
+$form.Controls.Add($btnClear)
+
+$grid = [System.Windows.Forms.DataGridView]::new()
+$grid.Location = [System.Drawing.Point]::new($X_GRID, $Y_GRID)
+$grid.Size = [System.Drawing.Size]::new($W_GRID, $H_GRID)
+$grid.ReadOnly = $true
+$grid.AllowUserToAddRows = $false
+$grid.AllowUserToResizeRows = $false
+$grid.RowHeadersVisible = $false
+$grid.BackgroundColor = [System.Drawing.Color]::White
+$grid.BorderStyle = 'FixedSingle'
+$grid.CellBorderStyle = 'SingleHorizontal'
+$grid.SelectionMode = 'FullRowSelect'
+$grid.AutoSizeColumnsMode = 'None'
+# 列头禁换行 + 短文案：窄列两行表头会被默认行高裁掉下半行（2026-11-10 实测）
+$grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::False
+# 列: # 词 CE 层1(s1) 频+(fb) u1+ 融合 满 序变(CE序→终) 窗内 —— eff 原始值
+# 不进协议，词频证据看 频+（β·log1p(eff)）与 层1（s1=频+u1）两列
+$cols = @(
+  @('#', 24), @('词', 58), @('CE', 62), @('层1', 56), @('频+', 56),
+  @('u1+', 56), @('融合', 62), @('满', 34), @('序变', 44), @('窗内', 44))
+foreach ($c in $cols) {
+  $i = $grid.Columns.Add($c[0], $c[0])
+  $grid.Columns[$i].Width = $c[1]
+}
+$form.Controls.Add($grid)
+
+$hist = [System.Windows.Forms.ListBox]::new()
+$hist.Location = [System.Drawing.Point]::new($X_HIST, $Y_GRID)
+$hist.Size = [System.Drawing.Size]::new($W_HIST, $H_GRID)
+$hist.HorizontalScrollbar = $true
+$form.Controls.Add($hist)
+
+$evt = [System.Windows.Forms.ListBox]::new()
+$evt.Location = [System.Drawing.Point]::new(8, $Y_EVT)
+$evt.Size = [System.Drawing.Size]::new(764, $H_EVT)
+$evt.HorizontalScrollbar = $true
+$form.Controls.Add($evt)
+
+$lblFoot = New-Lbl 8 $Y_FOOT 764 16
+$lblFoot.ForeColor = [System.Drawing.Color]::Gray
+$lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', 8)
+$lblFoot.Text = '数据源 \\.\pipe\' + $PipeName + ' · 开关 = 方案 llm_rerank/debug_fusion（改后重新部署）· 窗内=0 行 = 层1 尾窗透传（灰字）'
+
+# ── 显示更新 ─────────────────────────────────────────────────────────────
+function Update-Current {
+  if ($script:viewIdx -lt 0 -or $script:viewIdx -ge $script:invList.Count) {
+    $script:lblInfo.Text = '—'
+    $script:lblCtx.Text = '上文：—'
+    $script:grid.Rows.Clear()
+    return
+  }
+  $inv = $script:invList[$script:viewIdx]
+  $script:lblInfo.Text = ('{0}  输入 {1}   缓存 {2}   {3}ms   tick {4}   就绪 {5}   n={6}   来源 {7}' -f
+    $inv.t, $inv.input, $inv.cache, $inv.ms, $inv.tick, $inv.ready, $inv.n, $inv.src)
+  $script:lblCtx.Text = '上文：' + $(if ($inv.ctx) { $inv.ctx } else { '（空）' })
+  $script:grid.Rows.Clear()
+  $i = 0
+  foreach ($r in $inv.rows) {
+    [void]$script:grid.Rows.Add(($i + 1), $r.word,
+      $(if ($r.ce) { $r.ce } else { '·' }), $r.s1, $r.fb, $r.u1, $r.fused,
+      $r.full, ($r.cerank + '→' + $r.fin), $r.win)
+    if ($r.win -eq '0') {
+      $script:grid.Rows[$i].DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gray
+    }
+    $i++
+  }
+}
+
+function Add-Event {
+  param($text)
+  $script:events.Insert(0, $text)
+  while ($script:events.Count -gt 200) { $script:events.RemoveAt($script:events.Count - 1) }
+  if (-not $script:paused) {
+    $script:evt.Items.Clear()
+    foreach ($e in $script:events) { [void]$script:evt.Items.Add($e) }
+  }
+}
+
+function Rebuild-All {
+  $script:evt.Items.Clear()
+  foreach ($e in $script:events) { [void]$script:evt.Items.Add($e) }
+  # 历史列表也要重建：暂停期间 invList 仍在追加/裁剪，ListBox 已陈旧
+  $script:hist.Items.Clear()
+  foreach ($inv in $script:invList) {
+    $words = ($inv.rows | Select-Object -First 3 | ForEach-Object { $_.word }) -join ','
+    [void]$script:hist.Items.Add(('{0} {1} {2}' -f $inv.t, $inv.input, $words))
+  }
+  Update-Current
+}
+
+# ── 协议行处理 ───────────────────────────────────────────────────────────
+function Handle-Line {
+  param($line)
+  if ($line -eq '::CONNECTED') {
+    $script:connected = $true
+    if (-not $script:paused) {
+      $script:lblStatus.Text = '已连接' + $(if ($script:verInfo) { ' · ' + $script:verInfo } else { '' })
+      $script:lblStatus.ForeColor = [System.Drawing.Color]::Green
+    }
+    return
+  }
+  if ($line -eq '::DISCONNECTED') {
+    $script:connected = $false
+    if (-not $script:paused) {
+      $script:lblStatus.Text = '连接断开，1 秒后重连…（管道不存在 = debug_fusion 未开或小狼毫服务未运行）'
+      $script:lblStatus.ForeColor = [System.Drawing.Color]::DimGray
+    }
+    return
+  }
+  $f = $line -split '\|'
+  switch ($f[0]) {
+    'V' {
+      if ($f.Count -ge 5 -and $f[1] -eq 'rime-llm-live') {
+        $script:verInfo = ('协议 v{0} · {1} 版 · {2}' -f $f[2], $f[3], $f[4])
+        if ($script:connected -and -not $script:paused) {
+          $script:lblStatus.Text = '已连接 · ' + $script:verInfo
+        }
+      }
+    }
+    'L' {
+      if ($f.Count -lt 10) { return }
+      $inv = @{ t = $f[1]; input = $f[2]; cache = $f[3]; src = $f[4]
+                ctx = $f[5]; tick = $f[6]; ms = $f[7]; ready = $f[8]
+                n = $f[9]; rows = [System.Collections.Generic.List[object]]::new() }
+      $script:invList.Add($inv)
+      while ($script:invList.Count -gt 50) { $script:invList.RemoveAt(0) }
+      $script:viewIdx = $script:invList.Count - 1
+      if (-not $script:paused) {
+        [void]$script:hist.Items.Add(('{0} {1}' -f $inv.t, $inv.input))
+        while ($script:hist.Items.Count -gt 50) { $script:hist.Items.RemoveAt(0) }
+        Update-Current
+      }
+    }
+    'C' {
+      if ($f.Count -lt 12) { return }
+      if ($script:invList.Count -eq 0) { return }
+      $inv = $script:invList[$script:invList.Count - 1]
+      $inv.rows.Add(@{ eng = $f[1]; word = $f[2]; s1 = $f[3]; ce = $f[4]
+                       fb = $f[5]; u1 = $f[6]; fused = $f[7]; full = $f[8]
+                       cerank = $f[9]; fin = $f[10]; win = $f[11] })
+      if (-not $script:paused -and $script:viewIdx -eq ($script:invList.Count - 1)) {
+        Update-Current
+      }
+      # 历史条目补前 3 个词（前几条 C 行到达时）
+      if (-not $script:paused -and $inv.rows.Count -le 3) {
+        $idx = $script:hist.Items.Count - 1
+        if ($idx -ge 0) {
+          $words = ($inv.rows | Select-Object -First 3 | ForEach-Object { $_.word }) -join ','
+          $script:hist.Items[$idx] = ('{0} {1} {2}' -f $inv.t, $inv.input, $words)
+        }
+      }
+    }
+    'S' {
+      if ($f.Count -lt 3) { return }
+      Add-Event ('{0} 跳过 {1}（输入 {2} 来源 {3}）' -f $f[1], $f[2],
+        $(if ($f.Count -gt 3) { $f[3] } else { '' }),
+        $(if ($f.Count -gt 4) { $f[4] } else { '-' }))
+    }
+    'E' {
+      if ($f.Count -lt 7) { return }
+      Add-Event ('{0} 上屏 {1}  eff {2}→{3}  tick {4}→{5}' -f
+        $f[1], $f[2], $f[3], $f[4], $f[5], $f[6])
+    }
+    'R' {
+      if ($f.Count -lt 3) { return }
+      Add-Event ('{0} 重置 {1}' -f $f[1], $f[2])
+    }
+  }
+}
+
+# ── 交互 ─────────────────────────────────────────────────────────────────
+$btnPause.Add_Click({
+  $script:paused = -not $script:paused
+  $btnPause.Text = $(if ($script:paused) { '继续' } else { '暂停' })
+  if (-not $script:paused) { Rebuild-All }
+})
+$chkTop.Add_CheckedChanged({ $form.TopMost = $chkTop.Checked })
+$btnClear.Add_Click({
+  $script:invList.Clear(); $script:events.Clear()
+  $script:hist.Items.Clear(); $script:evt.Items.Clear()
+  $script:viewIdx = -1
+  Update-Current
+})
+$hist.Add_SelectedIndexChanged({
+  if ($script:hist.SelectedIndex -ge 0) {
+    # ListBox 与 invList 同步追加/裁剪到 50 → 下标换算：尾部对齐
+    $script:viewIdx = $script:invList.Count - $script:hist.Items.Count +
+                      $script:hist.SelectedIndex
+    if ($script:viewIdx -lt 0) { $script:viewIdx = 0 }
+    if ($script:viewIdx -ge $script:invList.Count) { $script:viewIdx = $script:invList.Count - 1 }
+    Update-Current
+  }
+})
+
+# ── 后台 Runspace + UI Timer ─────────────────────────────────────────────
+$script:bg = [System.Management.Automation.PowerShell]::Create()
+$script:bg.AddScript($ReaderScript).AddArgument($script:queue).AddArgument($PipeName) | Out-Null
+$script:bgHandle = $script:bg.BeginInvoke()
+
+$timer = [System.Windows.Forms.Timer]::new()
+$timer.Interval = 100
+$timer.Add_Tick({
+  $line = $null
+  while ($script:queue.TryDequeue([ref]$line)) { Handle-Line $line }
+})
+$timer.Start()
+
+$form.Add_FormClosing({
+  $timer.Stop()
+  try { $script:bg.Stop(); $script:bg.Dispose() } catch {}
+})
+
+# ── 高 DPI（抄 install_plugin.ps1 定案模式）：96 DPI 设计值 → 字体×k +
+#    Scale(k,k)；RIME_LLM_FAKE_DPI 可本机模拟核对 ─────────────────────────
+$script:DpiK = 1.0
+try {
+  if ($env:RIME_LLM_FAKE_DPI) {
+    $script:DpiK = [double]$env:RIME_LLM_FAKE_DPI / 96.0
+  } else {
+    $g = [System.Drawing.Graphics]::FromHwnd($form.Handle)
+    $script:DpiK = [double]$g.DpiX / 96.0
+    $g.Dispose()
+  }
+} catch { $script:DpiK = 1.0 }
+if ($script:DpiK -le 0) { $script:DpiK = 1.0 }
+$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+if ([Math]::Abs($script:DpiK - 1.0) -gt 0.001) {
+  $k = [single]$script:DpiK
+  $form.Font = [System.Drawing.Font]::new('Segoe UI', [float](9 * $k))
+  $lblInfo.Font = [System.Drawing.Font]::new('Segoe UI', [float](9 * $k), [System.Drawing.FontStyle]::Bold)
+  $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', [float](8 * $k))
+  $form.Scale([System.Drawing.SizeF]::new($k, $k))
+}
+
+[void]$form.ShowDialog()

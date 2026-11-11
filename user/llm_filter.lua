@@ -84,6 +84,27 @@ local function get_scores(cands)    if not llm or not llm.get_scores then return
     return scores
 end
 
+-- ═══ 实时调试行广播（2026-11-10）═══
+-- debug_fusion 开时把行协议（V/L/C/S/E/R，| 分隔）经 DLL 的命名管道
+-- \\.\pipe\rime_llm_live 推给外部查看器（本仓库 debug\llm_debug_view.ps1）。
+-- 协议两端（lua/C++/查看器）以 DLL 注释与查看器头部注释为准。
+-- 旧 DLL 无 live_write 时静默跳过（向后兼容）；查看器未连接时 DLL 侧
+-- 一次空遍历即返回。自由文本字段（input/ctx/word/reason）先过 live_esc。
+local function live_esc(s)
+    return (tostring(s or "")):gsub("|", "｜"):gsub("\n", " ")
+end
+
+local function live(line)
+    if not (cfg.debug_fusion and llm and llm.live_write) then return end
+    local ok = pcall(llm.live_write, line)
+    if not ok then llm.live_write = nil end  -- 接口异常则本会话不再尝试
+end
+
+local function live_fmt3(v)
+    if v == nil or v ~= v then return "" end
+    return string.format("%.3f", v)
+end
+
 local function load_llm(env)
     local ok, cpp = pcall(require, "rime_llm")
     if ok and cpp then
@@ -137,7 +158,12 @@ return function(translation, env)
 
     local all = {}
     for cand in translation:iter() do table.insert(all, cand) end
-    if #all < 2 then for _, c in ipairs(all) do yield(c) end; return end
+    if #all < 2 then
+        live("S|" .. os.date("%H:%M:%S") .. "|few_candidates|" ..
+             live_esc(env.engine.context.input or "") .. "|-")
+        for _, c in ipairs(all) do yield(c) end
+        return
+    end
 
     local input = env.engine.context.input or ""
 
@@ -171,6 +197,8 @@ return function(translation, env)
     -- （与源码版 boost::regex 同一套 ECMAScript 语法）；DLL 不提供该函数时
     -- 回退 Lua 模式——两种写法对 .{4} / .{4,} / .{3,4} / [abcde]{4} 等价。
     if not match_code_pattern(input) then
+        live("S|" .. os.date("%H:%M:%S") .. "|pattern|" .. live_esc(input)
+             .. "|-")
         for _, c in ipairs(all) do yield(c) end; return
     end
 
@@ -219,6 +247,7 @@ return function(translation, env)
     local cache = _G.llm_filter_cache
     local ok, result, scores
     local dbg_cache = "MISS"
+    local ev_ms = 0   -- 本轮推理耗时（缓存 HIT = 0；实时调试 L 行用）
     if cache and cache.ctx == context and cache.input == input and cache.result then
         ok, result, scores = true, cache.result, cache.scores
         dbg_cache = "HIT"
@@ -226,6 +255,7 @@ return function(translation, env)
         local t0 = os.clock()
         ok, result = pcall(function() return llm.score(context, cands) end)
         local elapsed_ms = (os.clock() - t0) * 1000
+        ev_ms = elapsed_ms
         if ok and type(result) == "table" then
             scores = get_scores(cands)
             _G.llm_filter_cache = {
@@ -270,24 +300,36 @@ return function(translation, env)
 
     -- 融合诊断 (llm_rerank/debug_fusion: true): 每次评分逐候选记录
     -- CE/eff/词频加成/满长标记/最终 key 与名次, 写 rime_llm_debug.txt
+    local live_ready = "n/a"   -- 模型就绪态（实时调试 L 行用；两个 dbg 块共享）
     local dbg = cfg.debug_fusion and {} or nil
     if dbg then
         local ctx_tail = #context > 16 and ("…" .. context:sub(-15)) or context
         local ready = "n/a"
         local okr, r = pcall(function() return llm.is_ready() end)
         if okr then ready = r and "1" or "0" end
+        live_ready = ready
         table.insert(dbg, string.format(
             "%s|score|input=%s|cache=%s|ctx=[%s]|src=%s|tick=%s|ready=%s|n=%d",
             os.date("%H:%M:%S"), input, dbg_cache, ctx_tail, ctx_src,
             tostring(_G.user_freq_tick), ready, #cands))
         if not ok then
             table.insert(dbg, "  ERROR: score pcall failed")
+            live("S|" .. os.date("%H:%M:%S") .. "|score_failed|" ..
+                 live_esc(input) .. "|" .. live_esc(ctx_src))
         elseif type(result) ~= "table" then
             table.insert(dbg, string.format(
                 "  score=nil (ready=%s, ctx空=%s — ready=0 模型未载/加载中; ctx空=min_tokens 跳过)",
                 ready, context == "" and "是" or "否"))
+            -- 实时调试（2026-11-10）：失败原因细分为 not_ready/ctx_empty/
+            -- ctx_short——"为什么没触发"是调试窗口的主要用途之一
+            local why = ready == "0" and "not_ready"
+                    or (context == "" and "ctx_empty" or "ctx_short")
+            live("S|" .. os.date("%H:%M:%S") .. "|" .. why .. "|" ..
+                 live_esc(input) .. "|" .. live_esc(ctx_src))
         elseif not scores then
             table.insert(dbg, "  融合跳过: scores=nil (get_scores 校验失败 — 候选缺分/含异常值)")
+            live("S|" .. os.date("%H:%M:%S") .. "|scores_nil|" ..
+                 live_esc(input) .. "|" .. live_esc(ctx_src))
         end
     end
 
@@ -392,6 +434,42 @@ return function(translation, env)
             for i, c in ipairs(ordered) do final_rank[c.text] = i end
             local all_rank = {}
             for i, c in ipairs(all) do all_rank[c.text] = i end
+
+            -- 实时调试（2026-11-10）：L 头行（完整上文，不截断）+ 逐候选
+            -- C 行（含层1 透传尾窗，上限 20 行；win=1 层2窗内/0 尾窗透传，
+            -- ce 空串=无 CE 分，fin=最终输出位置）。与 debug.txt 人类格式
+            -- 互补，供查看器（debug\llm_debug_view.ps1）渲染。
+            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d",
+                os.date("%H:%M:%S"), live_esc(input), dbg_cache,
+                live_esc(ctx_src), live_esc(context),
+                tostring(_G.user_freq_tick), ev_ms, live_ready, #cands))
+            local winset = {}
+            for _, w in ipairs(l1win) do winset[w] = true end
+            local emitted = 0
+            local function live_c(c, fin)
+                if emitted >= 20 then return end
+                emitted = emitted + 1
+                local d = dbg[c.text]
+                live(table.concat({
+                    "C", tostring(all_rank[c.text] or 0), live_esc(c.text),
+                    live_fmt3(s1_of[c.text]),
+                    (d and d.ce and d.ce > -1e9) and live_fmt3(d.ce) or "",
+                    d and live_fmt3(d.fb) or "",
+                    d and live_fmt3(d.u1) or "",
+                    d and live_fmt3(d.fused) or "",
+                    (d and d.full) and "1" or "0",
+                    tostring(d and d.cerank or 0),
+                    tostring(fin), winset[c.text] and "1" or "0"
+                }, "|"))
+            end
+            for i, c in ipairs(ordered) do live_c(c, i) end
+            local tail_pos = #ordered
+            for _, e in ipairs(layer1) do
+                if not seen[e.c.text] then
+                    tail_pos = tail_pos + 1
+                    live_c(e.c, tail_pos)
+                end
+            end
             for i = 1, math.min(#ordered, 8) do
                 local c = ordered[i]
                 local d = dbg[c.text]
@@ -426,21 +504,9 @@ return function(translation, env)
                 end
             end)
         end
-        -- 来源徽章（与源码版对齐）：com = COM 文档模型（Word/WPS 文字）、
-        -- uia = UIA TextPattern（通用现代应用）、rime = 历史上屏
-        local badge = (ctx_src == "com" and "AI·COM")
-                   or (ctx_src == "uia" and "AI·UIA")
-                   or "AI·历史"
-        for i, c in ipairs(ordered) do
-            if i == 1 then
-                local cm = c.comment
-                if cm and cm ~= "" then cm = cm .. " " .. badge
-                else cm = badge end
-                yield(ShadowCandidate(c, c.type, c.text, cm, true))
-            else
-                yield(c)
-            end
-        end
+        -- 来源徽章已删（2026-11-10 用户定案：实时调试窗口上线——上文来源/
+        -- 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment）
+        for _, c in ipairs(ordered) do yield(c) end
         for _, e in ipairs(layer1) do
             if not seen[e.c.text] then yield(e.c) end
         end

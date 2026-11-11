@@ -67,6 +67,27 @@ int main(void) {
         "print('[host] funcs:', type(m.llm_context), type(m.kick_context))\n"))
         return 1;
 
+    /* live 管道冒烟（2026-11-10）：live_write 存在性 + 六类行广播不崩
+     *（无查看器连接时 DLL 侧空遍历即返回；有连接时外部客户端收行）。
+     * 第一行 = 起管道的探针（行本身丢弃），Sleep 1.5s 留给外部查看器
+     * 连上（其重连周期 1s），随后六行才是待收内容。*/
+    if (run(L,
+        "local m = require('rime_llm')\n"
+        "print('[host] live_write:', type(m.live_write))\n"
+        "assert(type(m.live_write) == 'function', 'live_write missing')\n"
+        "m.live_write('R|12:00:00|管道启动探针')\n"))
+        return 1;
+    Sleep(1500);
+    if (run(L,
+        "local m = require('rime_llm')\n"
+        "m.live_write('L|12:00:00|smoke|MISS|tsf|冒烟上文全文|1|12|1|5')\n"
+        "m.live_write('C|1|冒烟词|1.0|-2.5|3.0|-8.0|-7.5|0|1|1|1')\n"
+        "m.live_write('S|12:00:01|pattern|abcd|-')\n"
+        "m.live_write('E|12:00:02|冒烟词|1.0|1.5|10|11')\n"
+        "m.live_write('R|12:00:03|编辑键(BackSpace)')\n"))
+        return 1;
+    Sleep(400);   /* 广播送达 */
+
     /* 模型加载：设路径（本机实际位置）+ score 首调懒触发 + 宿主轮询 */
     if (run(L,
         "package.loaded.rime_llm.model_path = "
