@@ -216,11 +216,10 @@ function Update-Current {
     return
   }
   $inv = $script:invList[$script:viewIdx]
-  $script:lblInfo.Text = ('{0}  输入 {1}   来源 {2}   预解 {3}   {4}ms   tick {5}   全词数 {6}   n={7}   就绪 {8}' -f
+  $script:lblInfo.Text = ('{0}  输入 {1}   来源 {2}   预解 {3}   {4}ms   tick {5}   n={6}   就绪 {7}' -f
     $inv.t, $inv.input, $inv.src,
     $(if ($inv.prep) { $inv.prep } else { '-' }),
     $inv.ms, $inv.tick,
-    $(if ($inv.nseen) { $inv.nseen } else { '-' }),
     $inv.n, $inv.ready)
   $script:lblCtx.Text = '上文：' + $(if ($inv.ctx) { $inv.ctx } else { '（空）' })
   $script:grid.Rows.Clear()
@@ -269,7 +268,8 @@ function Pad-L([string]$s, [int]$w) {
 
 # CE 格：加权 CE 与其三分量。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
 # 交叉熵、正值；分值取负号进融合），故等号右为带负号的括号和。
-# 权重 1.00/1.05/0.45 = 标定常数，原样显示不四舍五入；数据浮点统一 1 位小数。
+# ce2/ce3 带权重前缀（1.05/0.45 = 标定常数，原样显示不四舍五入）；ce1 权重
+# 恒 1 → 前缀不显示（2026-11-12 用户定案）；数据浮点统一 1 位小数。
 # $wL = 分数列内最宽值宽，$wC = 三分量列内最宽值宽
 function Get-CeProc($r, $wL, $wC) {
   $ce = Get-Num $r.ce
@@ -277,11 +277,12 @@ function Get-CeProc($r, $wL, $wC) {
   $lead = Pad-L (Format-F1 $ce) $wL
   $t = $lead + '=-('
   $any = $false
-  foreach ($pair in @(@('1.00', $r.ce1), @('1.05', $r.ce2), @('0.45', $r.ce3))) {
+  foreach ($pair in @(@($null, $r.ce1), @('1.05', $r.ce2), @('0.45', $r.ce3))) {
     $v = Get-Num $pair[1]
     if ($null -eq $v) { continue }
     if ($any) { $t += '+' }
-    $t += $pair[0] + '·' + (Pad-L (Format-F1 $v) $wC)
+    if ($pair[0]) { $t += $pair[0] + '·' }
+    $t += Pad-L (Format-F1 $v) $wC
     $any = $true
   }
   if (-not $any) { return $lead }
@@ -374,7 +375,8 @@ function Handle-Line {
                 ctx = $f[5]; tick = $f[6]; ms = $f[7]; ready = $f[8]
                 n = $f[9]
                 prep = $(if ($f.Count -gt 10) { $f[10] } else { '' })
-                nseen = $(if ($f.Count -gt 11) { $f[11] } else { '' })
+                # 协议 L 行第 12 字段 n_seen（全词数）自 2026-11-12 不再显示
+                # （公式简化后无消费方）——协议保留，查看器不解析不显示
                 rows = [System.Collections.Generic.List[object]]::new() }
       $script:invList.Add($inv)
       while ($script:invList.Count -gt 50) { $script:invList.RemoveAt(0) }
