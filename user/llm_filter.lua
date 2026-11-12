@@ -442,15 +442,21 @@ return function(translation, env)
             -- 输出位置）。与 debug.txt 人类格式互补，供查看器渲染。
             local okp, ph = pcall(function() return llm.prep_hit end)
             local prep = (okp and ph) and "1" or "0"
+            -- 协议 v4（2026-11-12）：L 尾追加 ctx_used = 推理实际使用的
+            -- 上文尾部文本（去空白上文中末 ≤max_ctx token 的原文段，
+            -- get_ctx_used 容错旧 DLL；查看器据此灰显未用前缀）
+            local okcu, cu = pcall(function() return llm.get_ctx_used() end)
+            local ctxused = (okcu and type(cu) == "string") and live_esc(cu) or ""
             -- L 第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），
             -- 保留位置发 "-"（旧查看器显示"评缓 -"，字段数不变免错位）
-            -- 尾两字段: prep=预解码命中, nseen=累计 unigram 全词数
-            --（累计得分 log((累计次数+1)/(nseen+2万)) 的分母，调试要能手算）
-            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s|%s",
+            -- 尾三字段: prep=预解码命中, nseen=累计 unigram 全词数
+            --（累计得分 log((累计次数+1)/(nseen+2万)) 的分母，调试要能手算）,
+            -- ctx_used=推理用尾部
+            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s|%s|%s",
                 os.date("%H:%M:%S"), live_esc(input), "-",
                 live_esc(ctx_src), live_esc(context),
                 tostring(_G.user_freq_tick), ev_ms, live_ready, #cands, prep,
-                tostring(_G.user_nseen or 0)))
+                tostring(_G.user_nseen or 0), ctxused))
             local winset = {}
             for _, w in ipairs(l1win) do winset[w] = true end
             local emitted = 0

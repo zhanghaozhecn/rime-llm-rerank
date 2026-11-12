@@ -1004,14 +1004,35 @@ static std::vector<llama_token> tokenize(const char * text) {
     return toks;
 }
 
+// 推理用上文尾部文本（2026-11-12 调试窗口协议 v4，灰显用）：截尾保留的
+// ids 逐 token 拼 piece —— 字节级 BPE 的各 token piece 恰好等于原文中
+// 连续字节段，拼接 = 精确尾部（真实 token 边界，非字符数估算）；
+// 未截尾（全文 ≤ max_ctx）时推理用全文。token 不足 min_tokens → 空
+//（无推理）。
+static std::string g_last_ctx_used;
+
+static std::string tokens_piece(const std::vector<llama_token> & ids) {
+    std::string s;
+    char buf[256];
+    for (auto id : ids) {
+        int n = llama_token_to_piece(g_vocab, id, buf, sizeof(buf), 0, true);
+        if (n > 0) s.append(buf, n);
+    }
+    return s;
+}
+
 // 上文 token 化 + min_tokens/max_ctx 截尾（prepare/score 入口共用）。
 // token 数不足 min_tokens（方案 llm_rerank/min_tokens，lua 传入）→ 返回空
 //（空 ctx 无推理是配置语义, 非 bug）。
 static std::vector<llama_token> ctx_token_ids(const char * context) {
     auto ids = tokenize(context);
-    if ((int)ids.size() < g_min_tokens) return {};
-    if ((int)ids.size() > g_max_ctx_tokens)
+    if ((int)ids.size() < g_min_tokens) { g_last_ctx_used.clear(); return {}; }
+    if ((int)ids.size() > g_max_ctx_tokens) {
         ids.erase(ids.begin(), ids.end() - g_max_ctx_tokens);
+        g_last_ctx_used = tokens_piece(ids);
+    } else {
+        g_last_ctx_used = context ? context : "";
+    }
     return ids;
 }
 
@@ -1527,6 +1548,13 @@ static int lua_get_scores(lua_State * L) {
     return 1;
 }
 
+// 上次推理实际使用的上文尾部（2026-11-12 协议 v4，调试窗口灰显）
+static int lua_get_ctx_used(lua_State * L) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    lua_pushstring(L, g_last_ctx_used.c_str());
+    return 1;
+}
+
 // 上次 score 的 CE 三分量（2026-11-11 调试窗口协议 v2）：text → {c1, c2, c3}
 // ——未乘 kCeW 权重的原始分量；缺 token / 评分失败位 = nil（lua 侧显示空）
 static int lua_get_ce3(lua_State * L) {
@@ -1694,6 +1722,7 @@ static int lua_index(lua_State * L) {
     if (strcmp(key, "is_ready") == 0)       lua_pushcfunction(L, lua_is_ready);
     else if (strcmp(key, "get_scores") == 0) lua_pushcfunction(L, lua_get_scores);
     else if (strcmp(key, "get_ce3") == 0)    lua_pushcfunction(L, lua_get_ce3);
+    else if (strcmp(key, "get_ctx_used") == 0) lua_pushcfunction(L, lua_get_ctx_used);
     else if (strcmp(key, "prep_hit") == 0)   lua_pushboolean(L, g_last_prep_hit ? 1 : 0);
     else if (strcmp(key, "score") == 0)     lua_pushcfunction(L, lua_score);
     else if (strcmp(key, "prepare") == 0)   lua_pushcfunction(L, lua_prepare);

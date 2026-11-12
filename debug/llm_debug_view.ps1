@@ -6,9 +6,12 @@
 
  行协议（| 分隔 UTF-8 文本行；自由文本字段已把 | 转全角｜、换行转空格）：
    V|rime-llm-live|1|plugin|<日期>                     连接后服务端立即推
-   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n      每次触发评分的调用头
-                                                       （ctx=完整上文；cache=HIT 时 ms=0；
-                                                        src ∈ tsf/com/uia/rime）
+   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n|prep|n_seen|ctx_used
+                                                       每次触发评分的调用头
+                                                       （ctx=完整去空白上文；src ∈ tsf/com/uia/rime；
+                                                        prep=KV 预解命中；n_seen=全词数（协议保留
+                                                        不显示）；v4 尾字段 ctx_used=推理用尾部，
+                                                        查看器灰显其余前缀——缺字段不灰显）
    C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1
                                                        逐候选按最终序（上限 20 行）：
                                                        eng=引擎原序 s1=层1分(=fb+u1)
@@ -132,7 +135,17 @@ $lblInfo = New-Lbl 8 $Y_INFO 1048 $H_INFO
 $lblInfo.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $lblInfo.Text = '—'
 
-$lblCtx = New-Lbl 8 $Y_CTX 1048 $H_CTX
+# 上文行 = RichTextBox（2026-11-12 灰显，协议 v4）：推理用尾部（ctx_used）
+# 正常色、未用前缀灰色；ReadOnly 无边框仿 Label，竖滚动条承接长上文
+$lblCtx = [System.Windows.Forms.RichTextBox]::new()
+$lblCtx.Location = [System.Drawing.Point]::new(8, $Y_CTX)
+$lblCtx.Size = [System.Drawing.Size]::new(1048, $H_CTX)
+$lblCtx.Font = [System.Drawing.Font]::new('Segoe UI', 9)
+$lblCtx.BackColor = [System.Drawing.Color]::White
+$lblCtx.BorderStyle = 'None'
+$lblCtx.ReadOnly = $true
+$lblCtx.ScrollBars = 'Vertical'
+$form.Controls.Add($lblCtx)
 $lblCtx.Text = '上文：—'
 
 $btnPause = [System.Windows.Forms.Button]::new()
@@ -221,7 +234,25 @@ function Update-Current {
     $(if ($inv.prep) { $inv.prep } else { '-' }),
     $inv.ms, $inv.tick,
     $inv.n, $inv.ready)
-  $script:lblCtx.Text = '上文：' + $(if ($inv.ctx) { $inv.ctx } else { '（空）' })
+  # 上文行灰显（协议 v4 ctx_used）：推理用尾部正常色、未用前缀灰色；
+  # 缺字段/找不到子串（旧 DLL、空上文）= 全文正常色
+  $lblCtx.Clear()
+  $lblCtx.SelectionColor = [System.Drawing.Color]::Black
+  $lblCtx.AppendText('上文：')
+  if (-not $inv.ctx) {
+    $lblCtx.AppendText('（空）')
+  } else {
+    $idx = -1
+    if ($inv.ctxused) { $idx = $inv.ctx.LastIndexOf($inv.ctxused) }
+    if ($idx -gt 0) {
+      $lblCtx.SelectionColor = [System.Drawing.Color]::Gray
+      $lblCtx.AppendText($inv.ctx.Substring(0, $idx))
+      $lblCtx.SelectionColor = [System.Drawing.Color]::Black
+      $lblCtx.AppendText($inv.ctx.Substring($idx))
+    } else {
+      $lblCtx.AppendText($inv.ctx)
+    }
+  }
   $script:grid.Rows.Clear()
   # 动态对齐（2026-11-11 用户定案）：本次调用内每个数值组向最宽者看齐、
   # 右对齐（补空格）——等宽字体下小数点逐位对齐，整数部分位数不同不再错位
@@ -377,6 +408,7 @@ function Handle-Line {
                 prep = $(if ($f.Count -gt 10) { $f[10] } else { '' })
                 # 协议 L 行第 12 字段 n_seen（全词数）自 2026-11-12 不再显示
                 # （公式简化后无消费方）——协议保留，查看器不解析不显示
+                ctxused = $(if ($f.Count -gt 12) { $f[12] } else { '' })
                 rows = [System.Collections.Generic.List[object]]::new() }
       $script:invList.Add($inv)
       while ($script:invList.Count -gt 50) { $script:invList.RemoveAt(0) }
