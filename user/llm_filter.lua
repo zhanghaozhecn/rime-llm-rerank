@@ -19,6 +19,56 @@ local FREQ_BETA = 12 -- 对数词频融合系数（v3 2026-11-06 六维联合标
 -- （组内融合分降序、同分稳定），其余候选按融合分降序在后——即原 elw
 -- 的极限行为（elw·span 加成→∞），不再需要 span 间接量。默认 false。
 
+-- 多音词码对预置降分修正（2026-11-13 用户定案：机制部署、表作参考）：
+-- LLM 只见词不见码义——高频字在低频读音的码上被 CE 系统性抬分（如
+-- 与@vkh：无法区分 yǔ/yù，按字频给分）。该类错误跨用户普适（结构性，
+-- 不随用户词频积累消失——污染对恰恰是用户不爱打的码对），但**词码表
+-- 是方案特异的**（码表结构与候选集随方案不同）→ 表不内置、放用户目
+-- 录 llm_pairfix.tsv（行 `词\t码[\tλ]`，λ 缺省 PAIRFIX_LAMBDA_DEFAULT，
+-- `#` 注释；**无文件 = 机制休眠**，其他方案零影响）。每次融合触发轻量
+-- 重读（每窗一次，相对推理成本可忽略）——编辑文件即时生效。软降分
+-- 非禁用：只破 CE 险胜的近平局。fade 门：用户自身该词码对累计
+-- ≥PAIRFIX_FADE_UNI 次 = 正向使用证据 → 预置让位（与 clamp 的"计数值
+-- 小"横截面判据方向相反——clamp 在用户域 +13 错证伪）。推导与用户域
+-- 验证（wiki 无泄漏拆半 +0.0630pp; 用户域双域回放净增益 +5 窗无损失;
+-- 拼读双拼参考表 = 研究资料库 eval/pairfix_pool_ratio.tsv 193 对,
+-- 复制为用户目录 llm_pairfix.tsv 启用）见研究库"词码对预置降分修正"节。
+local PAIRFIX_LAMBDA_DEFAULT = 5.0
+local PAIRFIX_FADE_UNI = 3
+
+-- 读参考表 → { ["词\t码"] = λ }; 无文件返回 nil（机制休眠）
+local function pairfix_table()
+    local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
+    if not ok or type(ud) ~= "string" or ud == "" then return nil end
+    local f = io.open(ud .. "\\llm_pairfix.tsv", "r")
+    if not f then return nil end
+    local tbl = {}
+    for line in f:lines() do
+        line = line:gsub("\r$", "")
+        if line ~= "" and line:sub(1, 1) ~= "#" then
+            local w, c, lam = line:match("^(.-)\t(.-)\t([%d%.]+)$")
+            local lambda = lam and tonumber(lam) or PAIRFIX_LAMBDA_DEFAULT
+            if not w then w, c = line:match("^(.-)\t(.-)$") end
+            if w and w ~= "" and c and c ~= "" then
+                tbl[w .. "\t" .. c] = lambda
+            end
+        end
+    end
+    f:close()
+    return tbl
+end
+
+-- 命中且未 fade 返回修正分（融合分 −λ）；否则 0
+local function pairfix_penalty(tbl, text, input)
+    if not tbl then return 0 end
+    local key = text .. "\t" .. (input or "")
+    local lam = tbl[key]
+    if not lam then return 0 end
+    local uni = _G.user_uni and _G.user_uni[key] or 0
+    if uni >= PAIRFIX_FADE_UNI then return 0 end
+    return lam
+end
+
 local cfg = {
     -- 编码匹配模式（2026-09-30 取代 min_code_len/max_code_len）：
     -- 全串匹配输入编码串，语法同 Rime 自身 speller/auto_select_pattern。
@@ -352,6 +402,9 @@ return function(translation, env)
         --   ③ expected_length_weight (elw) 已退役 (2026-11-07): 整句偏好改由
         --      two_code_sentence 开关直接实现 (见下方满长组优先块)。
         --   ④ 冷启动 eff≡0 且 uni 无计数时自动退化为 score 序, 成熟期三项叠加。
+        --   ⑤ 多音词码对预置修正（2026-11-13）: 参考表（用户目录
+        --      llm_pairfix.tsv）命中且未 fade 时融合分 −λ（见文件顶部
+        --      注释; debug.txt 行尾 修正-λ 标注）。
         -- 失败哨兵分 (≤-1e9) 排尾部不参与; 同分稳定保序 (融合序)。
         local fused_scores = nil
         if #ordered > 1 and scores then
@@ -379,6 +432,8 @@ return function(translation, env)
                 end
             end
             fused_scores = {}
+            -- 多音词码对预置修正参考表（每窗轻量重读, 无文件 = 休眠）
+            local pftbl = pairfix_table()
             local arr = {}
             for i, c in ipairs(ordered) do
                 local s = scores[c.text]
@@ -386,13 +441,15 @@ return function(translation, env)
                     local n = freq_eff and freq_eff(c.text, input) or 0
                     local u1_term = _G.user_unigram_term
                             and _G.user_unigram_term(c.text, input) or 0
-                    local t = s + FREQ_BETA * math.log(1 + n) + u1_term
+                    local pf = pairfix_penalty(pftbl, c.text, input)
+                    local t = s + FREQ_BETA * math.log(1 + n) + u1_term - pf
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = n,
                                         fb = FREQ_BETA * math.log(1 + n),
                                         u1 = u1_term,
+                                        pf = pf > 0 and pf or nil,
                                         uni = _G.user_uni and
                                               _G.user_uni[c.text .. "\t"
                                                           .. input] or 0,
@@ -403,12 +460,14 @@ return function(translation, env)
                     -- 无 CE 分（评分失败/无法表示）→ 层1 分 + 窗内最低
                     -- LLM 分（压制到窗底, 保留层1 耦合; 见上注）
                     local s1 = s1_of[c.text]
+                    local pf = pairfix_penalty(pftbl, c.text, input)
                     local t = (s1 or -math.huge)
-                            + (min_valid and min_valid or 0)
+                            + (min_valid and min_valid or 0) - pf
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = 0, fb = 0,
+                                        pf = pf > 0 and pf or nil,
                                         uni = _G.user_uni and
                                               _G.user_uni[c.text .. "\t"
                                                           .. input] or 0,
@@ -518,11 +577,13 @@ return function(translation, env)
                 if d then
                     local ce_str = (d.ce and d.ce > -1e9)
                         and string.format("%8.3f", d.ce) or "   -sent"
+                    local pf_str = d.pf
+                        and string.format(" 修正-λ%g", d.pf) or ""
                     table.insert(dbg, string.format(
-                        "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%8.3f  原次序%d→%d",
+                        "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%8.3f  原次序%d→%d%s",
                         i, c.text, ce_str, d.eff or 0, d.fb or 0,
                         d.u1 or 0, d.full and 1 or 0, d.fused or 0,
-                        d.cerank or 0, final_rank[c.text] or 0))
+                        d.cerank or 0, final_rank[c.text] or 0, pf_str))
                 end
             end
             local moved = {}
