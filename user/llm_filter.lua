@@ -213,11 +213,14 @@ return function(translation, env)
     local layer1 = {}
     local s1_of = {}
     do
+        -- 词码对记账（2026-11-13 用户定案）: eff/uni 查询键 = (候选, 当前
+        -- 窗码)——多音词属不同词条, 每个码对只看自己的历史（wiki 59,681
+        -- 窗: 分键全面更优 −0.34~−0.73pp 随龄扩大）
         local fe, bt = _G.user_freq_eff, _G.user_unigram_term
         for i, c in ipairs(all) do
-            local n = fe and fe(c.text) or 0
+            local n = fe and fe(c.text, input) or 0
             local s = FREQ_BETA * math.log(1 + n)
-            if bt then s = s + bt(c.text) end
+            if bt then s = s + bt(c.text, input) end
             layer1[i] = { c = c, s = s, idx = i }
             s1_of[c.text] = s
         end
@@ -360,14 +363,29 @@ return function(translation, env)
                 local okc, m = pcall(llm.get_ce3)
                 if okc and type(m) == "table" then ce3map = m end
             end
+            -- 无 CE 分候选的融合（2026-11-13 用户定案，取代 2026-11-07
+            -- "回退后两项和"）: CE 取窗内已算 CE 的**最低分**（score =
+            -- −CE 负值域，最低分 = 最差证据 → 该候选排到窗底但保留与
+            -- 层1 的正常耦合）。旧语义（融合=层1 分）会让无法表示的字
+            -- （如 tokenizer 打不出的 生僻字「𬤊」）以 S1=0 压过全部
+            -- 负分候选跳首选——aki 实况窗两例实证。全窗无有效 CE 时
+            -- min_valid 为 nil、加 0 = 自然回退层1 序。
+            local min_valid = nil
+            for _, c in ipairs(ordered) do
+                local s = scores[c.text]
+                if is_valid_llm_score(s)
+                        and (not min_valid or s < min_valid) then
+                    min_valid = s
+                end
+            end
             fused_scores = {}
             local arr = {}
             for i, c in ipairs(ordered) do
                 local s = scores[c.text]
                 if is_valid_llm_score(s) then
-                    local n = freq_eff and freq_eff(c.text) or 0
+                    local n = freq_eff and freq_eff(c.text, input) or 0
                     local u1_term = _G.user_unigram_term
-                            and _G.user_unigram_term(c.text) or 0
+                            and _G.user_unigram_term(c.text, input) or 0
                     local t = s + FREQ_BETA * math.log(1 + n) + u1_term
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
@@ -376,22 +394,26 @@ return function(translation, env)
                                         fb = FREQ_BETA * math.log(1 + n),
                                         u1 = u1_term,
                                         uni = _G.user_uni and
-                                              _G.user_uni[c.text] or 0,
+                                              _G.user_uni[c.text .. "\t"
+                                                          .. input] or 0,
                                         ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = t, cerank = i }
                     end
                 else
-                    -- 无 CE 分（评分失败）→ 后两项和（层1 分）参与窗内排序
-                    -- （2026-11-07 两层重排语义; 层1 已保证其在本窗内）
+                    -- 无 CE 分（评分失败/无法表示）→ 层1 分 + 窗内最低
+                    -- LLM 分（压制到窗底, 保留层1 耦合; 见上注）
                     local s1 = s1_of[c.text]
-                    fused_scores[c.text] = s1 or -math.huge
-                    arr[i] = { c = c, t = s1 or -math.huge, idx = i }
+                    local t = (s1 or -math.huge)
+                            + (min_valid and min_valid or 0)
+                    fused_scores[c.text] = t
+                    arr[i] = { c = c, t = t, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = 0, fb = 0,
                                         uni = _G.user_uni and
-                                              _G.user_uni[c.text] or 0,
+                                              _G.user_uni[c.text .. "\t"
+                                                          .. input] or 0,
                                         ce3 = ce3map and ce3map[c.text] or nil,
-                                        fused = s1 or -1 / 0, cerank = i,
+                                        fused = t, cerank = i,
                                         invalid = true }
                     end
                 end

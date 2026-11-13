@@ -88,29 +88,33 @@ local function append_raw(text)
 end
 
 -- === 用户词频计数 (llm_filter 排序融合用, 2026-08-19; 2026-08-21 改 Rime 时间衰减) ===
--- _G.user_word_freq: 词 → {c=累计次数, d=衰减计数 dee, t=最后提交 tick}
+-- **2026-11-13 词码对记账（用户原则性定案）**: 键 = (词, 码)——多音词属于
+-- 不同的词, 不同编码的相同字词是不同词条（形码方案 userdb 同语义）;
+-- wiki 59,681 窗重分析: 分键全面更优（−0.34~−0.73pp 随龄扩大）。
+-- _G.user_word_freq: "词\t码" → {c=累计次数, d=衰减计数 dee, t=最后提交 tick}
 -- _G.user_freq_tick: 全局 tick (每词提交 +1, 同 rime userdb UpdateTickCount)
 -- 衰减算法 = librime algo::formula_d (user_dictionary.cc 调频同源):
---   提交: dee = 1 + dee·exp((t_old - t_now)/800)   时间常数 τ=800 tick
---   查询: eff = dee·exp((t_word - t_now)/800)      (未提交期间持续衰减)
--- τ=400 (2026-11-06 v3 六维联合标定: w2×w3×β×τ×γ×λ 68,640 点, 用户域
--- argmax τ=400; 词频记忆半衰 ~277 次上屏, 旧值 800 偏长)
--- 每 20 个新词重写落盘 user_freq.tsv (崩溃最多丢 19 次计数)。仅计含中文的词
--- (判定为非 ASCII 即计, 与 Rime userdb "任何词条提交推 tick" 同源口径——
--- 全角标点也计, 有意为之; 2026-09-03 tick 含一字词定案同源原则)。
--- 格式: 首行 "#tick=N", 数据行 "词\t累计\tdee\ttick"; 兼容旧版 "词\t次数"
--- (迁移为 dee=次数, tick=当前 — 视为刚提交过)。
--- 落盘修剪 (2026-09-04): eff < 1e-3 的冷词条不再写 (对融合分影响
--- < 0.002 nats, 远低于任何实际分差) — 文件有界, 旧冷词条自然淘汰。
+--   提交: dee = 1 + dee·exp((t_old - t_now)/τ)    查询: eff = dee·exp(...)
+-- τ=400 (2026-11-06 v3 六维联合标定; 词频记忆半衰 ~277 次上屏)
+-- 每 20 个新词重写落盘 user_freq.tsv (崩溃最多丢 19 次计数)。仅计含中文的词。
+-- 格式: 首行 "#tick=N", 数据行 "词\t码\t累计\tdee\ttick" (码=完整提交码,
+-- 捕获失败为空串)。**旧词级格式 ("词\t累计\tdee\ttick" 与 "词\t次数")
+-- 不再兼容读取**——旧数据是词级合并口径（分键语义下无法拆分到词码对）,
+-- 读取端忽略、落盘时自然剥除（研究: calibrate_sc_percode 合并=错误口径,
+-- 分键自该版起重新积累）。
+-- 落盘修剪 (2026-09-04): eff < 1e-3 的冷词条不再写 — 文件有界。
 local FREQ_TAU = 400
 local FREQ_FLUSH = 20
 local freq_dirty = 0
+local function freq_key(word, code)
+    return word .. "\t" .. (code or "")
+end
 local function freq_file()
     return rime_api.get_user_data_dir() .. "\\user_freq.tsv"
 end
 local function freq_load()
     _G.user_word_freq = _G.user_word_freq or {}
-    local tick, maxt, legacy = nil, 0, {}
+    local tick, maxt = nil, 0
     local f = io.open(freq_file(), "r")
     if f then
         for line in f:lines() do
@@ -118,44 +122,43 @@ local function freq_load()
             if t then
                 tick = tonumber(t)
             else
-                local w, c, d, tk = line:match("^(.-)\t(%d+)\t([%d%.]+)\t(%d+)$")
-                if w and c and d and tk then
-                    _G.user_word_freq[w] = { c = tonumber(c), d = tonumber(d), t = tonumber(tk) }
+                -- 新格式: 词\t码\t累计\tdee\ttick (码 = 小写字母串或空,
+                -- %l* 不匹配旧词级格式的数字段 → 旧行天然忽略)
+                local w, c, cn, d, tk =
+                    line:match("^(.-)\t(%l*)\t(%d+)\t([%d%.]+)\t(%d+)$")
+                if w and cn and d and tk then
+                    _G.user_word_freq[w .. "\t" .. c] =
+                        { c = tonumber(cn), d = tonumber(d), t = tonumber(tk) }
                     if tonumber(tk) > maxt then maxt = tonumber(tk) end
-                else
-                    local w2, n = line:match("^(.-)\t(%d+)$")
-                    if w2 and n then legacy[#legacy + 1] = { w2, tonumber(n) } end
                 end
             end
         end
         f:close()
     end
     _G.user_freq_tick = tick or maxt
-    for _, e in ipairs(legacy) do
-        _G.user_word_freq[e[1]] = { c = e[2], d = e[2], t = _G.user_freq_tick }
-    end
 end
 local function freq_save()
     local f = io.open(freq_file(), "w")
     if f then
         f:write("#tick=" .. (_G.user_freq_tick or 0) .. "\n")
         local now = _G.user_freq_tick or 0
-        for w, e in pairs(_G.user_word_freq) do
+        for k, e in pairs(_G.user_word_freq) do
             local eff = e.d * math.exp((e.t - now) / FREQ_TAU)
             if eff >= 1e-3 then  -- 修剪: 衰减到噪声级的冷词条不落盘
-                f:write(string.format("%s\t%d\t%.3f\t%d\n", w, e.c, e.d, e.t))
+                f:write(string.format("%s\t%d\t%.3f\t%d\n", k, e.c, e.d, e.t))
             end
         end
         f:close()
     end
 end
-local function freq_bump(word)
+local function freq_bump(word, code)
     if not _G.user_word_freq then freq_load() end
     _G.user_freq_tick = (_G.user_freq_tick or 0) + 1
-    local e = _G.user_word_freq[word]
+    local k = freq_key(word, code)
+    local e = _G.user_word_freq[k]
     if not e then
         e = { c = 0, d = 0, t = 0 }
-        _G.user_word_freq[word] = e
+        _G.user_word_freq[k] = e
     end
     e.d = 1 + e.d * math.exp((e.t - _G.user_freq_tick) / FREQ_TAU)
     e.c = e.c + 1
@@ -167,9 +170,9 @@ local function freq_bump(word)
     end
 end
 
--- 衰减有效计数 (llm_filter 融合用): rime formula_d 查询式
-_G.user_freq_eff = function(w)
-    local e = _G.user_word_freq and _G.user_word_freq[w]
+-- 衰减有效计数 (llm_filter 融合用): rime formula_d 查询式 (词码对)
+_G.user_freq_eff = function(w, code)
+    local e = _G.user_word_freq and _G.user_word_freq[freq_key(w, code)]
     if not e or e.d <= 0 then return 0 end
     return e.d * math.exp((e.t - (_G.user_freq_tick or e.t)) / FREQ_TAU)
 end
@@ -183,7 +186,8 @@ end
 -- 词典词流同源); **原始计数不衰减** (τ 衰减只作用于 eff 单词项; 原始计数
 -- 是标定语义本身, 冷启动自然回退)。
 -- 存储: user_bigram.tsv (文件名历史沿用), 首行 "#n=N" (n_seen),
--- 行 "u\t词\t次数"。
+-- 行 "u\t词\t码\t次数"（2026-11-13 词码对记账; 旧词级 "u\t词\t次数"
+-- 读取端忽略——合并口径语义废弃, 落盘自然剥除）。
 -- 文件有界: 用户一年 ~10 万行 ≈ 3MB, 原始计数不修剪 (标定语义)。
 local function bigram_file()
     return rime_api.get_user_data_dir() .. "\\user_bigram.tsv"
@@ -203,7 +207,11 @@ local function bigram_load()
             else
                 local kind, a, cnt = line:match("^(%a)\t(.-)\t(%d+)$")
                 if kind == "u" then
-                    _G.user_uni[a] = tonumber(cnt)
+                    -- 词码对键 = "词\t码"（a 内含 \t = 新格式）; 旧词级行
+                    -- （a 不含 \t）合并口径语义废弃, 忽略
+                    if a:find("\t", 1, true) then
+                        _G.user_uni[a] = tonumber(cnt)
+                    end
                 end
                 -- 旧版 b 行（前词\t词\t次数）: 累计 Bigram 已退役, 忽略
             end
@@ -215,13 +223,13 @@ local function bigram_save()
     local f = io.open(bigram_file(), "w")
     if f then
         f:write("#n=" .. (_G.user_nseen or 0) .. "\n")
-        for w, c in pairs(_G.user_uni) do
-            f:write("u\t" .. w .. "\t" .. c .. "\n")
+        for k, c in pairs(_G.user_uni) do
+            f:write("u\t" .. k .. "\t" .. c .. "\n")
         end
         f:close()
     end
 end
-local function bigram_bump(word)
+local function bigram_bump(word, code)
     bigram_load()
     -- 只计含中文字符的词 (CJK 统合区 U+4E00-U+9FFF)
     local is_cjk = false
@@ -230,22 +238,24 @@ local function bigram_bump(word)
     end
     if not is_cjk then return end
     _G.user_nseen = (_G.user_nseen or 0) + 1
-    _G.user_uni[word] = (_G.user_uni[word] or 0) + 1
+    local k = word .. "\t" .. (code or "")
+    _G.user_uni[k] = (_G.user_uni[k] or 0) + 1
     bigram_dirty = bigram_dirty + 1
     if bigram_dirty >= FREQ_FLUSH then
         bigram_save()
         bigram_dirty = 0
     end
 end
--- 融合项查询 (llm_filter): 累计 Unigram 项
+-- 融合项查询 (llm_filter): 累计 Unigram 项（词码对）
 -- 2026-11-11 简化：log(uni+1)。原 log p1=(uni+1)/(n_seen+2万) 的分母与 δ
 -- 缩放均为窗内常数（同窗所有候选同减同值），对排序零影响——log(a/b)=
 -- log a − log b，常数项不改变大小关系，位级等价去除（用户定案）。
 -- 概率语义（log p1）与 δ=0.5/1 cohort 终审记录见研究库历史口径；
 -- uni 原始计数不衰减，存储 user_bigram.tsv 与 #n=N 头行不变。
-_G.user_unigram_term = function(x)
+-- 2026-11-13 词码对记账: x/码 组成键。
+_G.user_unigram_term = function(x, code)
     bigram_load()
-    return math.log(((_G.user_uni[x] or 0) + 1))
+    return math.log(((_G.user_uni[x .. "\t" .. (code or "")] or 0) + 1))
 end
 
 local function find_overlap(prev, curr)
@@ -424,17 +434,18 @@ local function processor(key, env)
                 pending_code = ""
                 last_full = ""
                 -- 词频计数: 仅含中文的词 (含英文/数字/标点不参与融合)
+                -- 2026-11-13 词码对记账: bump 键 = (词, 完整提交码)
                 if has_chinese then
                     if not _G.user_word_freq then freq_load() end  -- 诊断读数前先就位
-                    local before = _G.user_freq_eff and _G.user_freq_eff(w) or 0
+                    local before = _G.user_freq_eff and _G.user_freq_eff(w, code) or 0
                     local t_before = _G.user_freq_tick or 0
-                    freq_bump(w)
-                    bigram_bump(w)
+                    freq_bump(w, code)
+                    bigram_bump(w, code)
                     local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
                     if dbg_flag then
                         live(string.format("E|%s|%s|%.3f|%.3f|%d|%d",
                             os.date("%H:%M:%S"), live_esc(w), before,
-                            _G.user_freq_eff(w), t_before,
+                            _G.user_freq_eff(w, code), t_before,
                             _G.user_freq_tick or 0))
                         pcall(function()
                             local f = io.open(rime_api.get_user_data_dir()
