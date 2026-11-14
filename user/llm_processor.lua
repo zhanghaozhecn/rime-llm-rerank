@@ -96,12 +96,16 @@ end
 -- 衰减算法 = librime algo::formula_d (user_dictionary.cc 调频同源):
 --   提交: dee = 1 + dee·exp((t_old - t_now)/τ)    查询: eff = dee·exp(...)
 -- τ=400 (2026-11-06 v3 六维联合标定; 词频记忆半衰 ~277 次上屏)
--- 每 20 个新词重写落盘 user_freq.tsv (崩溃最多丢 19 次计数)。仅计含中文的词。
+-- 每 20 个新词重写落盘 user_eff.tsv (崩溃最多丢 19 次计数)。仅计含中文的词。
 -- 格式: 首行 "#tick=N", 数据行 "词\t码\t累计\tdee\ttick" (码=完整提交码,
 -- 捕获失败为空串)。**旧词级格式 ("词\t累计\tdee\ttick" 与 "词\t次数")
 -- 不再兼容读取**——旧数据是词级合并口径（分键语义下无法拆分到词码对）,
 -- 读取端忽略、落盘时自然剥除（研究: calibrate_sc_percode 合并=错误口径,
 -- 分键自该版起重新积累）。
+-- 文件名 (2026-11-14 用户定案: 与实际语义对应): user_eff.tsv = 衰减
+-- 计数账本 (查询接口 freq_eff); 旧名 user_freq.tsv 历史沿用至本版——
+-- 新名文件缺失时回退读旧名 (行格式相同, 无损接管), 落盘一律写新名,
+-- 旧文件保留不删 (手动清理)。
 -- 落盘修剪 (2026-09-04): eff < 1e-3 的冷词条不再写 — 文件有界。
 local FREQ_TAU = 400
 local FREQ_FLUSH = 20
@@ -110,12 +114,15 @@ local function freq_key(word, code)
     return word .. "\t" .. (code or "")
 end
 local function freq_file()
-    return rime_api.get_user_data_dir() .. "\\user_freq.tsv"
+    return rime_api.get_user_data_dir() .. "\\user_eff.tsv"
 end
 local function freq_load()
     _G.user_word_freq = _G.user_word_freq or {}
     local tick, maxt = nil, 0
     local f = io.open(freq_file(), "r")
+    if not f then  -- 旧名回退 (改名前数据, 行格式相同)
+        f = io.open(rime_api.get_user_data_dir() .. "\\user_freq.tsv", "r")
+    end
     if f then
         for line in f:lines() do
             local t = line:match("^#tick=(%d+)$")
@@ -185,12 +192,16 @@ end
 -- 口径 = 研究库 §三十二(续): 只计含中文字符的词 (纯标点不计——与标定的
 -- 词典词流同源); **原始计数不衰减** (τ 衰减只作用于 eff 单词项; 原始计数
 -- 是标定语义本身, 冷启动自然回退)。
--- 存储: user_bigram.tsv (文件名历史沿用), 首行 "#n=N" (n_seen),
--- 行 "u\t词\t码\t次数"（2026-11-13 词码对记账; 旧词级 "u\t词\t次数"
--- 读取端忽略——合并口径语义废弃, 落盘自然剥除）。
+-- 存储: user_unigram.tsv (2026-11-14 用户定案: 与实际语义对应——
+-- 本文件自 2026-11-08 起只存 unigram 累计计数, "bigram" 名随该项
+-- 退役已名不副实; 查询接口 user_unigram_term 同名对应), 首行 "#n=N"
+-- (n_seen), 行 "u\t词\t码\t次数"（2026-11-13 词码对记账; 旧词级
+-- "u\t词\t次数" 读取端忽略——合并口径语义废弃, 落盘自然剥除）。
+-- 旧名 user_bigram.tsv 回退读（行格式相同, 无损接管）, 落盘一律写
+-- 新名, 旧文件保留不删 (手动清理)。
 -- 文件有界: 用户一年 ~10 万行 ≈ 3MB, 原始计数不修剪 (标定语义)。
 local function bigram_file()
-    return rime_api.get_user_data_dir() .. "\\user_bigram.tsv"
+    return rime_api.get_user_data_dir() .. "\\user_unigram.tsv"
 end
 local BIGRAM_VCAP = 20000
 local bigram_dirty = 0
@@ -199,6 +210,10 @@ local function bigram_load()
     _G.user_uni = {}
     _G.user_nseen = 0
     local f = io.open(bigram_file(), "r")
+    if not f then  -- 旧名回退 (改名前数据, 行格式相同)
+        f = io.open(rime_api.get_user_data_dir() .. "\\user_bigram.tsv",
+                    "r")
+    end
     if f then
         for line in f:lines() do
             local n = line:match("^#n=(%d+)$")

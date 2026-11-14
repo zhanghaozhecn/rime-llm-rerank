@@ -8,7 +8,10 @@ os.execute('mkdir "' .. SMK .. '" 2>nul')
 
 -- ═══ A. processor 单元 ═══
 rime_api = { get_user_data_dir = function() return SMK end }
-local pf = io.open(SMK .. "\\user_bigram.tsv", "w")
+-- 2026-11-14 文件名语义化: user_eff.tsv (衰减账) / user_unigram.tsv (累计账),
+-- 旧名 user_freq.tsv / user_bigram.tsv 回退读。本块先写新名测正路径,
+-- 回退用例在 uni 断言后。
+local pf = io.open(SMK .. "\\user_unigram.tsv", "w")
 pf:write("#n=42\n")
 pf:write("u\t键\tjki\t3\n")     -- 新格式: 词码对
 pf:write("u\t键\t\t2\n")        -- 新格式: 空码（捕获失败提交）
@@ -28,6 +31,17 @@ approx(_G.user_unigram_term("键", "jki"), math.log(4), "uni(键,jki)=ln4")
 approx(_G.user_unigram_term("键", "jk"), math.log(1), "uni(键,jk)=ln1 无史")
 approx(_G.user_unigram_term("级", "jls"), math.log(1), "uni(级,*) 旧行忽略")
 approx(_G.user_unigram_term("键", ""), math.log(3), "uni(键,'')=ln3 空码对")
+
+-- 旧名回退: 新名缺失时读 user_bigram.tsv (行格式相同, 无损接管)
+os.remove(SMK .. "\\user_unigram.tsv")
+pf = io.open(SMK .. "\\user_bigram.tsv", "w")
+pf:write("#n=7\n")
+pf:write("u\t回\thei\t5\n")
+pf:close()
+_G.user_uni = nil
+proc = dofile("..\\user\\llm_processor.lua")
+approx(_G.user_unigram_term("回", "hei"), math.log(6),
+       "uni(回,hei)=ln6 旧名回退")
 
 -- freq 侧: 手工置分键账本 → 带码查询
 _G.user_word_freq = { ["键\tjki"] = { c = 2, d = 2.0, t = 0 } }
