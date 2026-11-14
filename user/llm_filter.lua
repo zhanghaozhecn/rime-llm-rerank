@@ -560,7 +560,10 @@ return function(translation, env)
                     d3 and live_fmt3(d3[2]) or "",
                     d3 and live_fmt3(d3[3]) or "",
                     d and live_fmt3(d.fb) or "",   -- 词频得分 β·log1p(eff)
-                    d and live_fmt3(d.u1) or ""    -- 累计得分 log(p1)
+                    d and live_fmt3(d.u1) or "",   -- 累计得分 log(p1)
+                    -- v5: 词码对预置修正分（λ, 0=未命中）——总分已含 −λ,
+                    -- 查看器总分格据此补 −λ 标注恢复逐项验算
+                    d and live_fmt3(d.pf or 0) or "0"
                 }, "|"))
             end
             for i, c in ipairs(ordered) do live_c(c, i) end

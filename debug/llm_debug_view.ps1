@@ -12,7 +12,8 @@
                                                         prep=KV 预解命中；n_seen=全词数（协议保留
                                                         不显示）；v4 尾字段 ctx_used=推理用尾部，
                                                         查看器灰显其余前缀——缺字段不灰显）
-   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1
+   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf
+                                                       pf=修正分 λ（v5, 0=未命中）
                                                        逐候选按最终序（上限 20 行）：
                                                        eng=引擎原序 s1=层1分(=fb+u1)
                                                        ce=加权 CE（空=无分）
@@ -190,10 +191,10 @@ $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridVie
 # 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
 # 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 3 位小数，
 # 等宽字体逐位对齐），公式不再单独展示；其余列只剩 身份(#/词) 与 状态(满/窗)
-# 列宽与源码版 WeaselLLMDebug 同值（GDI 实测取宽 + 对齐补空格的余量）；
-# 总分置前 = 纯分值（三项已各自带过程，不重复连加式）
+# 列宽与源码版 WeaselLLMDebug 同值（GDI 实测取宽 + 对齐补空格的余量；
+# 总分 90 = v5 容 −λ 修正标注）；总分置前 = 分值 + 修正标注
 $cols = @(
-  @('#', 26), @('词', 64), @('总分', 64), @('CE', 310), @('衰减词频分', 140),
+  @('#', 26), @('词', 64), @('总分', 90), @('CE', 310), @('衰减词频分', 140),
   @('累计词频分', 112), @('匹配词长', 72), @('窗', 30))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
@@ -266,7 +267,12 @@ function Update-Current {
     $v = Get-Num $r.eff;  if ($null -ne $v) { $wFbE = [Math]::Max($wFbE, (Format-F1 $v).Length) }
     $v = Get-Num $r.u1;   if ($null -ne $v) { $wU1L = [Math]::Max($wU1L, (Format-F1 $v).Length) }
     $v = Get-Num $r.uni;  if ($null -ne $v) { $wUni = [Math]::Max($wUni, ([string][int]$v).Length) }
-    $v = Get-Num $r.fused; if ($null -ne $v) { $wFuL = [Math]::Max($wFuL, (Format-F1 $v).Length) }
+    $v = Get-Num $r.fused; if ($null -ne $v) {
+      $ext = 0
+      $pfv = Get-Num $r.pf
+      if ($pfv -and $pfv -gt 0) { $ext = ('−{0:g}' -f $pfv).Length }
+      $wFuL = [Math]::Max($wFuL, (Format-F1 $v).Length + $ext)
+    }
   }
   $i = 0
   foreach ($r in $inv.rows) {
@@ -342,11 +348,15 @@ function Get-U1Proc($r, $wL, $wU) {
   return $lead + ('=ln(1+{0})' -f (Pad-L ([string][int]$uni) $wU))
 }
 
-# 总分格：融合分值（三项已各自带过程，不重复连加式；$wL=分数宽）
+# 总分格：融合分值 + 修正标注（v5：pf>0 时尾追 −λ，恢复逐项验算——
+# 总分 = CE + 衰减词频分 + 累计词频分 − 修正；$wL=分数宽）
 function Get-FusedProc($r, $wL) {
   $fu = Get-Num $r.fused
   if ($null -eq $fu) { return '—' }
-  return Pad-L (Format-F1 $fu) $wL
+  $s = Pad-L (Format-F1 $fu) $wL
+  $pf = Get-Num $r.pf
+  if ($pf -and $pf -gt 0) { $s += ('−{0:g}' -f $pf) }
+  return $s
 }
 
 function Add-Event {
@@ -432,7 +442,9 @@ function Handle-Line {
                        ce2 = $(if ($f.Count -gt 13) { $f[13] } else { '' })
                        ce3 = $(if ($f.Count -gt 14) { $f[14] } else { '' })
                        fb = $(if ($f.Count -gt 15) { $f[15] } else { '' })
-                       u1 = $(if ($f.Count -gt 16) { $f[16] } else { '' }) })
+                       u1 = $(if ($f.Count -gt 16) { $f[16] } else { '' })
+                       # v5: 修正分 pf（词码对预置降分 λ, 0=未命中）
+                       pf = $(if ($f.Count -gt 17) { $f[17] } else { '' }) })
       if (-not $script:paused -and $script:viewIdx -eq ($script:invList.Count - 1)) {
         Update-Current
       }
