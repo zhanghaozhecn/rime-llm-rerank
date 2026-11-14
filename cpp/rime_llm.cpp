@@ -47,11 +47,14 @@ extern "C" {
 // 处，模型直接放根目录、不套子文件夹；8-27 曾误用 %USERPROFILE%\
 // gguf_models\。自定义位置用 schema model_path 显式指向。便携模式小狼毫
 // 的用户目录不在 %APPDATA%\Rime，此类部署需显式配置 model_path）
+// 默认模型 = Qwen2.5-0.5B-Q4_K_M（2026-11-14 用户定案：0.5B 候选段延迟
+// 0.69×、弱 CPU 机友好，精度代价 −0.12~−0.30pp 可接受；旧默认
+// Qwen3.5-0.8B）
 static std::string default_model_path() {
   const char *ad = getenv("APPDATA");
   if (ad && *ad)
-    return std::string(ad) + "\\Rime\\Qwen3.5-0.8B-Q4_K_M.gguf";
-  return "Qwen3.5-0.8B-Q4_K_M.gguf";
+    return std::string(ad) + "\\Rime\\Qwen2.5-0.5B-Q4_K_M.gguf";
+  return "Qwen2.5-0.5B-Q4_K_M.gguf";
 }
 static std::string  g_model_path      = default_model_path();
 static int          g_min_tokens      = 1;
@@ -71,7 +74,10 @@ static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker 
 // v3 2026-11-06 六维联合标定 (w2×w3×β×τ×γ×λ 68,640 点, 用户域标定 →
 // wiki 平台内就近): (1.0, 1.05, 0.45); 旧值 (1.0, 1.13, 0.61) 出自
 // 2026-09-16 20% 前缀标定。
-static constexpr double kCeW1 = 1.0, kCeW2 = 1.05, kCeW3 = 0.45;
+// 2026-11-14 默认模型改 Qwen2.5-0.5B 后重标定（用户域 34k + wiki 池化
+// 180k 网格 w2×w3×β, 偶半选→奇半验四半区一致）: (1.0, 1.10, 0.60)
+// + β 12→14（calibrate_model_05b, τ=400 词频侧与模型无关不动）。
+static constexpr double kCeW1 = 1.0, kCeW2 = 1.10, kCeW3 = 0.60;
 
 // ============================================================
 // 模型状态

@@ -50,10 +50,10 @@ $LUA_DIR = Join-Path $RIME_USER "lua"
 # 默认模型路径 = 用户文件夹（2026-08-27 用户定案：不假设存在 D: 分区；
 # 有 D 盘模型的机器在 GUI/schema 里显式填 D:\gguf_models\...）
 # 与运行期默认保持一致：C++ 侧取 RIME 用户目录根（同上注册表优先）
-$DEFAULT_MODEL = Join-Path $RIME_USER "Qwen3.5-0.8B-Q4_K_M.gguf"
+$DEFAULT_MODEL = Join-Path $RIME_USER "Qwen2.5-0.5B-Q4_K_M.gguf"
 # 完整模型的体量下限（与"下载完成转正"判据同一个数）：小于它 = 疑似半截/损坏
 $MODEL_MIN_BYTES = 100MB
-$MODEL_URL = "https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf"
+$MODEL_URL = "https://hf-mirror.com/QuantFactory/Qwen2.5-0.5B-GGUF/resolve/main/Qwen2.5-0.5B.Q4_K_M.gguf"
 
 function Find-WeaselDir {
   # ① 注册表 WeaselRoot（安装器写入；最可靠）
@@ -278,7 +278,7 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
     "  debug_fusion: $(if ($p.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $sec += "  model_path: " + (Convert-ToYamlPath $modelPath) }
-  else { $sec += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen3.5-0.8B-Q4_K_M.gguf>" }
+  else { $sec += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen2.5-0.5B-Q4_K_M.gguf>" }
   $out = @()
   if ($start -gt 0) { $out += $lines[0..($start - 1)] }
   $out += $sec
@@ -315,7 +315,7 @@ function Merge-LlmParams($prior) {
 }
 
 # llm_rerank 配置节；modelPath 非空时写为生效行（反斜杠→正斜杠，含空格则加引号），
-# 留空则保持注释示例（运行时默认 %APPDATA%\Rime\Qwen3.5-0.8B-Q4_K_M.gguf）。
+# 留空则保持注释示例（运行时默认 %APPDATA%\Rime\Qwen2.5-0.5B-Q4_K_M.gguf）。
 # prior = 重跑加 LLM 时方案里已有的参数（Read-LlmParams 结果）——先剥后插
 # 重建节时逐键保留，防止重跑把用户自定义参数重置回默认（model_path 同思路）。
 function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
@@ -331,7 +331,7 @@ function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
     "  debug_fusion: $(if ($d.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
-  else { $l += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen3.5-0.8B-Q4_K_M.gguf>" }
+  else { $l += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen2.5-0.5B-Q4_K_M.gguf>" }
   return $l
 }
 function Convert-ToYamlPath([string]$p) {
@@ -857,7 +857,7 @@ function Run-InstallerGui {
   $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；`n**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
   $tipStrip = "剥离：把选中方案里的 LLM 组件行与 llm_rerank 配置节整个删掉`n（方案回到『未接入』状态），并自动重新部署。`n日常只想改参数请用『保存并生效』。"
   $tipFiles = "复制文件：停服务 → 清理旧二进制 → 替换 rime_llm.dll 与 lua → 启服务。"
-  $tipDownload = "下载模型：ModelScope 断点续传（curl -C -），落点 = 左边的模型路径框`n（留空 = 用户文件夹里的默认名 Qwen3.5-0.8B-Q4_K_M.gguf）。`n失败会保留 .download 分片，再点一次即续传。"
+  $tipDownload = "下载模型：hf-mirror 断点续传（curl -C -），落点 = 左边的模型路径框`n（留空 = 用户文件夹里的默认名 Qwen2.5-0.5B-Q4_K_M.gguf）。`n失败会保留 .download 分片，再点一次即续传。"
 
   # 控件工厂：AutoSize=false —— Label 默认宽度会被缩到文字宽，
   # 破坏公式行"+"右对齐列与编辑框同列对齐（固定宽度才可核对不相交）

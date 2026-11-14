@@ -7,9 +7,11 @@ local llm_loaded_for = nil  -- enabled value when llm was loaded
 
 -- 融合系数 β 为内置常数（2026-11-05 用户定案：标定产物退出用户配置面——用户没有
 -- 标定能力；与 FREQ_TAU=400 同待遇。调整 = 改代码随下次发版生效）：
-local FREQ_BETA = 12 -- 对数词频融合系数（v3 2026-11-06 六维联合标定
-                     -- w2×w3×β×τ×γ×λ 68,640 点: 用户域标定 → wiki 平台内
-                     -- 就近点 (1.05/0.45/β12/τ400/γ1/λ0.5), 见研究库 §三十三）
+local FREQ_BETA = 14 -- 对数词频融合系数（2026-11-14 默认模型改
+                     -- Qwen2.5-0.5B 后重标定: 用户域 34k + wiki 池化
+                     -- 180k 网格, kCeW (1.0,1.10,0.60)+β14 偶半选→奇半
+                     -- 验四半区一致, 见研究库 calibrate_model_05b; 旧
+                     -- v3 (1.05/0.45/β12) 为 0.8B 标定值）
                      -- fused = score + β·log(1+eff) + log(0.5·p1)
                      --   p1 = 用户累计 Unigram 平滑概率（llm_processor 维护,
                      --   _G.user_unigram_term 查询; 累计 Bigram 项已退役
