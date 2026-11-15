@@ -326,7 +326,7 @@ int main(int argc, char **argv) {
 
   llama_backend_init();
   llama_model_params mp = llama_model_default_params();
-  mp.use_mmap = 1;
+  mp.load_mode = LLAMA_LOAD_MODE_MMAP;
   g_model = llama_model_load_from_file(model_path, mp);
   if (!g_model) {
     // keep the console window open on double-click launch
@@ -339,7 +339,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   g_vocab = llama_model_get_vocab(g_model);
-  int vs = llama_n_vocab(g_vocab);
+  int vs = llama_vocab_n_tokens(g_vocab);
 
   // fixed workload: 10-token context + 5 candidates matching the heaviest
   // real typing case: 3 x 2-token + 2 x 3-token candidates (triggers the
@@ -394,7 +394,7 @@ int main(int argc, char **argv) {
     cp.n_threads = thr;
     cp.n_threads_batch = thr;
     cp.n_seq_max = 12;
-    llama_context *ctx = llama_new_context_with_model(g_model, cp);
+    llama_context *ctx = llama_init_from_model(g_model, cp);
     if (!ctx) {
       out("  thr=%2d: ctx create FAILED\n", thr);
       continue;
