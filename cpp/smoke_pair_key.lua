@@ -110,7 +110,7 @@ yield = function(c) table.insert(OUT, c) end
 filter(translation, env)
 for i, c in ipairs(OUT) do io.write("[yield] ", tostring(c.text), "\n") end
 assert(#OUT == 3, "yield count")
--- 「一处」@iock 强词码对史（12·ln4+ln6 ≈ 18.2）应压过引擎序首「一次」
+-- 「一处」@iock 强词码对史（14·ln4+ln6 ≈ 21.2）应压过引擎序首「一次」
 assert(OUT[1].text == "一处",
     "词码对层1 未生效: OUT[1]=" .. tostring(OUT[1].text))
 print("[smoke] 层1 词码对排序生效: 一处 升首 OK")

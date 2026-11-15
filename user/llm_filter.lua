@@ -188,6 +188,10 @@ local function init_config(env)
     -- min_tokens 不再从 schema 读取（2026-09-30 用户配置面移除；固定 C++ 默认 1）
     local dbg = sc:get_bool("llm_rerank/debug_fusion")
     if dbg ~= nil then cfg.debug_fusion = dbg end
+    -- 两码整句开关（2026-11-16 补读——自 13ed97e 引入起从未读 schema，
+    -- 插件版该开关一直停默认 false；源码版正常，故真机未暴露）
+    local tcs = sc:get_bool("llm_rerank/two_code_sentence")
+    if tcs ~= nil then cfg.two_code_sentence = tcs end
 end
 
 -- === Filter ===
@@ -283,9 +287,27 @@ return function(translation, env)
     end
     local cands = {}
     local l1win = {}
-    for i = 1, math.min(cfg.max_candidates, #layer1) do
-        cands[i] = layer1[i].c.text
-        l1win[i] = layer1[i].c.text
+    -- two_code_sentence 准入优先（2026-11-16 用户定案，取代 2026-11-07 的
+    -- "词频前 k 全参评 + 最终排序满长组置顶"）：层1 序里词长==⌊码长/2⌋ 的
+    -- 候选优先占满评分窗，前 k 个才算 CE；不足 k 个就空着——不匹配词长的
+    -- 候选不进窗、不算 CE（"有没有 CE 分"即满长组成员标志，「匹配词长」
+    -- 专用列随之删除）。层1 排序本身不变，只改窗口准入。
+    local tcs_elen = cfg.two_code_sentence and math.floor(#input / 2) or 0
+    if tcs_elen >= 1 then
+        local taken = 0
+        for _, e in ipairs(layer1) do
+            if taken < cfg.max_candidates
+                    and (utf8.len(e.c.text or "") or 0) == tcs_elen then
+                taken = taken + 1
+                cands[#cands + 1] = e.c.text
+                l1win[#l1win + 1] = e.c.text
+            end
+        end
+    else
+        for i = 1, math.min(cfg.max_candidates, #layer1) do
+            cands[i] = layer1[i].c.text
+            l1win[i] = layer1[i].c.text
+        end
     end
     -- 候选窗快照改为层1 前 k（LLM 实际评分范围; 训练语料窗口语义随生产）
     _G.llm_last_window = { input = input, cands = l1win }
@@ -293,9 +315,18 @@ return function(translation, env)
     -- 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在
     -- 生产里命中率极低（每个新词的上文都变），却要维护一套失效逻辑（编辑键清
     -- 缓存/候选集变化重放），删掉以简化。每次触发都是真实推理。
+    -- 满长准入后窗不足 2 个（不足即空着的极端形态）：无重排意义、整窗跳过
+    -- 评分（与源码版一致显式发 S 事件，避免静默零输出）——ok 保持 nil，
+    -- 下游走层1 序展示。
+    if tcs_elen >= 1 and #cands < 2 then
+        live("S|" .. os.date("%H:%M:%S") .. "|full_len_lt2|" ..
+             live_esc(input) .. "|" .. live_esc(ctx_src))
+        cands = {}
+    end
     local ok, result, scores
     local ev_ms = 0   -- 本轮推理耗时（实时调试 L 行用）
-    do
+    if #cands >= 2 then
+        do
         local t0 = os.clock()
         ok, result = pcall(function() return llm.score(context, cands) end)
         local elapsed_ms = (os.clock() - t0) * 1000
@@ -337,6 +368,7 @@ return function(translation, env)
                 cand_str, ctx_safe, res_info, elapsed_ms, ctx_src))
             ef:close()
         end
+        end   -- if #cands >= 2（满长准入窗 <2 跳过评分）
     end
 
     -- 融合诊断 (llm_rerank/debug_fusion: true): 每次评分逐候选记录
