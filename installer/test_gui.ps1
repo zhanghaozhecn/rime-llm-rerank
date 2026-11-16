@@ -551,7 +551,7 @@ engine:
   Combo-Key $cmb 0x24 "是"
   Start-Sleep -Milliseconds 400
   $modelBox = (Get-Ctls | Where-Object { $_.cls -match '(?i)COMBOBOX' } | Select-Object -Last 1).text
-  $expectDef = Join-Path (Join-Path $sandbox "Rime") "Qwen2.5-0.5B-Q4_K_M.gguf"
+  $expectDef = Join-Path (Join-Path $sandbox "Rime") "qwen2.5-0.5b-instruct-q4_k_m.gguf"
   Write-Host ("  模型路径框 = " + $modelBox)
   Assert ("默认模型路径 = 用户目录下的默认名（实测 '$modelBox'）") ($modelBox -eq $expectDef)
   # ③ 相对路径必须被拒绝（不落盘）

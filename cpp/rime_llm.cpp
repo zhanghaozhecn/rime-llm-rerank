@@ -47,14 +47,16 @@ extern "C" {
 // 处，模型直接放根目录、不套子文件夹；8-27 曾误用 %USERPROFILE%\
 // gguf_models\。自定义位置用 schema model_path 显式指向。便携模式小狼毫
 // 的用户目录不在 %APPDATA%\Rime，此类部署需显式配置 model_path）
-// 默认模型 = Qwen2.5-0.5B-Q4_K_M（2026-11-14 用户定案：0.5B 候选段延迟
-// 0.69×、弱 CPU 机友好，精度代价 −0.12~−0.30pp 可接受；旧默认
-// Qwen3.5-0.8B）
+// 默认模型 = qwen2.5-0.5b-instruct-q4_k_m（2026-11-16 用户定案 base→instruct
+// 切换：聚合效果与 base 无差异（2 万窗对照 +0.02pp）、下载源 ModelScope
+// 官方仓国内直连快；CPU 延迟与 base 无差异（三轮交替配对 ≈50.5ms，
+// 张量逐层同量化——首测 +9% 系小样本非交替测量误差）。
+// 前身 2026-11-14 的 Qwen2.5-0.5B-Q4_K_M（base），更旧 Qwen3.5-0.8B）
 static std::string default_model_path() {
   const char *ad = getenv("APPDATA");
   if (ad && *ad)
-    return std::string(ad) + "\\Rime\\Qwen2.5-0.5B-Q4_K_M.gguf";
-  return "Qwen2.5-0.5B-Q4_K_M.gguf";
+    return std::string(ad) + "\\Rime\\qwen2.5-0.5b-instruct-q4_k_m.gguf";
+  return "qwen2.5-0.5b-instruct-q4_k_m.gguf";
 }
 static std::string  g_model_path      = default_model_path();
 static int          g_min_tokens      = 1;
