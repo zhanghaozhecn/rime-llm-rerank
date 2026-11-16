@@ -6,11 +6,13 @@
 
  行协议（| 分隔 UTF-8 文本行；自由文本字段已把 | 转全角｜、换行转空格）：
    V|rime-llm-live|1|plugin|<日期>                     连接后服务端立即推
+                                                       （协议握手保留；版本/日期徽章
+                                                       自 2026-11-16 不再显示）
    L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n|prep|n_seen|ctx_used
                                                        每次触发评分的调用头
                                                        （ctx=完整去空白上文；src ∈ tsf/com/uia/rime；
-                                                        prep=KV 预解命中；n_seen=全词数（协议保留
-                                                        不显示）；v4 尾字段 ctx_used=推理用尾部，
+                                                        prep=KV 预解命中；n=候选数、n_seen=全词数
+                                                        （协议保留不显示）；v4 尾字段 ctx_used=推理用尾部，
                                                         查看器灰显其余前缀——缺字段不灰显）
    C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf
                                                        pf=修正分 λ（v5, 0=未命中）
@@ -96,7 +98,6 @@ $script:events  = [System.Collections.Generic.List[string]]::new()  # 最近 200
 $script:viewIdx = -1          # 当前展示的调用下标（-1 = 无）
 $script:paused  = $false
 $script:connected = $false
-$script:verInfo = ''
 
 # ── 布局常量（96 DPI 设计值；DpiK≠1 时末尾统一 字体×k + Scale(k,k)）──────
 $Y_STATUS = 8;  $H_STATUS = 22
@@ -249,11 +250,11 @@ function Update-Current {
     return
   }
   $inv = $script:invList[$script:viewIdx]
-  $script:lblInfo.Text = ('{0}  输入 {1}   来源 {2}   预解 {3}   {4}ms   tick {5}   n={6}   就绪 {7}' -f
+  $script:lblInfo.Text = ('{0}  输入 {1}   来源 {2}   预解 {3}   {4}ms   tick {5}   就绪 {6}' -f
     $inv.t, $inv.input, $inv.src,
     $(if ($inv.prep) { $inv.prep } else { '-' }),
     $inv.ms, $inv.tick,
-    $inv.n, $inv.ready)
+    $inv.ready)
   # 上文行灰显（协议 v4 ctx_used）：推理用尾部正常色、未用前缀灰色；
   # 缺字段/找不到子串（旧 DLL、空上文）= 全文正常色
   $lblCtx.Clear()
@@ -416,7 +417,8 @@ function Handle-Line {
   if ($line -eq '::CONNECTED') {
     $script:connected = $true
     if (-not $script:paused) {
-      $script:lblStatus.Text = '已连接' + $(if ($script:verInfo) { ' · ' + $script:verInfo } else { '' })
+      # 协议版本/日期徽章自 2026-11-16 不再显示（两版查看器同口径）
+      $script:lblStatus.Text = '已连接'
       $script:lblStatus.ForeColor = [System.Drawing.Color]::Green
     }
     return
@@ -432,21 +434,17 @@ function Handle-Line {
   $f = $line -split '\|'
   switch ($f[0]) {
     'V' {
-      if ($f.Count -ge 5 -and $f[1] -eq 'rime-llm-live') {
-        $script:verInfo = ('协议 v{0} · {1} 版 · {2}' -f $f[2], $f[3], $f[4])
-        if ($script:connected -and -not $script:paused) {
-          $script:lblStatus.Text = '已连接 · ' + $script:verInfo
-        }
-      }
+      # 协议握手行仅作识别；版本/日期徽章自 2026-11-16 不再显示，
+      # 行本身保留供协议升级判别
     }
     'L' {
       if ($f.Count -lt 10) { return }
       $inv = @{ t = $f[1]; input = $f[2]; cache = $f[3]; src = $f[4]
                 ctx = $f[5]; tick = $f[6]; ms = $f[7]; ready = $f[8]
-                n = $f[9]
                 prep = $(if ($f.Count -gt 10) { $f[10] } else { '' })
-                # 协议 L 行第 12 字段 n_seen（全词数）自 2026-11-12 不再显示
-                # （公式简化后无消费方）——协议保留，查看器不解析不显示
+                # 协议 L 行第 10 字段 n（候选数，信息行 2026-11-16 起不再显示）
+                # 与第 12 字段 n_seen（全词数，2026-11-12 起不再显示）均
+                # 协议保留，查看器不解析不显示
                 ctxused = $(if ($f.Count -gt 12) { $f[12] } else { '' })
                 rows = [System.Collections.Generic.List[object]]::new() }
       $script:invList.Add($inv)
