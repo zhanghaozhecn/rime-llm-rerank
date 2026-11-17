@@ -469,7 +469,7 @@ local function processor(key, env)
                                 f:write(string.format(
                                     "%s|commit|词=%s|码=%s|eff %.3f→%.3f|tick %d→%d|flush脏%d/20\n",
                                     os.date("%H:%M:%S"), w, code, before,
-                                    _G.user_freq_eff(w), t_before,
+                                    _G.user_freq_eff(w, code), t_before,
                                     _G.user_freq_tick or 0, freq_dirty))
                                 f:close()
                             end
