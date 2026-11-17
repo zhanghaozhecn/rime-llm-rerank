@@ -14,8 +14,9 @@
                                                         prep=KV 预解命中；n=候选数、n_seen=全词数
                                                         （协议保留不显示）；v4 尾字段 ctx_used=推理用尾部，
                                                         查看器灰显其余前缀——缺字段不灰显）
-   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf
-                                                       pf=修正分 λ（v5, 0=未命中）
+   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf|sdelta
+                                                       pf=旧修正分 λ（v5, 0=未命中）
+                                                       sdelta=有符号分数（v6, +200/+100/-5/0）
                                                        逐候选按最终序（上限 20 行）：
                                                        eng=引擎原序 s1=层1分(=fb+u1)
                                                        ce=加权 CE（空=无分）
@@ -313,11 +314,16 @@ function Update-Current {
     $v = Get-Num $r.u1;   if ($null -ne $v) { $wU1L = [Math]::Max($wU1L, (Format-F1 $v).Length) }
     $v = Get-Num $r.uni;  if ($null -ne $v) { $wUni = [Math]::Max($wUni, ([string][int]$v).Length) }
     $v = Get-Num $r.fused; if ($null -ne $v) { $wFuL = [Math]::Max($wFuL, (Format-F1 $v).Length) }
-    $v = Get-Num $r.pf; if ($null -ne $v) {
-      # 命中 = -λ 带 ASCII 负号；未命中 = "0.0"（3 字符）。不用三元运算符：
-      # open_debug_window.bat 回退 PowerShell 5.1，? : 是 7.0 才有的语法
-      $n = if ($v -gt 0) { (Format-F1 $v).Length + 1 } else { 3 }
+    $v = Get-Num $r.sdelta; if ($null -ne $v) {
+      # v6 有符号：正分带 '+'（+200.0），负分自带 '-'
+      $n = (Format-F1 $v).Length + $(if ($v -gt 0) { 1 } else { 0 })
       $wPfL = [Math]::Max($wPfL, $n)
+    } else {
+      $v = Get-Num $r.pf; if ($null -ne $v) {
+        # 旧 v5 回退：命中 = -λ 带 ASCII 负号；未命中 = "0.0"（3 字符）
+        $n = if ($v -gt 0) { (Format-F1 $v).Length + 1 } else { 3 }
+        $wPfL = [Math]::Max($wPfL, $n)
+      }
     }
   }
   $i = 0
@@ -403,11 +409,16 @@ function Get-FusedProc($r, $wL) {
   return Pad-L (Format-F1 $fu) $wL
 }
 
-# 修正分格（2026-11-16 定案：专属列取代 v5 总分格尾追 −λ 标注——pf=0 时
-# 尾追什么都不显示，命中与否完全不可见）：λ=词码对预置降分，命中显示 -λ
-# （负值，验算 总分 = CE + 衰减词频分 + 累计词频分 + 修正分），未命中 0.0；
-# 协议缺 pf 字段（旧发送端）→ —；$wL=列内最宽值宽
+# 修正分格（2026-11-17 v6：有符号词码对分数）：+200/+100 = 固定首选/
+# 次选加分，-5 = pairfix 扣分，0.0 = 未命中；验算
+# 总分 = CE + 衰减词频分 + 累计词频分 + 修正分。旧发送端无 sdelta 时
+# 回退 v5 的 -λ/0.0；协议缺字段 → —；$wL=列内最宽值宽
 function Get-PfProc($r, $wL) {
+  $sd = Get-Num $r.sdelta
+  if ($null -ne $sd) {
+    $s = if ($sd -gt 0) { '+' + (Format-F1 $sd) } else { Format-F1 $sd }
+    return Pad-L $s $wL
+  }
   $pf = Get-Num $r.pf
   if ($null -eq $pf) { return '—' }
   $s = if ($pf -gt 0) { '-' + (Format-F1 $pf) } else { '0.0' }
@@ -521,8 +532,10 @@ function Handle-Line {
                        ce3 = $(if ($f.Count -gt 14) { $f[14] } else { '' })
                        fb = $(if ($f.Count -gt 15) { $f[15] } else { '' })
                        u1 = $(if ($f.Count -gt 16) { $f[16] } else { '' })
-                       # v5: 修正分 pf（词码对预置降分 λ, 0=未命中）
-                       pf = $(if ($f.Count -gt 17) { $f[17] } else { '' }) })
+                       # v5: 旧修正分 pf（负分幅度, 0=未命中）
+                       pf = $(if ($f.Count -gt 17) { $f[17] } else { '' })
+                       # v6: 有符号词码对分数（+200/+100/-5/0）
+                       sdelta = $(if ($f.Count -gt 18) { $f[18] } else { '' }) })
       if (-not $script:paused -and $script:viewIdx -eq ($script:invList.Count - 1)) {
         Update-Current
       }

@@ -21,24 +21,21 @@ local FREQ_BETA = 14 -- 对数词频融合系数（2026-11-14 默认模型改
 -- （组内融合分降序、同分稳定），其余候选按融合分降序在后——即原 elw
 -- 的极限行为（elw·span 加成→∞），不再需要 span 间接量。默认 false。
 
--- 多音词码对预置降分修正（2026-11-13 用户定案：机制部署、表作参考）：
--- LLM 只见词不见码义——高频字在低频读音的码上被 CE 系统性抬分（如
--- 与@vkh：无法区分 yǔ/yù，按字频给分）。该类错误跨用户普适（结构性，
--- 不随用户词频积累消失——污染对恰恰是用户不爱打的码对），但**词码表
--- 是方案特异的**（码表结构与候选集随方案不同）→ 表不内置、放用户目
--- 录 llm_pairfix.tsv（行 `词\t码[\tλ]`，λ 缺省 PAIRFIX_LAMBDA_DEFAULT，
--- `#` 注释；**无文件 = 机制休眠**，其他方案零影响）。每次融合触发轻量
--- 重读（每窗一次，相对推理成本可忽略）——编辑文件即时生效。软降分
--- 非禁用：只破 CE 险胜的近平局。fade 门：用户自身该词码对累计
--- ≥PAIRFIX_FADE_UNI 次 = 正向使用证据 → 预置让位（与 clamp 的"计数值
--- 小"横截面判据方向相反——clamp 在用户域 +13 错证伪）。推导与用户域
--- 验证（wiki 无泄漏拆半 +0.0630pp; 用户域双域回放净增益 +5 窗无损失;
--- 拼读双拼参考表 = 研究资料库 eval/pairfix_pool_ratio.tsv 193 对,
--- 复制为用户目录 llm_pairfix.tsv 启用）见研究库"词码对预置降分修正"节。
-local PAIRFIX_LAMBDA_DEFAULT = 5.0
+-- 词码对分数修正（2026-11-17 用户定案：固顶与 pairfix 合并为一张有符号表）：
+-- 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>[+|-]分数`：
+--   +200 / 200 = 加分（固定首选，09876 上屏时写入）
+--   +100 / 100 = 加分（固定次选，手动编辑）
+--   -5         = 扣分（pairfix 预置降噪；无第三列 = 旧默认扣 5）
+-- `#` 注释；无文件 = 机制休眠；每次窗口准入/融合轻量重读，编辑即时生效。
+-- 正分不受 fade 限制（09876 上屏会累计 user_uni，固定首选必须持久）；
+-- 负分保留 fade（用户该词码对累计 >= PAIRFIX_FADE_UNI 次 -> 预置让位）。
+-- 正分候选即使不在层1 前 k，也优先占用评分窗名额（见窗口准入段）。
+-- 旧 2026-11-13 pairfix 推导（wiki 拆半/用户域回放）保留在文件头历史注释：
+-- 与@vkh 等污染对按字频抬分；负分只破 CE 险胜的近平局。
+local PAIRFIX_PENALTY_DEFAULT = 5.0
 local PAIRFIX_FADE_UNI = 3
 
--- 读参考表 → { ["词\t码"] = λ }; 无文件返回 nil（机制休眠）
+-- 读参考表 → { ["词\t码"] = 有符号分数 }; 无文件返回 nil（机制休眠）
 local function pairfix_table()
     local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
     if not ok or type(ud) ~= "string" or ud == "" then return nil end
@@ -48,11 +45,21 @@ local function pairfix_table()
     for line in f:lines() do
         line = line:gsub("\r$", "")
         if line ~= "" and line:sub(1, 1) ~= "#" then
-            local w, c, lam = line:match("^(.-)\t(.-)\t([%d%.]+)$")
-            local lambda = lam and tonumber(lam) or PAIRFIX_LAMBDA_DEFAULT
-            if not w then w, c = line:match("^(.-)\t(.-)$") end
-            if w and w ~= "" and c and c ~= "" then
-                tbl[w .. "\t" .. c] = lambda
+            local w, c, sv = line:match("^(.-)\t(.-)\t(.+)$")
+            local delta
+            if sv then
+                sv = sv:match("^([%+%-]?[%d%.]+)$")
+                if not sv then
+                    w, c = nil, nil   -- 第三列非法：跳过，不并进码键
+                else
+                    delta = tonumber(sv)
+                end
+            else
+                w, c = line:match("^(.-)\t(.-)$")
+                delta = -PAIRFIX_PENALTY_DEFAULT  -- 旧两列格式 = 默认扣 5
+            end
+            if w and w ~= "" and c and c ~= "" and delta then
+                tbl[w .. "\t" .. c] = delta
             end
         end
     end
@@ -60,15 +67,16 @@ local function pairfix_table()
     return tbl
 end
 
--- 命中且未 fade 返回修正分（融合分 −λ）；否则 0
-local function pairfix_penalty(tbl, text, input)
+-- 命中返回有符号分数修正；正分（固定首选/次选）不受 fade 限制
+local function pairfix_delta(tbl, text, input)
     if not tbl then return 0 end
     local key = text .. "\t" .. (input or "")
-    local lam = tbl[key]
-    if not lam then return 0 end
+    local d = tbl[key]
+    if not d or d == 0 then return 0 end
+    if d > 0 then return d end
     local uni = _G.user_uni and _G.user_uni[key] or 0
     if uni >= PAIRFIX_FADE_UNI then return 0 end
-    return lam
+    return d
 end
 
 local cfg = {
@@ -285,28 +293,49 @@ return function(translation, env)
             return a.idx < b.idx   -- 稳定: 同分保引擎序
         end)
     end
+    -- 词码对分数表：正分（固定首选 +200 / 固定次选 +100）在层1 排序后
+    -- 优先占用评分窗名额；窗口大小仍不超过 max_candidates（不扩窗、不增
+    -- decode 行数）。分数表在窗口准入前读一次，本窗融合复用同一份。
+    local pftbl = pairfix_table()
     local cands = {}
     local l1win = {}
+    local win_seen = {}
+    local function add_win(e)
+        if #cands >= cfg.max_candidates then return end
+        local t = e.c.text
+        if win_seen[t] then return end
+        win_seen[t] = true
+        cands[#cands + 1] = t
+        l1win[#l1win + 1] = t
+    end
+    -- 正分候选优先占位：+200 先于 +100；同分按层1 分、再按引擎序。
+    if pftbl then
+        local pos = {}
+        for _, e in ipairs(layer1) do
+            local d = pairfix_delta(pftbl, e.c.text, input)
+            if d > 0 then pos[#pos + 1] = { e = e, d = d } end
+        end
+        table.sort(pos, function(a, b)
+            if a.d ~= b.d then return a.d > b.d end
+            if a.e.s ~= b.e.s then return a.e.s > b.e.s end
+            return a.e.idx < b.e.idx
+        end)
+        for _, p in ipairs(pos) do add_win(p.e) end
+    end
     -- two_code_sentence 准入优先（2026-11-16 用户定案，取代 2026-11-07 的
-    -- "词频前 k 全参评 + 最终排序满长组置顶"）：层1 序里词长==⌊码长/2⌋ 的
-    -- 候选优先占满评分窗，前 k 个才算 CE；不足 k 个就空着——不匹配词长的
-    -- 候选不进窗、不算 CE（"有没有 CE 分"即满长组成员标志，「匹配词长」
-    -- 专用列随之删除）。层1 排序本身不变，只改窗口准入。
+    -- "词频前 k 全参评 + 最终排序满长组置顶"）：正分固定词先占位后，剩余
+    -- 名额里词长==⌊码长/2⌋ 的候选优先；不足就空着——不匹配词长的候选
+    -- 不进窗、不算 CE。固定词不受满长限制（固定首选优先于整句规则）。
     local tcs_elen = cfg.two_code_sentence and math.floor(#input / 2) or 0
     if tcs_elen >= 1 then
-        local taken = 0
         for _, e in ipairs(layer1) do
-            if taken < cfg.max_candidates
-                    and (utf8.len(e.c.text or "") or 0) == tcs_elen then
-                taken = taken + 1
-                cands[#cands + 1] = e.c.text
-                l1win[#l1win + 1] = e.c.text
+            if (utf8.len(e.c.text or "") or 0) == tcs_elen then
+                add_win(e)
             end
         end
     else
-        for i = 1, math.min(cfg.max_candidates, #layer1) do
-            cands[i] = layer1[i].c.text
-            l1win[i] = layer1[i].c.text
+        for _, e in ipairs(layer1) do
+            add_win(e)
         end
     end
     -- 候选窗快照改为层1 前 k（LLM 实际评分范围; 训练语料窗口语义随生产）
@@ -436,9 +465,10 @@ return function(translation, env)
         --   ③ expected_length_weight (elw) 已退役 (2026-11-07): 整句偏好改由
         --      two_code_sentence 开关直接实现 (见下方满长组优先块)。
         --   ④ 冷启动 eff≡0 且 uni 无计数时自动退化为 score 序, 成熟期三项叠加。
-        --   ⑤ 多音词码对预置修正（2026-11-13）: 参考表（用户目录
-        --      llm_pairfix.tsv）命中且未 fade 时融合分 −λ（见文件顶部
-        --      注释; debug.txt 行尾 修正-λ 标注）。
+        --   ⑤ 词码对分数修正（2026-11-17 有符号表）: 正分 = 固定首选/次选
+        --      （+200/+100，不受 fade）；负分 = pairfix 降噪（原 −λ，保留
+        --      fade）。无 CE 分支同样生效；debug 行尾 修正%+g，C 行尾追加
+        --      sdelta（有符号；旧 pf 字段仍为负分幅度，兼容旧查看器）。
         -- 失败哨兵分 (≤-1e9) 排尾部不参与; 同分稳定保序 (融合序)。
         local fused_scores = nil
         if #ordered > 1 and scores then
@@ -466,8 +496,7 @@ return function(translation, env)
                 end
             end
             fused_scores = {}
-            -- 多音词码对预置修正参考表（每窗轻量重读, 无文件 = 休眠）
-            local pftbl = pairfix_table()
+            -- 本窗已在窗口准入前读过同一份表（正分占位用），这里复用。
             local arr = {}
             for i, c in ipairs(ordered) do
                 local s = scores[c.text]
@@ -475,15 +504,17 @@ return function(translation, env)
                     local n = freq_eff and freq_eff(c.text, input) or 0
                     local u1_term = _G.user_unigram_term
                             and _G.user_unigram_term(c.text, input) or 0
-                    local pf = pairfix_penalty(pftbl, c.text, input)
-                    local t = s + FREQ_BETA * math.log(1 + n) + u1_term - pf
+                    local delta = pairfix_delta(pftbl, c.text, input)
+                    local t = s + FREQ_BETA * math.log(1 + n) + u1_term
+                            + delta
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = n,
                                         fb = FREQ_BETA * math.log(1 + n),
                                         u1 = u1_term,
-                                        pf = pf > 0 and pf or nil,
+                                        pf = delta < 0 and -delta or nil,
+                                        sdelta = delta ~= 0 and delta or nil,
                                         uni = _G.user_uni and
                                               _G.user_uni[c.text .. "\t"
                                                           .. input] or 0,
@@ -494,14 +525,15 @@ return function(translation, env)
                     -- 无 CE 分（评分失败/无法表示）→ 层1 分 + 窗内最低
                     -- LLM 分（压制到窗底, 保留层1 耦合; 见上注）
                     local s1 = s1_of[c.text]
-                    local pf = pairfix_penalty(pftbl, c.text, input)
+                    local delta = pairfix_delta(pftbl, c.text, input)
                     local t = (s1 or -math.huge)
-                            + (min_valid and min_valid or 0) - pf
+                            + (min_valid and min_valid or 0) + delta
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = 0, fb = 0,
-                                        pf = pf > 0 and pf or nil,
+                                        pf = delta < 0 and -delta or nil,
+                                        sdelta = delta ~= 0 and delta or nil,
                                         uni = _G.user_uni and
                                               _G.user_uni[c.text .. "\t"
                                                           .. input] or 0,
@@ -595,9 +627,10 @@ return function(translation, env)
                     d3 and live_fmt3(d3[3]) or "",
                     d and live_fmt3(d.fb) or "",   -- 词频得分 β·log1p(eff)
                     d and live_fmt3(d.u1) or "",   -- 累计得分 log(p1)
-                    -- v5: 词码对预置修正分（λ, 0=未命中）——总分已含 −λ,
-                    -- 查看器总分格据此补 −λ 标注恢复逐项验算
-                    d and live_fmt3(d.pf or 0) or "0"
+                    -- v5: 旧 pf = 负分幅度（仅扣分，0=未命中），保留给旧查看器
+                    d and live_fmt3(d.pf or 0) or "0",
+                    -- v6 (2026-11-17): 有符号词码对修正分（+200/+100/−5/0）
+                    d and live_fmt3(d.sdelta or 0) or "0"
                 }, "|"))
             end
             for i, c in ipairs(ordered) do live_c(c, i) end
@@ -614,8 +647,8 @@ return function(translation, env)
                 if d then
                     local ce_str = (d.ce and d.ce > -1e9)
                         and string.format("%8.3f", d.ce) or "   -sent"
-                    local pf_str = d.pf
-                        and string.format(" 修正-λ%g", d.pf) or ""
+                    local pf_str = d.sdelta
+                        and string.format(" 修正%+g", d.sdelta) or ""
                     table.insert(dbg, string.format(
                         "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%8.3f  原次序%d→%d%s",
                         i, c.text, ce_str, d.eff or 0, d.fb or 0,
