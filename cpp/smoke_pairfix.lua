@@ -20,7 +20,8 @@ _G.user_freq_eff = function(w, c)
     return (w == "与" and c == "vkh") and 0.717 or 0
 end
 _G.user_unigram_term = function(w, c) return 0 end
-_G.user_uni = { ["与\tvkh"] = 0 }
+local UNI = { ["与\tvkh"] = 0 }
+_G.user_uni_count = function(w, c) return UNI[w .. "\t" .. (c or "")] or 0 end
 _G.user_freq_tick = 9
 
 local cfgmock = {
@@ -168,7 +169,7 @@ print(string.format("[smoke] 负分: key=%.3f = ce %.3f + fb %.3f + u1 %.3f - 5 
 local pos2 = #read_record() + 1
 
 -- ── ③ 正分 +200: 不受 fade 影响, key = 三项和 + 200, 与排第一 ──
-_G.user_uni["与\tvkh"] = 3
+UNI["与\tvkh"] = 3
 write_tbl({ "与\tvkh\t+200" })
 run()
 assert(#OUT == 5, "yield count 3")
@@ -197,7 +198,7 @@ print("[smoke] 负分 fade 让位 OK")
 local pos4 = #read_record() + 1
 
 -- ── ⑤ +200 / +100: 首选第一、次选第二 ──
-_G.user_uni["与\tvkh"] = 0
+UNI["与\tvkh"] = 0
 write_tbl({ "与\tvkh\t+200", "予\tvkh\t+100" })
 run()
 assert(#OUT == 5, "yield count 5")
@@ -216,7 +217,7 @@ local pos5 = #read_record() + 1
 
 -- ── ⑥ 正分候选不在层1前5: 仍占窗并排第一 ──
 -- 8 个候选; 前5个高词频, 玉 层1 第8; 表给 玉 +200。
-_G.user_uni["玉\tvkh"] = 0
+UNI["玉\tvkh"] = 0
 _G.user_freq_eff = function(w, c)
     if c ~= "vkh" then return 0 end
     if w == "与" or w == "予" or w == "语" or w == "育" or w == "雨" then

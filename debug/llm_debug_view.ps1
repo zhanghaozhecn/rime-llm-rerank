@@ -8,12 +8,13 @@
    V|rime-llm-live|1|plugin|<日期>                     连接后服务端立即推
                                                        （协议握手保留；版本/日期徽章
                                                        自 2026-11-16 不再显示）
-   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n|prep|n_seen|ctx_used
+   L|HH:MM:SS|input|cache|src|ctx|tick|ms|ready|n|prep|ctx_used
                                                        每次触发评分的调用头
                                                        （ctx=完整去空白上文；src ∈ tsf/com/uia/rime；
-                                                        prep=KV 预解命中；n=候选数、n_seen=全词数
-                                                        （协议保留不显示）；v4 尾字段 ctx_used=推理用尾部，
-                                                        查看器灰显其余前缀——缺字段不灰显）
+                                                        prep=KV 预解命中；n=候选数（协议保留不显示）；
+                                                        v4 尾字段 ctx_used=推理用尾部，查看器灰显
+                                                        其余前缀——缺字段不灰显；n_seen 字段
+                                                        2026-11-17 删除，按字段数兼容旧行）
    C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf|sdelta
                                                        pf=旧修正分 λ（v5, 0=未命中）
                                                        sdelta=有符号分数（v6, +200/+100/-5/0）
@@ -504,9 +505,10 @@ function Handle-Line {
                 ctx = $f[5]; tick = $f[6]; ms = $f[7]; ready = $f[8]
                 prep = $(if ($f.Count -gt 10) { $f[10] } else { '' })
                 # 协议 L 行第 10 字段 n（候选数，信息行 2026-11-16 起不再显示）
-                # 与第 12 字段 n_seen（全词数，2026-11-12 起不再显示）均
-                # 协议保留，查看器不解析不显示
-                ctxused = $(if ($f.Count -gt 12) { $f[12] } else { '' })
+                # 协议保留、查看器不解析。n_seen 字段 2026-11-17 服务端删除：
+                # 旧行 13 字段取第 13 字段，新行 12 字段取第 12 字段（ctx_used）。
+                ctxused = $(if ($f.Count -gt 12) { $f[12] }
+                            elseif ($f.Count -gt 11) { $f[11] } else { '' })
                 seq = $script:invSeq
                 rows = [System.Collections.Generic.List[object]]::new() }
       $script:invList.Add($inv)

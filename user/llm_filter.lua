@@ -27,7 +27,7 @@ local FREQ_BETA = 14 -- 对数词频融合系数（2026-11-14 默认模型改
 --   +100 / 100 = 加分（固定次选，手动编辑）
 --   -5         = 扣分（pairfix 预置降噪；无第三列 = 旧默认扣 5）
 -- `#` 注释；无文件 = 机制休眠；每次窗口准入/融合轻量重读，编辑即时生效。
--- 正分不受 fade 限制（09876 上屏会累计 user_uni，固定首选必须持久）；
+-- 正分不受 fade 限制（09876 上屏会累计 uni 计数，固定首选必须持久）；
 -- 负分保留 fade（用户该词码对累计 >= PAIRFIX_FADE_UNI 次 -> 预置让位）。
 -- 正分候选即使不在层1 前 k，也优先占用评分窗名额（见窗口准入段）。
 -- 旧 2026-11-13 pairfix 推导（wiki 拆半/用户域回放）保留在文件头历史注释：
@@ -74,7 +74,8 @@ local function pairfix_delta(tbl, text, input)
     local d = tbl[key]
     if not d or d == 0 then return 0 end
     if d > 0 then return d end
-    local uni = _G.user_uni and _G.user_uni[key] or 0
+    local uni = _G.user_uni_count
+                    and _G.user_uni_count(text, input) or 0
     if uni >= PAIRFIX_FADE_UNI then return 0 end
     return d
 end
@@ -727,9 +728,9 @@ return function(translation, env)
                                         u1 = u1_term,
                                         pf = delta < 0 and -delta or nil,
                                         sdelta = delta ~= 0 and delta or nil,
-                                        uni = _G.user_uni and
-                                              _G.user_uni[c.text .. "\t"
-                                                          .. input] or 0,
+                                        uni = _G.user_uni_count
+                                              and _G.user_uni_count(c.text,
+                                                                    input) or 0,
                                         ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = t, cerank = i }
                     end
@@ -746,9 +747,9 @@ return function(translation, env)
                         dbg[c.text] = { ce = s, eff = 0, fb = 0,
                                         pf = delta < 0 and -delta or nil,
                                         sdelta = delta ~= 0 and delta or nil,
-                                        uni = _G.user_uni and
-                                              _G.user_uni[c.text .. "\t"
-                                                          .. input] or 0,
+                                        uni = _G.user_uni_count
+                                              and _G.user_uni_count(c.text,
+                                                                    input) or 0,
                                         ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = t, cerank = i,
                                         invalid = true }
@@ -807,14 +808,15 @@ return function(translation, env)
             local ctxused = (okcu and type(cu) == "string") and live_esc(cu) or ""
             -- L 第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），
             -- 保留位置发 "-"（旧查看器显示"评缓 -"，字段数不变免错位）
-            -- 尾三字段: prep=预解码命中, nseen=累计 unigram 全词数
-            --（累计得分 log((累计次数+1)/(nseen+2万)) 的分母，调试要能手算）,
-            -- ctx_used=推理用尾部
-            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s|%s|%s",
+            -- 尾两字段: prep=预解码命中, ctx_used=推理用尾部。
+            -- n_seen 字段已删（2026-11-17 用户定案：不参与打分, 连记录
+            -- 一并取消）——查看器按字段数兼容旧行（>12 取第 13 字段，
+            -- 否则第 12 字段）。
+            live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s|%s",
                 os.date("%H:%M:%S"), live_esc(input), "-",
                 live_esc(ctx_src), live_esc(context),
                 tostring(_G.user_freq_tick), ev_ms, live_ready, #cands, prep,
-                tostring(_G.user_nseen or 0), ctxused))
+                ctxused))
             local winset = {}
             for _, w in ipairs(l1win) do winset[w] = true end
             local emitted = 0

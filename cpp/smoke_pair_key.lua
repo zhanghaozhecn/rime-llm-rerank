@@ -6,22 +6,25 @@ package.cpath = [[build/Release/?.dll]]
 local SMK = os.getenv("TEMP") .. "\\pairkey_smoke"
 os.execute('mkdir "' .. SMK .. '" 2>nul')
 
--- ═══ A. processor 单元 ═══
+-- ═══ A. processor 单元（单账本 user_ledger.tsv, 2026-11-17 合并）═══
 rime_api = { get_user_data_dir = function() return SMK end }
--- 2026-11-14 文件名语义化: user_eff.tsv (衰减账) / user_unigram.tsv (累计账),
--- 旧名 user_freq.tsv / user_bigram.tsv 回退读。本块先写新名测正路径,
--- 回退用例在 uni 断言后。
-local pf = io.open(SMK .. "\\user_unigram.tsv", "w")
-pf:write("#n=42\n")
-pf:write("u\t键\tjki\t3\n")     -- 新格式: 词码对
-pf:write("u\t键\t\t2\n")        -- 新格式: 空码（捕获失败提交）
-pf:write("u\t级\t7\n")          -- 旧词级: 忽略
-pf:write("b\t前\t词\t9\n")      -- 旧 b 行: 忽略
+for _, n in ipairs({ "user_ledger.tsv", "user_eff.tsv", "user_unigram.tsv",
+                     "user_freq.tsv", "user_bigram.tsv" }) do
+    os.remove(SMK .. "\\" .. n)
+end
+-- 新格式: "#tick=N" + "s\t词\t码\tdee\ttick\tcum"（只认 s 行）
+local pf = io.open(SMK .. "\\user_ledger.tsv", "w")
+pf:write("#tick=10\n")
+pf:write("s\t键\tjki\t2.000\t10\t3\n")   -- 衰减计数 2.0 / 累计 3
+pf:write("s\t键\t\t1.000\t9\t2\n")       -- 空码（捕获失败提交）
+pf:write("s\t旧\tzzz\t5.000\t10\t0\n")   -- 无累计计数
+pf:write("u\t忽略\tx\t7\n")              -- 旧行类型: 忽略
 pf:close()
 
 local proc = dofile("..\\user\\llm_processor.lua")
 print("[smoke] processor loaded:", type(proc))
-assert(_G.user_unigram_term and _G.user_freq_eff, "导出面")
+assert(_G.user_unigram_term and _G.user_freq_eff and _G.user_uni_count,
+       "导出面")
 
 local function approx(a, b, tag)
     assert(math.abs(a - b) < 1e-9, tag .. " 期望 " .. b .. " 实得 " .. a)
@@ -29,26 +32,50 @@ local function approx(a, b, tag)
 end
 approx(_G.user_unigram_term("键", "jki"), math.log(4), "uni(键,jki)=ln4")
 approx(_G.user_unigram_term("键", "jk"), math.log(1), "uni(键,jk)=ln1 无史")
-approx(_G.user_unigram_term("级", "jls"), math.log(1), "uni(级,*) 旧行忽略")
 approx(_G.user_unigram_term("键", ""), math.log(3), "uni(键,'')=ln3 空码对")
+approx(_G.user_uni_count("键", "jki"), 3, "uni_count(键,jki)=3")
+approx(_G.user_unigram_term("忽略", "x"), math.log(1), "旧行类型忽略")
+approx(_G.user_freq_eff("键", "jki"), 2.0, "eff(键,jki)=2.0 同账本")
+approx(_G.user_freq_eff("键", "jk"), 0, "eff(键,jk) 异码无史")
 
--- 旧名回退: 新名缺失时读 user_bigram.tsv (行格式相同, 无损接管)
+-- 旧两账本一次性迁移: cum = max(eff.commits, uni), 只对含中文词条
+os.remove(SMK .. "\\user_ledger.tsv")
+pf = io.open(SMK .. "\\user_eff.tsv", "w")
+pf:write("#tick=100\n")
+pf:write("键\tjki\t5\t2.000\t100\n")   -- commits=5 > uni=2
+pf:write("键\t\t3\t1.000\t90\n")
+pf:write("——\t\t4\t2.000\t100\n")      -- 全角标点: cum=0
+pf:close()
+pf = io.open(SMK .. "\\user_unigram.tsv", "w")
+pf:write("#n=42\n")                    -- n_seen 不再记录/读取
+pf:write("u\t键\tjki\t2\n")
+pf:write("u\t键\t\t4\n")               -- uni=4 > commits=3
+pf:write("u\t级\tjls\t9\n")            -- 仅累计账有: dee=0
+pf:close()
+_G.user_stats = nil
+proc = dofile("..\\user\\llm_processor.lua")
+approx(_G.user_unigram_term("键", "jki"), math.log(6), "迁移 max=5 → ln6")
+approx(_G.user_unigram_term("键", ""), math.log(5), "迁移 max=4 → ln5")
+approx(_G.user_unigram_term("级", "jls"), math.log(10), "仅累计账 → ln10")
+approx(_G.user_unigram_term("——", ""), math.log(1), "标点 cum=0")
+approx(_G.user_freq_eff("键", "jki"), 2.0, "迁移 eff=2.0")
+approx(_G.user_freq_eff("级", "jls"), 0, "仅累计账 dee=0")
+
+-- 旧名回退: 新两账本缺失时读 user_freq.tsv / user_bigram.tsv
+os.remove(SMK .. "\\user_eff.tsv")
 os.remove(SMK .. "\\user_unigram.tsv")
+pf = io.open(SMK .. "\\user_freq.tsv", "w")
+pf:write("#tick=7\n")
+pf:write("回\thei\t2\t1.000\t7\n")
+pf:close()
 pf = io.open(SMK .. "\\user_bigram.tsv", "w")
-pf:write("#n=7\n")
 pf:write("u\t回\thei\t5\n")
 pf:close()
-_G.user_uni = nil
+_G.user_stats = nil
 proc = dofile("..\\user\\llm_processor.lua")
 approx(_G.user_unigram_term("回", "hei"), math.log(6),
-       "uni(回,hei)=ln6 旧名回退")
-
--- freq 侧: 手工置分键账本 → 带码查询
-_G.user_word_freq = { ["键\tjki"] = { c = 2, d = 2.0, t = 0 } }
-_G.user_freq_tick = 0
-assert(_G.user_freq_eff("键", "jki") > 1.9, "eff(键,jki) 带码查询")
-assert(_G.user_freq_eff("键", "jk") == 0, "eff(键,jk) 异码无史")
-print("[smoke] eff(键,jki)=" .. _G.user_freq_eff("键", "jki") .. " OK; 异码=0 OK")
+       "uni(回,hei)=ln6 旧名回退 max=5")
+approx(_G.user_freq_eff("回", "hei"), 1.0, "eff(回,hei)=1.0 旧名回退")
 
 -- ═══ B. filter 端到端（真 DLL, 分键注入）═══
 function yield(c) end
@@ -63,7 +90,9 @@ end
 _G.user_unigram_term = function(w, c)
     return (w == "一处" and c == "iock") and math.log(6) or 0
 end
-_G.user_uni = { ["一处\tiock"] = 5 }
+_G.user_uni_count = function(w, c)
+    return (w == "一处" and c == "iock") and 5 or 0
+end
 _G.user_freq_tick = 9
 
 local cfgmock = {

@@ -76,190 +76,192 @@ local function trigger_prepare()
     end
 end
 
--- === 用户词频计数 (llm_filter 排序融合用, 2026-08-19; 2026-08-21 改 Rime 时间衰减) ===
+-- === 用户词频账本（2026-11-17 用户定案：衰减账 + 累计账合并为单文件单账本）===
+-- 两本账原本键相同（词\t码）、计数时机相同（OnCommit）、落盘节奏相同
+-- （每 20 词全量重写）——合并为一个 map、一次重写、单一格式，消除双文件
+-- 跨文件漂移与"同形异义格式"误读（2026-11-16 累计账读取事故即为后者）。
 -- **2026-11-13 词码对记账（用户原则性定案）**: 键 = (词, 码)——多音词属于
 -- 不同的词, 不同编码的相同字词是不同词条（形码方案 userdb 同语义）;
 -- wiki 59,681 窗重分析: 分键全面更优（−0.34~−0.73pp 随龄扩大）。
--- _G.user_word_freq: "词\t码" → {c=累计次数, d=衰减计数 dee, t=最后提交 tick}
+-- _G.user_stats: "词\t码" → {d=衰减计数 dee, t=最后提交 tick, c=累计次数}
 -- _G.user_freq_tick: 全局 tick (每词提交 +1, 同 rime userdb UpdateTickCount)
 -- 衰减算法 = librime algo::formula_d (user_dictionary.cc 调频同源):
 --   提交: dee = 1 + dee·exp((t_old - t_now)/τ)    查询: eff = dee·exp(...)
 -- τ=400 (2026-11-06 v3 六维联合标定; 词频记忆半衰 ~277 次上屏)
--- 每 20 个新词重写落盘 user_eff.tsv (崩溃最多丢 19 次计数)。仅计含中文的词。
--- 格式: 首行 "#tick=N", 数据行 "词\t码\t累计\tdee\ttick" (码=完整提交码,
--- 捕获失败为空串)。**旧词级格式 ("词\t累计\tdee\ttick" 与 "词\t次数")
--- 不再兼容读取**——旧数据是词级合并口径（分键语义下无法拆分到词码对）,
--- 读取端忽略、落盘时自然剥除（研究: calibrate_sc_percode 合并=错误口径,
--- 分键自该版起重新积累）。
--- 文件名 (2026-11-14 用户定案: 与实际语义对应): user_eff.tsv = 衰减
--- 计数账本 (查询接口 freq_eff); 旧名 user_freq.tsv 历史沿用至本版——
--- 新名文件缺失时回退读旧名 (行格式相同, 无损接管), 落盘一律写新名,
--- 旧文件保留不删 (手动清理)。
--- 落盘修剪 (2026-09-04): eff < 1e-3 的冷词条不再写 — 文件有界。
+-- 累计计数 c 不衰减（log(c+1) 融合项）；只计含中文的词条。
+-- 文件: 用户目录 user_ledger.tsv（两版共用）
+--   首行 "#tick=N"；数据行 "s\t词\t码\tdee\ttick\tcum"（码可空）。
+--   行首 s = 行类型（旧账本 u/b 行天然不匹配，防同形异义误读）。
+--   修剪: eff < 1e-3 且 cum=0 才丢——含中文词条终身保留（旧累计账语义），
+--   全角标点等非中文行随衰减淘汰。
+-- 旧两账本一次性迁移（只读，旧文件保留不删；落盘写新名）:
+--   user_eff.tsv（回退 user_freq.tsv）5 字段 → dee/tick, cum=commits(含中文时)
+--   user_unigram.tsv（回退 user_bigram.tsv）u 行 → cum=max(cum, 次数)
+--   eff 的 commits 列对含中文词条 = 真实累计次数（同一提交两处计数），
+--   取 max 可补回 2026-11-16 读取事故丢失的累计次数。
+-- n_seen 不再记录（2026-11-17 用户定案：不参与打分，无消费方）。
 local FREQ_TAU = 400
 local FREQ_FLUSH = 20
-local freq_dirty = 0
+local stats_dirty = 0
 local function freq_key(word, code)
     return word .. "\t" .. (code or "")
 end
-local function freq_file()
-    return rime_api.get_user_data_dir() .. "\\user_eff.tsv"
+local function ledger_file()
+    return rime_api.get_user_data_dir() .. "\\user_ledger.tsv"
 end
-local function freq_load()
-    _G.user_word_freq = _G.user_word_freq or {}
-    local tick, maxt = nil, 0
-    local f = io.open(freq_file(), "r")
-    if not f then  -- 旧名回退 (改名前数据, 行格式相同)
-        f = io.open(rime_api.get_user_data_dir() .. "\\user_freq.tsv", "r")
+local function has_non_ascii(w)
+    return w:match("[^\1-\127]") ~= nil
+end
+local function has_cjk(w)
+    for _, cp in utf8.codes(w) do
+        if cp >= 0x4E00 and cp <= 0x9FFF then return true end
     end
+    return false
+end
+local function open_fallback(names)
+    for _, n in ipairs(names) do
+        local f = io.open(rime_api.get_user_data_dir() .. "\\" .. n, "r")
+        if f then return f end
+    end
+    return nil
+end
+-- 旧衰减账（user_eff.tsv / user_freq.tsv）: 词\t码\tcommits\tdee\ttick。
+-- commits 对含中文词条 = 真实累计提交次数，迁移时直接作为 cum——可补回
+-- 2026-11-16 累计账读取事故丢失的次数。旧词级行（4/2 字段）不再迁移。
+local function stats_load_legacy_eff()
+    local f = open_fallback({ "user_eff.tsv", "user_freq.tsv" })
+    if not f then return nil end
+    local tick, maxt = nil, 0
+    for line in f:lines() do
+        local t = line:match("^#tick=(%d+)$")
+        if t then
+            tick = tonumber(t)
+        else
+            local w, c, cn, d, tk =
+                line:match("^(.-)\t(%l*)\t(%d+)\t([%d%.]+)\t(%d+)$")
+            if w and cn and d and tk then
+                _G.user_stats[w .. "\t" .. c] =
+                    { d = tonumber(d), t = tonumber(tk),
+                      c = has_cjk(w) and tonumber(cn) or 0 }
+                if tonumber(tk) > maxt then maxt = tonumber(tk) end
+            end
+        end
+    end
+    f:close()
+    return tick or maxt
+end
+-- 旧累计账（user_unigram.tsv / user_bigram.tsv）: u\t词\t码\t次数。
+-- 旧行照原值接管（保持迁移前评分口径）；3 字段旧词级行与旧 b 行忽略。
+local function stats_load_legacy_uni()
+    local f = open_fallback({ "user_unigram.tsv", "user_bigram.tsv" })
+    if not f then return end
+    for line in f:lines() do
+        local kind, a, cnt = line:match("^(%a)\t(.-)\t(%d+)$")
+        if kind == "u" and a:find("\t", 1, true) then
+            local n = tonumber(cnt)
+            local e = _G.user_stats[a]
+            if e then
+                if n > (e.c or 0) then e.c = n end
+            else
+                _G.user_stats[a] = { d = 0, t = 0, c = n }
+            end
+        end
+    end
+    f:close()
+end
+local function stats_load()
+    _G.user_stats = _G.user_stats or {}
+    local tick = nil
+    local f = io.open(ledger_file(), "r")
     if f then
+        local maxt = 0
         for line in f:lines() do
             local t = line:match("^#tick=(%d+)$")
             if t then
                 tick = tonumber(t)
             else
-                -- 新格式: 词\t码\t累计\tdee\ttick (码 = 小写字母串或空,
-                -- %l* 不匹配旧词级格式的数字段 → 旧行天然忽略)
-                local w, c, cn, d, tk =
-                    line:match("^(.-)\t(%l*)\t(%d+)\t([%d%.]+)\t(%d+)$")
-                if w and cn and d and tk then
-                    _G.user_word_freq[w .. "\t" .. c] =
-                        { c = tonumber(cn), d = tonumber(d), t = tonumber(tk) }
+                -- s\t词\t码\tdee\ttick\tcum（码可空；只认 s 行）
+                local w, c, d, tk, cu =
+                    line:match("^s\t([^\t]+)\t([^\t]*)\t([%d%.]+)\t(%d+)\t(%d+)$")
+                if w and d and tk and cu then
+                    _G.user_stats[w .. "\t" .. c] =
+                        { d = tonumber(d), t = tonumber(tk),
+                          c = tonumber(cu) }
                     if tonumber(tk) > maxt then maxt = tonumber(tk) end
                 end
             end
         end
         f:close()
+        tick = tick or maxt
+    else
+        -- 首次升级：旧两账本一次性合并（只读，旧文件保留）
+        tick = stats_load_legacy_eff()
+        stats_load_legacy_uni()
     end
-    _G.user_freq_tick = tick or maxt
+    _G.user_freq_tick = tick or _G.user_freq_tick or 0
 end
-local function freq_save()
-    local f = io.open(freq_file(), "w")
+local function stats_save()
+    local f = io.open(ledger_file(), "w")
     if f then
         f:write("#tick=" .. (_G.user_freq_tick or 0) .. "\n")
         local now = _G.user_freq_tick or 0
-        for k, e in pairs(_G.user_word_freq) do
+        for k, e in pairs(_G.user_stats) do
+            -- 修剪: 衰减到噪声级且无累计提交的冷词条不落盘；含中文词条
+            -- cum>0 终身保留（旧累计账语义），文件有界于中文词表规模。
             local eff = e.d * math.exp((e.t - now) / FREQ_TAU)
-            if eff >= 1e-3 then  -- 修剪: 衰减到噪声级的冷词条不落盘
-                f:write(string.format("%s\t%d\t%.3f\t%d\n", k, e.c, e.d, e.t))
+            if eff >= 1e-3 or (e.c or 0) > 0 then
+                f:write(string.format("s\t%s\t%.3f\t%d\t%d\n",
+                    k, e.d, e.t, e.c or 0))
             end
         end
         f:close()
     end
 end
-local function freq_bump(word, code)
-    if not _G.user_word_freq then freq_load() end
+local function stats_bump(word, code)
+    if not has_non_ascii(word) then return end
+    if not _G.user_stats then stats_load() end
     _G.user_freq_tick = (_G.user_freq_tick or 0) + 1
     local k = freq_key(word, code)
-    local e = _G.user_word_freq[k]
+    local e = _G.user_stats[k]
     if not e then
-        e = { c = 0, d = 0, t = 0 }
-        _G.user_word_freq[k] = e
+        e = { d = 0, t = 0, c = 0 }
+        _G.user_stats[k] = e
     end
     e.d = 1 + e.d * math.exp((e.t - _G.user_freq_tick) / FREQ_TAU)
-    e.c = e.c + 1
     e.t = _G.user_freq_tick
-    freq_dirty = freq_dirty + 1
-    if freq_dirty >= FREQ_FLUSH then
-        freq_save()
-        freq_dirty = 0
+    if has_cjk(word) then e.c = (e.c or 0) + 1 end
+    stats_dirty = stats_dirty + 1
+    if stats_dirty >= FREQ_FLUSH then
+        stats_save()
+        stats_dirty = 0
     end
 end
 
 -- 衰减有效计数 (llm_filter 融合用): rime formula_d 查询式 (词码对)
 _G.user_freq_eff = function(w, code)
-    local e = _G.user_word_freq and _G.user_word_freq[freq_key(w, code)]
+    if not _G.user_stats then stats_load() end
+    local e = _G.user_stats[freq_key(w, code)]
     if not e or e.d <= 0 then return 0 end
     return e.d * math.exp((e.t - (_G.user_freq_tick or e.t)) / FREQ_TAU)
 end
 
 -- === 用户累计 Unigram 计数 (v3 2026-11-06; 累计 Bigram 退役 2026-11-08) ===
--- 融合项 = log(0.5·p1);  p1 = (uni[x]+1)/(n_seen+20000)。
--- （曾配套累计 Bigram 项 log(0.5·p2+0.5·p1)——cohort 生产量级评测实证其在
---   真实用户龄仅 fired ~2%、剔除零损失（研究库 §三十七），2026-11-08 退役：
---   停记 b 行、查询只剩 p1；旧 user_bigram.tsv 里的 b 行读取时忽略。）
--- 口径 = 研究库 §三十二(续): 只计含中文字符的词 (纯标点不计——与标定的
--- 词典词流同源); **原始计数不衰减** (τ 衰减只作用于 eff 单词项; 原始计数
--- 是标定语义本身, 冷启动自然回退)。
--- 存储: user_unigram.tsv (2026-11-14 用户定案: 与实际语义对应——
--- 本文件自 2026-11-08 起只存 unigram 累计计数, "bigram" 名随该项
--- 退役已名不副实; 查询接口 user_unigram_term 同名对应), 首行 "#n=N"
--- (n_seen), 行 "u\t词\t码\t次数"（2026-11-13 词码对记账; 旧词级
--- "u\t词\t次数" 读取端忽略——合并口径语义废弃, 落盘自然剥除）。
--- 旧名 user_bigram.tsv 回退读（行格式相同, 无损接管）, 落盘一律写
--- 新名, 旧文件保留不删 (手动清理)。
--- 文件有界: 用户一年 ~10 万行 ≈ 3MB, 原始计数不修剪 (标定语义)。
-local function bigram_file()
-    return rime_api.get_user_data_dir() .. "\\user_unigram.tsv"
-end
-local BIGRAM_VCAP = 20000
-local bigram_dirty = 0
-local function bigram_load()
-    if _G.user_uni then return end
-    _G.user_uni = {}
-    _G.user_nseen = 0
-    local f = io.open(bigram_file(), "r")
-    if not f then  -- 旧名回退 (改名前数据, 行格式相同)
-        f = io.open(rime_api.get_user_data_dir() .. "\\user_bigram.tsv",
-                    "r")
-    end
-    if f then
-        for line in f:lines() do
-            local n = line:match("^#n=(%d+)$")
-            if n then
-                _G.user_nseen = tonumber(n)
-            else
-                local kind, a, cnt = line:match("^(%a)\t(.-)\t(%d+)$")
-                if kind == "u" then
-                    -- 词码对键 = "词\t码"（a 内含 \t = 新格式）; 旧词级行
-                    -- （a 不含 \t）合并口径语义废弃, 忽略
-                    if a:find("\t", 1, true) then
-                        _G.user_uni[a] = tonumber(cnt)
-                    end
-                end
-                -- 旧版 b 行（前词\t词\t次数）: 累计 Bigram 已退役, 忽略
-            end
-        end
-        f:close()
-    end
-end
-local function bigram_save()
-    local f = io.open(bigram_file(), "w")
-    if f then
-        f:write("#n=" .. (_G.user_nseen or 0) .. "\n")
-        for k, c in pairs(_G.user_uni) do
-            f:write("u\t" .. k .. "\t" .. c .. "\n")
-        end
-        f:close()
-    end
-end
-local function bigram_bump(word, code)
-    bigram_load()
-    -- 只计含中文字符的词 (CJK 统合区 U+4E00-U+9FFF)
-    local is_cjk = false
-    for _, cp in utf8.codes(word) do
-        if cp >= 0x4E00 and cp <= 0x9FFF then is_cjk = true end
-    end
-    if not is_cjk then return end
-    _G.user_nseen = (_G.user_nseen or 0) + 1
-    local k = word .. "\t" .. (code or "")
-    _G.user_uni[k] = (_G.user_uni[k] or 0) + 1
-    bigram_dirty = bigram_dirty + 1
-    if bigram_dirty >= FREQ_FLUSH then
-        bigram_save()
-        bigram_dirty = 0
-    end
-end
--- 融合项查询 (llm_filter): 累计 Unigram 项（词码对）
--- 2026-11-11 简化：log(uni+1)。原 log p1=(uni+1)/(n_seen+2万) 的分母与 δ
--- 缩放均为窗内常数（同窗所有候选同减同值），对排序零影响——log(a/b)=
--- log a − log b，常数项不改变大小关系，位级等价去除（用户定案）。
--- 概率语义（log p1）与 δ=0.5/1 cohort 终审记录见研究库历史口径；
--- uni 原始计数不衰减，存储 user_bigram.tsv 与 #n=N 头行不变。
--- 2026-11-13 词码对记账: x/码 组成键。
+-- 融合项 = log(uni+1)（2026-11-11 简化：原 log p1 的分母与 δ 缩放均为窗内
+-- 常数 = 排序不变量，位级等价去除）。口径 = 只计含中文字符的词（纯标点
+-- 不计——与标定的词典词流同源）；原始计数不衰减（标定语义）。
+-- 累计计数与衰减计数同存 user_ledger.tsv 的 cum 列（2026-11-17 合并）；
+-- n_seen 连记录一并取消（不参与打分，无消费方）。
 _G.user_unigram_term = function(x, code)
-    bigram_load()
-    return math.log(((_G.user_uni[x .. "\t" .. (code or "")] or 0) + 1))
+    if not _G.user_stats then stats_load() end
+    local e = _G.user_stats[freq_key(x, code)]
+    return math.log(((e and e.c or 0) + 1))
+end
+
+-- 累计 unigram 原始计数（llm_filter 调试行"累计频"列 / pairfix fade 门用）
+_G.user_uni_count = function(x, code)
+    if not _G.user_stats then stats_load() end
+    local e = _G.user_stats[freq_key(x, code)]
+    return e and e.c or 0
 end
 
 local function find_overlap(prev, curr)
@@ -437,12 +439,12 @@ local function processor(key, env)
                 last_full = ""
                 -- 词频计数: 仅含中文的词 (含英文/数字/标点不参与融合)
                 -- 2026-11-13 词码对记账: bump 键 = (词, 完整提交码)
+                -- 2026-11-17 单账本: dee 与累计计数同一次 bump/落盘
                 if has_chinese then
-                    if not _G.user_word_freq then freq_load() end
+                    if not _G.user_stats then stats_load() end
                     local before = _G.user_freq_eff and _G.user_freq_eff(w, code) or 0
                     local t_before = _G.user_freq_tick or 0
-                    freq_bump(w, code)
-                    bigram_bump(w, code)
+                    stats_bump(w, code)
                     local after = _G.user_freq_eff and _G.user_freq_eff(w, code) or 0
                     local tick_after = _G.user_freq_tick or 0
                     local cid = _G.llm_write_c
@@ -453,7 +455,7 @@ local function processor(key, env)
                             os.date("%H:%M:%S"), live_esc(w), before,
                             after, t_before, tick_after))
                         if cid and _G.llm_debug_e then
-                            _G.llm_debug_e(cid, before, after, freq_dirty)
+                            _G.llm_debug_e(cid, before, after, stats_dirty)
                         end
                     end
                 else
