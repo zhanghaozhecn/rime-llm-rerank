@@ -9,9 +9,6 @@ local commit_base = 0    -- 上文基座: 只认 commit_history 中 base 之后�
                          -- (编辑键后旧词永久忽略——librime 无法清 commit_history)
 local com_ctx_enabled = true  -- COM/UIA 光标上文旁路总开关（2026-09-29 定案：
                               -- 不做配置项、无关闭态；排障直接改此值）
-local SPLIT = "|"
-local TAB = "\t"
-local BSP = "←"
 local prev_input = ""    -- 上一轮的输入码
 local pending_code = ""  -- 手动选词上屏码（输入变空瞬间捕获）
 local last_full = ""     -- 最后满码（4码），顶屏时回退用
@@ -76,14 +73,6 @@ local function trigger_prepare()
     if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
         last_prep_ctx = cur_ctx
         llm_prep.prepare(cur_ctx)
-    end
-end
-
-local function append_raw(text)
-    local f = io.open(rime_api.get_user_data_dir() .. "\\llm_training.txt", "a")
-    if f then
-        f:write(text)
-        f:close()
     end
 end
 
@@ -369,13 +358,20 @@ local function processor(key, env)
     --   退格后剩余词不会作为新词重新记录训练数据)
     if ctx.input == "" and is_edit_key(key:repr()) then
         local k = key:repr()
-        if is_nav_ish_key(k) then
-            if #history > 0 then
-                append_raw("\n")
-            end
-        elseif #history > 0 then
-            append_raw(SPLIT .. BSP)
+        -- 常开语料 M：reset 事件与 kind（与源码版 reason 映射同集）
+        local kind = "navigation"
+        if k == "BackSpace" or k == "Control+BackSpace" then
+            kind = "backspace"
+        elseif k == "Delete" or k == "Control+Delete" then
+            kind = "delete"
+        elseif k:match("^Control%+[zyvxZYVX]$") then
+            kind = "undo-clipboard"
+        elseif k == "Return" or k == "KP_Enter" then
+            kind = "enter"
         end
+        local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
+        _G.llm_debug_enabled = dbg_flag or false
+        if _G.llm_write_m then _G.llm_write_m(kind) end
         reset_history()
         -- 编辑键: 当前 commit_history 位置记为基座——旧词永久忽略
         -- (librime lua 无法清 commit_history, 旧词留在引擎里;
@@ -389,19 +385,9 @@ local function processor(key, env)
         if llm_prep and llm_prep.edit_reset_context then
             pcall(llm_prep.edit_reset_context)
         end
-        if sc:get_bool("llm_rerank/debug_fusion") then
+        if dbg_flag then
             live("R|" .. os.date("%H:%M:%S") .. "|编辑键("
                  .. live_esc(key:repr()) .. ")→上文重置+缓存清空")
-            pcall(function()
-                local f = io.open(rime_api.get_user_data_dir()
-                    .. "\\rime_llm_debug.txt", "a")
-                if f then
-                    f:write(string.format(
-                        "%s|reset|编辑键(%s)→上文重置+缓存清空\n",
-                        os.date("%H:%M:%S"), key:repr()))
-                    f:close()
-                end
-            end)
         end
         -- 上文已重置 → 立即异步预解码 (空上文)
         trigger_prepare()
@@ -430,11 +416,12 @@ local function processor(key, env)
         end
 
         if #new_words > 0 then
-            if overlap == 0 then
-                append_raw("\n")
+            if overlap == 0 and _G.llm_write_m then
+                _G.llm_write_m("scene")
             end
 
-            local parts = {}
+            local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
+            _G.llm_debug_enabled = dbg_flag or false
             for _, w in ipairs(new_words) do
                 -- 含中文才分配码，跳过纯英文/数字/标点
                 local has_chinese = w:match("[^\1-\127]")
@@ -451,48 +438,30 @@ local function processor(key, env)
                 -- 词频计数: 仅含中文的词 (含英文/数字/标点不参与融合)
                 -- 2026-11-13 词码对记账: bump 键 = (词, 完整提交码)
                 if has_chinese then
-                    if not _G.user_word_freq then freq_load() end  -- 诊断读数前先就位
+                    if not _G.user_word_freq then freq_load() end
                     local before = _G.user_freq_eff and _G.user_freq_eff(w, code) or 0
                     local t_before = _G.user_freq_tick or 0
                     freq_bump(w, code)
                     bigram_bump(w, code)
-                    local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
+                    local after = _G.user_freq_eff and _G.user_freq_eff(w, code) or 0
+                    local tick_after = _G.user_freq_tick or 0
+                    local cid = _G.llm_write_c
+                                and _G.llm_write_c(w, code, tick_after, true)
+                                or nil
                     if dbg_flag then
                         live(string.format("E|%s|%s|%.3f|%.3f|%d|%d",
                             os.date("%H:%M:%S"), live_esc(w), before,
-                            _G.user_freq_eff(w, code), t_before,
-                            _G.user_freq_tick or 0))
-                        pcall(function()
-                            local f = io.open(rime_api.get_user_data_dir()
-                                .. "\\rime_llm_debug.txt", "a")
-                            if f then
-                                f:write(string.format(
-                                    "%s|commit|词=%s|码=%s|eff %.3f→%.3f|tick %d→%d|flush脏%d/20\n",
-                                    os.date("%H:%M:%S"), w, code, before,
-                                    _G.user_freq_eff(w, code), t_before,
-                                    _G.user_freq_tick or 0, freq_dirty))
-                                f:close()
-                            end
-                        end)
+                            after, t_before, tick_after))
+                        if cid and _G.llm_debug_e then
+                            _G.llm_debug_e(cid, before, after, freq_dirty)
+                        end
+                    end
+                else
+                    if _G.llm_write_c then
+                        _G.llm_write_c(w, code, _G.user_freq_tick or 0, false)
                     end
                 end
-                -- 真实候选窗快照 (llm_filter 记录): 用截断前的完整码匹配
-                -- (filter 记录的是完整 input; 训练样本带真实候选窗 词\t码\t候选1,候选2,...,
-                -- LLM 重排目标 = 在窗内把正确词排第一; 无快照/不匹配回退旧格式 仅词+码)
-                local window_cands = ""
-                if code ~= "" and _G.llm_last_window
-                        and _G.llm_last_window.input == code then
-                    window_cands = TAB .. table.concat(_G.llm_last_window.cands, ",")
-                    _G.llm_last_window = nil  -- 已消费
-                end
-                -- 单字 3 码只需前 2 码（第 3 码是形码，由字本身决定）
-                if #w == 1 and #code >= 3 then
-                    code = code:sub(1, 2)
-                end
-                table.insert(parts, w .. TAB .. code .. window_cands)
             end
-            local sep = (overlap > 0 and SPLIT or "")
-            append_raw(sep .. table.concat(parts, SPLIT))
 
             -- 上屏后立即刷新 COM/UIA 快照（2026-09-10）：新词此刻已入
             -- 文档/控件，读链 6-13ms 在后台线程完成，下一键即有新鲜上文
@@ -504,7 +473,7 @@ local function processor(key, env)
         if #new_words == 0 and #history < #prev_hist and #history < 3 then
             pending_code = ""
             last_full = ""
-            append_raw("\n")
+            if _G.llm_write_m then _G.llm_write_m("scene") end
         end
 
         prev_hist = {}

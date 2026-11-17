@@ -100,6 +100,224 @@ local cfg = {
     -- → 内置常数 FREQ_BETA；方案里残留旧行读取端忽略，保存/重建节时剥除
 }
 
+-- ============================================================
+-- 记录文件（2026-11-17 用户定案：只保留两个文件）
+--   常开语料 rime_llm_corpus.tsv（TSV，不轮转，独立可分析）
+--   按需 debug rime_llm_debug.txt（| 分隔，10MB 单轮转）
+-- 事件 ID 串联两文件；debug 只写语料没有的字段（CE/eff/耗时/错误），
+-- 不重复词/码/上下文/候选序/配置。llm_processor.lua 复用这些 _G 函数。
+-- ============================================================
+_G.llm_ev_seq = _G.llm_ev_seq or 0
+_G.llm_debug_enabled = _G.llm_debug_enabled or false
+
+local function rec_user_dir()
+    local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
+    if ok and type(ud) == "string" and ud ~= "" then return ud end
+    return os.getenv("TEMP") or "C:\\Windows\\Temp"
+end
+
+local function rec_esc(s)
+    s = tostring(s or "")
+    s = s:gsub("\\", "\\\\"):gsub("\t", "\\t")
+         :gsub("\r", "\\r"):gsub("\n", "\\n")
+    return s
+end
+
+local function rec_cand_esc(s)
+    s = tostring(s or "")
+    s = s:gsub("\\", "\\\\"):gsub(",", "\\,")
+         :gsub("\t", "\\t"):gsub("\r", "\\r"):gsub("\n", "\\n")
+    return s
+end
+
+local function rec_join(v, maxn)
+    local out = {}
+    for i = 1, math.min(#(v or {}), maxn) do
+        out[i] = rec_cand_esc(v[i])
+    end
+    return table.concat(out, ",")
+end
+
+local function rec_ctx_tail(s, n)
+    s = s or ""
+    if #s <= n then return s end
+    local cut = #s - n + 1
+    while cut <= #s and (s:byte(cut) or 0) >= 0x80
+            and (s:byte(cut) or 0) < 0xC0 do
+        cut = cut + 1
+    end
+    return s:sub(cut)
+end
+
+local function rec_stamp()
+    return os.date("%Y-%m-%d %H:%M:%S")
+end
+
+function _G.llm_new_event(kind, tick)
+    _G.llm_ev_seq = (_G.llm_ev_seq or 0) + 1
+    return os.date("%Y%m%dT%H%M%S") .. "-" .. tostring(tick or 0)
+        .. "-" .. string.format("%04d", _G.llm_ev_seq)
+end
+
+local function rec_header_ok(path, magic, header)
+    local f = io.open(path, "rb")
+    if f then
+        local first = f:read("*l")
+        f:close()
+        if not first then
+            f = io.open(path, "ab")
+            if not f then return false end
+            f:write(header .. "\n"); f:close(); return true
+        end
+        return first:sub(1, #magic) == magic
+    end
+    f = io.open(path, "ab")
+    if not f then return false end
+    f:write(header .. "\n"); f:close(); return true
+end
+
+local function rec_append(path, line)
+    local f = io.open(path, "ab")
+    if not f then return end
+    f:write(line, "\n")
+    f:close()
+end
+
+function _G.llm_corpus_write(line)
+    local ud = rec_user_dir()
+    local path = ud .. "\\rime_llm_corpus.tsv"
+    if _G.llm_corpus_header_path ~= path then
+        _G.llm_corpus_header_path = path
+        _G.llm_corpus_ok = rec_header_ok(path, "#RIME_CORPUS\tv2\t",
+            "#RIME_CORPUS\tv2\t" .. rec_stamp() .. "\tplugin")
+    end
+    if not _G.llm_corpus_ok then return end
+    rec_append(path, line)
+end
+
+function _G.llm_debug_write(line, force)
+    if not force and not _G.llm_debug_enabled then return end
+    local ud = rec_user_dir()
+    local path = ud .. "\\rime_llm_debug.txt"
+    if _G.llm_debug_header_path ~= path then
+        _G.llm_debug_header_path = path
+        _G.llm_debug_ok = rec_header_ok(path, "#RIME_DEBUG|v2|",
+            "#RIME_DEBUG|v2|" .. rec_stamp() .. "|plugin")
+    end
+    if not _G.llm_debug_ok then return end
+    local f = io.open(path, "rb")
+    if f then
+        local sz = f:seek("end")
+        f:close()
+        if sz and sz > 10 * 1024 * 1024 then
+            os.remove(path .. ".old")
+            os.rename(path, path .. ".old")
+        end
+    end
+    rec_append(path, line)
+end
+
+local function rec_rank(v, word)
+    for i, x in ipairs(v or {}) do
+        if x == word then return i end
+    end
+    return -1
+end
+
+function _G.llm_write_w(id, src, code, ctx, engine, window, final, tick,
+                        status, skip, prep, flags)
+    local line = table.concat({
+        "W", id, rec_stamp(), rec_esc(src), rec_esc(code),
+        rec_esc(rec_ctx_tail(ctx, 120)), rec_join(engine, 10),
+        rec_join(window, 20), rec_join(final, 20), tostring(tick or 0),
+        status or "ok", rec_esc(skip or ""), prep and "1" or "0",
+        rec_esc(flags or "")
+    }, "\t")
+    _G.llm_corpus_write(line)
+    _G.llm_last_event_id = id
+    _G.llm_last_window = { id = id, code = code, engine = engine or {},
+                           window = window or {}, final = final or {},
+                           tick = tick or 0 }
+    return id
+end
+
+function _G.llm_write_c(word, code, tick, cjk)
+    local ref, re, rw, rf = "", -1, -1, -1
+    local wl = _G.llm_last_window
+    if wl and code and code ~= "" and wl.code == code then
+        ref = wl.id or ""
+        re = rec_rank(wl.engine, word)
+        rw = rec_rank(wl.window, word)
+        rf = rec_rank(wl.final, word)
+    end
+    _G.llm_last_window = nil
+    local id = _G.llm_new_event("C", tick)
+    local line = table.concat({
+        "C", id, rec_stamp(), ref, rec_esc(word), rec_esc(code or ""),
+        tostring(re), tostring(rw), tostring(rf), tostring(tick or 0),
+        cjk and "cjk=1" or ""
+    }, "\t")
+    _G.llm_corpus_write(line)
+    _G.llm_last_event_id = id
+    return id
+end
+
+function _G.llm_write_m(kind)
+    local id = _G.llm_new_event("M", 0)
+    local line = table.concat({
+        "M", id, rec_stamp(), _G.llm_last_event_id or "", kind or "unknown",
+        "", ""
+    }, "\t")
+    _G.llm_corpus_write(line)
+    _G.llm_debug_write(id .. "|R|gen=" .. tostring(_G.llm_reset_gen or 0),
+                       false)
+    return id
+end
+
+local function rec_base(path)
+    path = path or ""
+    return (path:match("([^\\/]+)$") or path)
+end
+
+function _G.llm_write_h(schema, model)
+    local id = _G.llm_new_event("H", _G.user_freq_tick or 0)
+    local line = table.concat({
+        "H", id, rec_stamp(), "plugin", rec_esc(schema or "unknown"),
+        rec_esc(rec_base(model)), rec_esc(cfg.code_pattern or ""),
+        tostring(cfg.max_candidates or 5), tostring(cfg.max_tokens or 10),
+        cfg.two_code_sentence and "1" or "0", "14.00", "400"
+    }, "\t")
+    _G.llm_corpus_write(line)
+end
+
+local function rec_num(v)
+    if type(v) ~= "number" or v ~= v or v <= -1e307 or v >= 1e307 then
+        return "-inf"
+    end
+    return string.format("%.3f", v)
+end
+
+function _G.llm_debug_p(id, total, prep)
+    _G.llm_debug_write(string.format("%s|P|total=%.1f|prep=%d", id,
+                                     total or 0, prep and 1 or 0), false)
+end
+
+function _G.llm_debug_d(id, rank, ce, ce1, ce2, ce3, eff, fb, u1, full,
+                        key, sdelta, cerank, finrank)
+    _G.llm_debug_write(string.format(
+        "%s|D|%d|ce=%s|ce1=%s|ce2=%s|ce3=%s|eff=%.3f|fb=%.3f|u1=%.3f"
+        .. "|full=%d|key=%s|sdelta=%g|cerank=%d|finrank=%d",
+        id, rank, rec_num(ce), rec_num(ce1), rec_num(ce2), rec_num(ce3),
+        eff or 0, fb or 0, u1 or 0, full and 1 or 0, rec_num(key),
+        sdelta or 0, cerank or 0, finrank or 0), false)
+end
+
+function _G.llm_debug_e(id, before, after, dirty)
+    _G.llm_debug_write(string.format(
+        "%s|E|eff_before=%.3f|eff_after=%.3f|dirty=%d", id, before or 0,
+        after or 0, dirty or 0), false)
+end
+
 local lat_max   = 0
 local lat_count = 0
 
@@ -200,6 +418,20 @@ local function init_config(env)
     -- 插件版该开关一直停默认 false；源码版正常，故真机未暴露）
     local tcs = sc:get_bool("llm_rerank/two_code_sentence")
     if tcs ~= nil then cfg.two_code_sentence = tcs end
+    _G.llm_debug_enabled = cfg.debug_fusion
+    if not _G.llm_h_written then
+        _G.llm_h_written = true
+        local sid = (env.engine.schema and env.engine.schema.schema_id)
+                    or "unknown"
+        local mp = sc:get_string("llm_rerank/model_path") or ""
+        _G.llm_write_h(sid, mp)
+    end
+end
+
+local function texts_of(list, maxn)
+    local out = {}
+    for i = 1, math.min(#list, maxn) do out[i] = list[i].text end
+    return out
 end
 
 -- === Filter ===
@@ -214,52 +446,9 @@ return function(translation, env)
         cfg._inited = true
     end
 
+    local input = env.engine.context.input or ""
     local all = {}
     for cand in translation:iter() do table.insert(all, cand) end
-    if #all < 2 then
-        live("S|" .. os.date("%H:%M:%S") .. "|few_candidates|" ..
-             live_esc(env.engine.context.input or "") .. "|-")
-        for _, c in ipairs(all) do yield(c) end
-        return
-    end
-
-    local input = env.engine.context.input or ""
-
-    -- 候选窗快照: (input, 前 max_candidates 个候选) 供 llm_processor 上屏时
-    -- 关联真实候选窗写入训练语料 (与 LLM 打分范围一致)。所有路径统一记录,
-    -- 含 off/未加载/编码不匹配 code_pattern 的透传路径——候选窗是 RIME 实际显示的集合,
-    -- 即使不评分也构成训练样本 (LLM 要学的是在真实窗内把正确词排第一)。
-    local win = {}
-    for i, c in ipairs(all) do
-        if i > cfg.max_candidates then break end
-        win[#win + 1] = c.text
-    end
-    _G.llm_last_window = { input = input, cands = win }
-
-    -- enabled false → 原样透传，不推理
-    if not enabled then
-        for _, c in ipairs(all) do yield(c) end; return
-    end
-
-    -- Lazy load DLL on first use (enabled 变化时重载, 重新部署立即生效)
-    if not llm_loaded_for then
-        load_llm(env)
-    end
-
-    if not llm then
-        for _, c in ipairs(all) do yield(c) end; return
-    end
-
-    -- 触发条件：编码串是否匹配 code_pattern（2026-09-30 取代 min/max_code_len 区间）
-    -- 全串匹配（同 Rime auto_select_pattern 语义）。优先用 DLL 的 std::regex
-    -- （与源码版 boost::regex 同一套 ECMAScript 语法）；DLL 不提供该函数时
-    -- 回退 Lua 模式——两种写法对 .{4} / .{4,} / .{3,4} / [abcde]{4} 等价。
-    if not match_code_pattern(input) then
-        live("S|" .. os.date("%H:%M:%S") .. "|pattern|" .. live_esc(input)
-             .. "|-")
-        for _, c in ipairs(all) do yield(c) end; return
-    end
-
     local ctx_text, ctx_src = "", "rime"
     if _G.llm_context_get then
         ctx_text, ctx_src = _G.llm_context_get()
@@ -268,6 +457,65 @@ return function(translation, env)
     -- 不需过滤尾部 ASCII: Rime 编码显示在候选窗, 不写入编辑器,
     -- 外挂读到的光标前文本不会包含编码字母 (微软拼音式 inline composition 才会)
     local context = (ctx_text or ""):gsub('%s+', '')
+    local tick = _G.user_freq_tick or 0
+    -- DLL 需先加载：match_code 用 std::regex；Lua 回退不支持 .{4} 量词。
+    if enabled and not llm_loaded_for then
+        load_llm(env)
+    end
+    local pattern_ok = enabled and match_code_pattern(input) or false
+    -- 常开语料 W：只在 enabled + pattern 匹配时尝试（部分输入码不落行）。
+    local rec = enabled and pattern_ok
+    local wid = rec and _G.llm_new_event("W", tick) or nil
+    local engine_top = texts_of(all, 10)
+    -- 清掉上一轮快照，避免未重排/失败路径的陈旧窗口被 C 误引用。
+    _G.llm_last_window = nil
+
+    if #all < 2 then
+        live("S|" .. os.date("%H:%M:%S") .. "|few_candidates|" ..
+             live_esc(input) .. "|-")
+        if wid then
+            _G.llm_write_w(wid, ctx_src, input, context, engine_top, {}, {},
+                           tick, "skip", "few_candidates", false, "")
+        end
+        for _, c in ipairs(all) do yield(c) end
+        return
+    end
+
+    -- enabled false → 原样透传，不推理（常开语料也不写 W）
+    if not enabled then
+        for _, c in ipairs(all) do yield(c) end; return
+    end
+
+    if not llm then
+        if wid then
+            _G.llm_write_w(wid, ctx_src, input, context, engine_top, {}, {},
+                           tick, "skip", "model_loading", false, "")
+        end
+        live("S|" .. os.date("%H:%M:%S") .. "|model_loading|" ..
+             live_esc(input) .. "|-")
+        for _, c in ipairs(all) do yield(c) end; return
+    end
+
+    -- 触发条件：编码串是否匹配 code_pattern（2026-09-30 取代 min/max_code_len 区间）
+    -- 全串匹配（同 Rime auto_select_pattern 语义）。优先用 DLL 的 std::regex
+    -- （与源码版 boost::regex 同一套 ECMAScript 语法）；DLL 不提供该函数时
+    -- 回退 Lua 模式——两种写法对 .{4} / .{4,} / .{3,4} / [abcde]{4} 等价。
+    if not pattern_ok then
+        live("S|" .. os.date("%H:%M:%S") .. "|pattern|" .. live_esc(input)
+             .. "|-")
+        for _, c in ipairs(all) do yield(c) end; return
+    end
+
+    -- 空上文：与源码版一致跳过评分（W skip 记录）
+    if context == "" then
+        if wid then
+            _G.llm_write_w(wid, ctx_src, input, context, engine_top, {}, {},
+                           tick, "skip", "ctx_empty", false, "")
+        end
+        live("S|" .. os.date("%H:%M:%S") .. "|ctx_empty|" ..
+             live_esc(input) .. "|" .. live_esc(ctx_src))
+        for _, c in ipairs(all) do yield(c) end; return
+    end
     -- ═══ 层1: 全体候选 用户词频打分重排（v3 两层重排, 2026-11-07 定案）═══
     -- 全体候选 S1 = FREQ_BETA·log1p(eff) + 累计 Unigram 项, 稳定降序（同分保引擎序）,
     -- 取前 max_candidates 进 LLM 评分（层2 三项融合重排）, 其余按层1 序透传。
@@ -338,11 +586,9 @@ return function(translation, env)
             add_win(e)
         end
     end
-    -- 候选窗快照改为层1 前 k（LLM 实际评分范围; 训练语料窗口语义随生产）
-    _G.llm_last_window = { input = input, cands = l1win }
-
+    local w_written = false
     -- 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在
-    -- 生产里命中率极低（每个新词的上文都变），却要维护一套失效逻辑（编辑键清
+    -- 生产里命中率极低（每个新词的上文都变），却要维护一整套失效逻辑（编辑键清
     -- 缓存/候选集变化重放），删掉以简化。每次触发都是真实推理。
     -- 满长准入后窗不足 2 个（不足即空着的极端形态）：无重排意义、整窗跳过
     -- 评分（与源码版一致显式发 S 事件，避免静默零输出）——ok 保持 nil，
@@ -350,6 +596,11 @@ return function(translation, env)
     if tcs_elen >= 1 and #cands < 2 then
         live("S|" .. os.date("%H:%M:%S") .. "|full_len_lt2|" ..
              live_esc(input) .. "|" .. live_esc(ctx_src))
+        if wid then
+            _G.llm_write_w(wid, ctx_src, input, context, engine_top, l1win,
+                           {}, tick, "skip", "full_len_lt2", false, "")
+            w_written = true
+        end
         cands = {}
     end
     local ok, result, scores
@@ -364,73 +615,34 @@ return function(translation, env)
             scores = get_scores(cands)
         end
 
-        -- Event log (仅真实推理时写; RIME 用户目录, 回退 %TEMP%)
-        local okd, log_dir = pcall(function() return rime_api.get_user_data_dir() end)
-        if not okd or not log_dir or log_dir == "" then
-            log_dir = os.getenv("TEMP") or "C:\\Windows\\Temp"
-        end
-        local epath = log_dir .. "\\rime_llm_events.txt"
-        local ef = io.open(epath, "a")
-        -- 日志轮转 (2026-09-04): >5MB 改名 .old (单文件轮转), 防无限增长
-        if ef then
-            local esz = ef:seek("end")
-            if esz and esz > 5 * 1024 * 1024 then
-                ef:close()
-                os.remove(epath .. ".old")
-                os.rename(epath, epath .. ".old")
-                ef = io.open(epath, "a")
-            end
-        end
-        if ef then
-            local cand_str = table.concat(cands, ","):gsub("|", "/")
-            local ctx_safe = context:gsub("|", "/"):gsub("\n", " ")
-            local res_info = "nil"
-            if ok and type(result) == "table" then
-                res_info = table.concat(result, ","):gsub("|", "/")
-            elseif ok and result then
-                res_info = tostring(result)
-            end
-            lat_count = lat_count + 1
-            if elapsed_ms > lat_max then lat_max = elapsed_ms end
-            ef:write(string.format("%s|%d|%s|%s|%s|%s|%.0fms|%s\n",
-                os.date("%H:%M:%S"), lat_count, input,
-                cand_str, ctx_safe, res_info, elapsed_ms, ctx_src))
-            ef:close()
-        end
+        lat_count = lat_count + 1
+        if elapsed_ms > lat_max then lat_max = elapsed_ms end
         end   -- if #cands >= 2（满长准入窗 <2 跳过评分）
     end
 
-    -- 融合诊断 (llm_rerank/debug_fusion: true): 每次评分逐候选记录
-    -- CE/eff/词频加成/满长标记/最终 key 与名次, 写 rime_llm_debug.txt
-    local live_ready = "n/a"   -- 模型就绪态（实时调试 L 行用；两个 dbg 块共享）
-    local dbg = cfg.debug_fusion and {} or nil
-    if dbg then
-        local ctx_tail = #context > 16 and ("…" .. context:sub(-15)) or context
-        local ready = "n/a"
-        local okr, r = pcall(function() return llm.is_ready() end)
-        if okr then ready = r and "1" or "0" end
-        live_ready = ready
-        table.insert(dbg, string.format(
-            "%s|score|input=%s|ctx=[%s]|src=%s|tick=%s|ready=%s|n=%d",
-            os.date("%H:%M:%S"), input, ctx_tail, ctx_src,
-            tostring(_G.user_freq_tick), ready, #cands))
+    -- 失败原因（用于 W skip）；ok/result 成功时为空
+    local skip_reason = nil
+    if #cands >= 2 then
         if not ok then
-            table.insert(dbg, "  ERROR: score pcall failed")
-            live("S|" .. os.date("%H:%M:%S") .. "|score_failed|" ..
-                 live_esc(input) .. "|" .. live_esc(ctx_src))
+            skip_reason = "score_failed"
         elseif type(result) ~= "table" then
-            table.insert(dbg, string.format(
-                "  score=nil (ready=%s, ctx空=%s — ready=0 模型未载/加载中; ctx空=min_tokens 跳过)",
-                ready, context == "" and "是" or "否"))
-            -- 实时调试（2026-11-10）：失败原因细分为 not_ready/ctx_empty/
-            -- ctx_short——"为什么没触发"是调试窗口的主要用途之一
-            local why = ready == "0" and "not_ready"
-                    or (context == "" and "ctx_empty" or "ctx_short")
-            live("S|" .. os.date("%H:%M:%S") .. "|" .. why .. "|" ..
-                 live_esc(input) .. "|" .. live_esc(ctx_src))
+            local okr, ready = pcall(function() return llm.is_ready() end)
+            skip_reason = (okr and ready) and "ctx_short" or "not_ready"
         elseif not scores then
-            table.insert(dbg, "  融合跳过: scores=nil (get_scores 校验失败 — 候选缺分/含异常值)")
-            live("S|" .. os.date("%H:%M:%S") .. "|scores_nil|" ..
+            skip_reason = "scores_nil"
+        end
+    end
+
+    local live_ready = "n/a"
+    local dbg = cfg.debug_fusion and {} or nil
+    local prep_flag = "0"
+    if dbg then
+        local okr, r = pcall(function() return llm.is_ready() end)
+        if okr then live_ready = r and "1" or "0" end
+        local okp, ph = pcall(function() return llm.prep_hit end)
+        prep_flag = (okp and ph) and "1" or "0"
+        if skip_reason then
+            live("S|" .. os.date("%H:%M:%S") .. "|" .. skip_reason .. "|" ..
                  live_esc(input) .. "|" .. live_esc(ctx_src))
         end
     end
@@ -587,8 +799,7 @@ return function(translation, env)
             -- L 头行（完整上文，不截断）+ 逐候选 C 行（含层1 透传尾窗，上限
             -- 20 行；win=1 层2窗内/0 尾窗透传，ce 空串=无 CE 分，fin=最终
             -- 输出位置）。与 debug.txt 人类格式互补，供查看器渲染。
-            local okp, ph = pcall(function() return llm.prep_hit end)
-            local prep = (okp and ph) and "1" or "0"
+            local prep = prep_flag
             -- 协议 v4（2026-11-12）：L 尾追加 ctx_used = 推理实际使用的
             -- 上文尾部文本（去空白上文中末 ≤max_ctx token 的原文段，
             -- get_ctx_used 容错旧 DLL；查看器据此灰显未用前缀）
@@ -641,41 +852,25 @@ return function(translation, env)
                     live_c(e.c, tail_pos)
                 end
             end
-            for i = 1, math.min(#ordered, 8) do
-                local c = ordered[i]
-                local d = dbg[c.text]
-                if d then
-                    local ce_str = (d.ce and d.ce > -1e9)
-                        and string.format("%8.3f", d.ce) or "   -sent"
-                    local pf_str = d.sdelta
-                        and string.format(" 修正%+g", d.sdelta) or ""
-                    table.insert(dbg, string.format(
-                        "  #%d %-6s CE=%s eff=%6.3f 频+%6.3f u1+%6.3f 满=%d key=%8.3f  原次序%d→%d%s",
-                        i, c.text, ce_str, d.eff or 0, d.fb or 0,
-                        d.u1 or 0, d.full and 1 or 0, d.fused or 0,
-                        d.cerank or 0, final_rank[c.text] or 0, pf_str))
-                end
-            end
-            local moved = {}
+            -- debug P/D：只写语料没有的字段；词/候选序在语料 W，
+            -- 靠 wid 关联；不写 debug 文件的人类可读块。
+            _G.llm_debug_p(wid, ev_ms, prep_flag == "1")
             for i, c in ipairs(ordered) do
                 local d = dbg[c.text]
-                if d and d.cerank and final_rank[c.text] and
-                        d.cerank ~= final_rank[c.text] then
-                    table.insert(moved, string.format("%s %d→%d",
-                        c.text, d.cerank, final_rank[c.text]))
+                if d then
+                    local d3 = d.ce3 or {}
+                    _G.llm_debug_d(wid, i, d.ce, d3[1], d3[2], d3[3],
+                                   d.eff, d.fb, d.u1, d.full, d.fused,
+                                   d.sdelta, d.cerank, i)
                 end
             end
-            table.insert(dbg, #moved > 0
-                and ("  名次变化: " .. table.concat(moved, ", "))
-                or  "  名次变化: 无 (CE 序即融合序)")
-            local okw = pcall(function()
-                local f = io.open(rime_api.get_user_data_dir()
-                                  .. "\\rime_llm_debug.txt", "a")
-                if f then
-                    f:write(table.concat(dbg, "\n") .. "\n\n")
-                    f:close()
-                end
-            end)
+        end
+        -- 常开语料 W ok（最终序 + 引擎前 10 + 层1 窗）
+        if wid and not w_written then
+            _G.llm_write_w(wid, ctx_src, input, context, engine_top, l1win,
+                           texts_of(ordered, 20), tick, "ok", "",
+                           prep_flag == "1", "")
+            w_written = true
         end
         -- 来源徽章已删（2026-11-10 用户定案：实时调试窗口上线——上文来源/
         -- 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment）
@@ -685,6 +880,12 @@ return function(translation, env)
         end
     else
         -- 评分失败/缺分: 层1 已重排全体候选 → 按层1 序展示
+        if wid and not w_written then
+            _G.llm_write_w(wid, ctx_src, input, context, engine_top, l1win,
+                           {}, tick, "skip", skip_reason or "score_failed",
+                           prep_flag == "1", "")
+            w_written = true
+        end
         for _, e in ipairs(layer1) do yield(e.c) end
     end
 end

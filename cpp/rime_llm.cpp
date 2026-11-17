@@ -117,31 +117,63 @@ static int g_score_log_cnt = 0;  // score 日志限频计数器
 static std::string g_log_dir;
 
 static void log_msg(const char * fmt, ...) {
-    char buf[512];
+    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    // 2026-11-17 记录重构：DLL 日志并入 rime_llm_debug.txt（只保留
+    // corpus + debug 两个记录文件），按 debug 协议发 X 行（force：错误
+    // 即使在 debug_fusion 关闭时也保留，避免静默失败）。
+    for (char *p = buf; *p; ++p) {
+        if (*p == '|') *p = '/';
+        else if (*p == '\n' || *p == '\r') *p = ' ';
+    }
     char path[MAX_PATH];
     if (!g_log_dir.empty() && g_log_dir.size() < MAX_PATH - 32) {
         strcpy_s(path, g_log_dir.c_str());
-        strcat_s(path, "\\rime_llm_log.txt");
+        strcat_s(path, "\\rime_llm_debug.txt");
     } else {
         GetTempPathA(sizeof(path), path);
-        strcat_s(path, sizeof(path), "rime_llm_log.txt");
+        strcat_s(path, sizeof(path), "rime_llm_debug.txt");
     }
-    // 日志轮转（2026-09-04）：>5MB 改名 .old（单文件轮转）防无限增长；
-    // 改名失败（被占等罕见）则继续追加，不丢日志
+    static std::string header_path;
+    if (header_path != path) {
+        header_path = path;
+        FILE *rf = fopen(path, "rb");
+        bool ok = false;
+        if (rf) {
+            char first[256] = {0};
+            ok = fgets(first, sizeof(first), rf) &&
+                 strncmp(first, "#RIME_DEBUG|v2|", 15) == 0;
+            fclose(rf);
+        } else {
+            FILE *hf = fopen(path, "ab");
+            if (hf) {
+                SYSTEMTIME st; GetLocalTime(&st);
+                fprintf(hf,
+                        "#RIME_DEBUG|v2|%04d-%02d-%02d %02d:%02d:%02d|plugin\n",
+                        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                        st.wSecond);
+                fclose(hf);
+                ok = true;
+            }
+        }
+        if (!ok) return;
+    }
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa) &&
         ((((unsigned long long)fa.nFileSizeHigh << 32) |
-          (unsigned long long)fa.nFileSizeLow) > 5ull * 1024 * 1024)) {
+          (unsigned long long)fa.nFileSizeLow) > 10ull * 1024 * 1024)) {
         std::string oldp = std::string(path) + ".old";
         DeleteFileA(oldp.c_str());
         MoveFileA(path, oldp.c_str());
     }
-    FILE * f = fopen(path, "a");
-    if (f) { fprintf(f, "%s\n", buf); fclose(f); }
+    FILE * f = fopen(path, "ab");
+    if (f) {
+        fprintf(f, "-|X|scope=dll|msg=%s\n", buf);
+        fclose(f);
+    }
 }
 
 
