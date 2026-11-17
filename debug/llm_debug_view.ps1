@@ -94,23 +94,27 @@ if ($Raw) {
 # ── 数据状态 ─────────────────────────────────────────────────────────────
 $script:queue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 $script:invList = [System.Collections.Generic.List[object]]::new()  # 最近 50 次调用
-$script:events  = [System.Collections.Generic.List[string]]::new()  # 最近 200 条事件行
+# 合并流（2026-11-17 用户定案：原历史〔推理项列表，可点开详情〕与事件〔纯日志〕
+# 两块合一）：@{kind='inv'|'evt'; text=; seq=} 按到达顺序排（旧在头新在尾），
+# 推理行 ◆ 黑字可点开、日志行灰字不可点开——行为同前只是合到一起
+$script:streamData = [System.Collections.Generic.List[object]]::new()  # 最近 200 行
+$script:invSeq = 0            # 推理序号（inv.seq；流行经它关联回 invList）
 $script:viewIdx = -1          # 当前展示的调用下标（-1 = 无）
 $script:paused  = $false
 $script:connected = $false
+$script:suppressStreamSel = $false   # 程序化拨高亮时抑制 SelectedIndexChanged
 
 # ── 布局常量（96 DPI 设计值；DpiK≠1 时末尾统一 字体×k + Scale(k,k)）──────
 $Y_STATUS = 8;  $H_STATUS = 22
 $Y_INFO   = 34; $H_INFO = 20
 $Y_CTX    = 58; $H_CTX = 42
-$Y_GRID   = 104; $H_GRID = 314
-$X_GRID   = 8;   $W_GRID = 856   # 2026-11-16 列改动净增 8px（总分 −26 / 修正分 +34），加宽免横向滚动条
-$X_HIST   = 872; $W_HIST = 204
-$Y_TYPE   = 424; $H_TYPE = 64   # 打字测试框（2026-11-16：在此输入即走本机 IME，免切窗口测试）
-$Y_EVT    = 514; $H_EVT = 96
-$Y_FOOT   = 616       # 数据源一行灰注（公式行已删——公式体现在分数格内）
-$CW = 1088      # ClientSize 宽（= X_HIST + W_HIST + 12）
-$CH = 640       # ClientSize 高
+$Y_GRID   = 104; $H_GRID = 250
+$X_GRID   = 8;   $W_GRID = 1072  # 2026-11-17 合并流后右列腾出 → 网格占满全宽
+$Y_STREAM = 360; $H_STREAM = 188 # 合并流：网格下方（原 事件区 96 + 历史列并入）
+$Y_TYPE   = 554; $H_TYPE = 64   # 打字测试框（2026-11-16：在此输入即走本机 IME，免切窗口测试）
+$Y_FOOT   = 644       # 数据源一行灰注（公式行已删——公式体现在分数格内）
+$CW = 1088      # ClientSize 宽
+$CH = 664       # ClientSize 高（2026-11-17 流列表换得的高度：原 640 + 24）
 
 $form = [System.Windows.Forms.Form]::new()
 $form.Text = 'LLM 实时调试 — rime-llm-rerank（插件版）'
@@ -207,17 +211,38 @@ foreach ($c in $cols) {
 }
 $form.Controls.Add($grid)
 
-$hist = [System.Windows.Forms.ListBox]::new()
-$hist.Location = [System.Drawing.Point]::new($X_HIST, $Y_GRID)
-$hist.Size = [System.Drawing.Size]::new($W_HIST, $H_GRID)
-$hist.HorizontalScrollbar = $true
-$form.Controls.Add($hist)
-
-$evt = [System.Windows.Forms.ListBox]::new()
-$evt.Location = [System.Drawing.Point]::new(8, $Y_EVT)
-$evt.Size = [System.Drawing.Size]::new(1072, $H_EVT)
-$evt.HorizontalScrollbar = $true
-$form.Controls.Add($evt)
+# 合并流（2026-11-17 用户定案）：原历史（推理项列表，可点开详情）与事件
+# （纯日志）两块合一。owner-draw 只为分色：推理行 ◆ 黑字、日志行灰字
+# （同尾窗灰约定）；选中高亮 = 详情区所示那条推理。
+$stream = [System.Windows.Forms.ListBox]::new()
+$stream.Location = [System.Drawing.Point]::new(8, $Y_STREAM)
+$stream.Size = [System.Drawing.Size]::new(1072, $H_STREAM)
+$stream.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
+$stream.ItemHeight = 18
+$stream.HorizontalScrollbar = $true
+$form.Controls.Add($stream)
+$stream.Add_DrawItem({
+  param($s, $e)
+  $sel = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
+  $text = ''
+  $isInv = $false
+  if ($e.Index -ge 0 -and $e.Index -lt $script:streamData.Count) {
+    $text = $script:streamData[$e.Index].text
+    $isInv = ($script:streamData[$e.Index].kind -eq 'inv')
+  }
+  $bg = [System.Drawing.Color]::White
+  $fg = [System.Drawing.Color]::Gray
+  if ($sel) { $bg = [System.Drawing.Color]::Highlight; $fg = [System.Drawing.Color]::White }
+  elseif ($isInv) { $fg = [System.Drawing.Color]::Black }
+  $b = [System.Drawing.SolidBrush]::new($bg)
+  $e.Graphics.FillRectangle($b, $e.Bounds)
+  $b.Dispose()
+  $fb = [System.Drawing.SolidBrush]::new($fg)
+  $e.Graphics.DrawString($text, $e.Font, $fb,
+    (New-Object System.Drawing.PointF(($e.Bounds.X + 2), ($e.Bounds.Y + 1))))
+  $fb.Dispose()
+  $e.DrawFocusRectangle()
+})
 
 # 打字测试框（2026-11-16 用户定案）：在此输入即走本机 IME——组词/候选/
 # 上屏全程在本窗口内完成，逐候选数据实时刷新，免切窗口测试。
@@ -389,25 +414,49 @@ function Get-PfProc($r, $wL) {
   return Pad-L $s $wL
 }
 
-function Add-Event {
-  param($text)
-  $script:events.Insert(0, $text)
-  while ($script:events.Count -gt 200) { $script:events.RemoveAt($script:events.Count - 1) }
-  if (-not $script:paused) {
-    $script:evt.Items.Clear()
-    foreach ($e in $script:events) { [void]$script:evt.Items.Add($e) }
+# ── 合并流（2026-11-17：历史+事件两块合一）─────────────────────────────────
+function Get-InvRowText($inv) {
+  # 推理行：◆ 时间 输入 词1,词2,词3（前 3 词；C 行到达时补齐）
+  $words = ($inv.rows | Select-Object -First 3 | ForEach-Object { $_.word }) -join ','
+  if ($words) { return ('◆ {0} {1} {2}' -f $inv.t, $inv.input, $words) }
+  return ('◆ {0} {1}' -f $inv.t, $inv.input)
+}
+
+function Add-Stream {
+  # 追加一行到合并流（数据列表是唯一事实源；未暂停时同步 ListBox）。
+  # kind='inv' 带 seq（关联回 invList，可点开详情）；'evt' seq=0 不可点开。
+  param($kind, $text, $seq)
+  $script:streamData.Add(@{ kind = $kind; text = $text; seq = $seq })
+  while ($script:streamData.Count -gt 200) { $script:streamData.RemoveAt(0) }
+  if ($script:paused) { return }
+  [void]$script:stream.Items.Add($text)
+  while ($script:stream.Items.Count -gt 200) { $script:stream.Items.RemoveAt(0) }
+  if ($script:stream.Items.Count -gt 0) {
+    $script:stream.TopIndex = $script:stream.Items.Count - 1   # 跟随最新
+  }
+}
+
+function Select-Current-In-Stream {
+  # 把高亮拨回详情区正在展示的那条推理（程序化拨选不触发递归：抑制标志）
+  if ($script:viewIdx -lt 0 -or $script:viewIdx -ge $script:invList.Count) { return }
+  $seq = $script:invList[$script:viewIdx].seq
+  for ($i = $script:streamData.Count - 1; $i -ge 0; $i--) {
+    if ($script:streamData[$i].kind -eq 'inv' -and $script:streamData[$i].seq -eq $seq) {
+      $script:suppressStreamSel = $true
+      try { $script:stream.SelectedIndex = $i } finally { $script:suppressStreamSel = $false }
+      return
+    }
   }
 }
 
 function Rebuild-All {
-  $script:evt.Items.Clear()
-  foreach ($e in $script:events) { [void]$script:evt.Items.Add($e) }
-  # 历史列表也要重建：暂停期间 invList 仍在追加/裁剪，ListBox 已陈旧
-  $script:hist.Items.Clear()
-  foreach ($inv in $script:invList) {
-    $words = ($inv.rows | Select-Object -First 3 | ForEach-Object { $_.word }) -join ','
-    [void]$script:hist.Items.Add(('{0} {1} {2}' -f $inv.t, $inv.input, $words))
+  # 合并流整列重建：streamData 是唯一事实源（暂停期间照常入队）
+  $script:stream.Items.Clear()
+  foreach ($e in $script:streamData) { [void]$script:stream.Items.Add($e.text) }
+  if ($script:stream.Items.Count -gt 0) {
+    $script:stream.TopIndex = $script:stream.Items.Count - 1
   }
+  Select-Current-In-Stream
   Update-Current
 }
 
@@ -439,6 +488,7 @@ function Handle-Line {
     }
     'L' {
       if ($f.Count -lt 10) { return }
+      $script:invSeq++
       $inv = @{ t = $f[1]; input = $f[2]; cache = $f[3]; src = $f[4]
                 ctx = $f[5]; tick = $f[6]; ms = $f[7]; ready = $f[8]
                 prep = $(if ($f.Count -gt 10) { $f[10] } else { '' })
@@ -446,13 +496,14 @@ function Handle-Line {
                 # 与第 12 字段 n_seen（全词数，2026-11-12 起不再显示）均
                 # 协议保留，查看器不解析不显示
                 ctxused = $(if ($f.Count -gt 12) { $f[12] } else { '' })
+                seq = $script:invSeq
                 rows = [System.Collections.Generic.List[object]]::new() }
       $script:invList.Add($inv)
       while ($script:invList.Count -gt 50) { $script:invList.RemoveAt(0) }
       $script:viewIdx = $script:invList.Count - 1
       if (-not $script:paused) {
-        [void]$script:hist.Items.Add(('{0} {1}' -f $inv.t, $inv.input))
-        while ($script:hist.Items.Count -gt 50) { $script:hist.Items.RemoveAt(0) }
+        Add-Stream 'inv' (Get-InvRowText $inv) $inv.seq
+        Select-Current-In-Stream   # 高亮跟随最新（网格同步切到最新）
         Update-Current
       }
     }
@@ -475,29 +526,32 @@ function Handle-Line {
       if (-not $script:paused -and $script:viewIdx -eq ($script:invList.Count - 1)) {
         Update-Current
       }
-      # 历史条目补前 3 个词（前几条 C 行到达时）
+      # 合并流最新推理行补前 3 个词（前几条 C 行到达时）
       if (-not $script:paused -and $inv.rows.Count -le 3) {
-        $idx = $script:hist.Items.Count - 1
-        if ($idx -ge 0) {
-          $words = ($inv.rows | Select-Object -First 3 | ForEach-Object { $_.word }) -join ','
-          $script:hist.Items[$idx] = ('{0} {1} {2}' -f $inv.t, $inv.input, $words)
+        for ($i = $script:streamData.Count - 1; $i -ge 0; $i--) {
+          if ($script:streamData[$i].kind -eq 'inv' -and $script:streamData[$i].seq -eq $inv.seq) {
+            $txt = Get-InvRowText $inv
+            $script:streamData[$i].text = $txt
+            $script:stream.Items[$i] = $txt
+            break
+          }
         }
       }
     }
     'S' {
       if ($f.Count -lt 3) { return }
-      Add-Event ('{0} 跳过 {1}（输入 {2} 来源 {3}）' -f $f[1], $f[2],
+      Add-Stream 'evt' ('{0} 跳过 {1}（输入 {2} 来源 {3}）' -f $f[1], $f[2],
         $(if ($f.Count -gt 3) { $f[3] } else { '' }),
-        $(if ($f.Count -gt 4) { $f[4] } else { '-' }))
+        $(if ($f.Count -gt 4) { $f[4] } else { '-' })) 0
     }
     'E' {
       if ($f.Count -lt 7) { return }
-      Add-Event ('{0} 上屏 {1}  eff {2}→{3}  tick {4}→{5}' -f
-        $f[1], $f[2], $f[3], $f[4], $f[5], $f[6])
+      Add-Stream 'evt' ('{0} 上屏 {1}  eff {2}→{3}  tick {4}→{5}' -f
+        $f[1], $f[2], $f[3], $f[4], $f[5], $f[6]) 0
     }
     'R' {
       if ($f.Count -lt 3) { return }
-      Add-Event ('{0} 重置 {1}' -f $f[1], $f[2])
+      Add-Stream 'evt' ('{0} 重置 {1}' -f $f[1], $f[2]) 0
     }
   }
 }
@@ -510,20 +564,27 @@ $btnPause.Add_Click({
 })
 $chkTop.Add_CheckedChanged({ $form.TopMost = $chkTop.Checked })
 $btnClear.Add_Click({
-  $script:invList.Clear(); $script:events.Clear()
-  $script:hist.Items.Clear(); $script:evt.Items.Clear()
+  $script:invList.Clear(); $script:streamData.Clear()
+  $script:stream.Items.Clear()
   $script:viewIdx = -1
   Update-Current
 })
-$hist.Add_SelectedIndexChanged({
-  if ($script:hist.SelectedIndex -ge 0) {
-    # ListBox 与 invList 同步追加/裁剪到 50 → 下标换算：尾部对齐
-    $script:viewIdx = $script:invList.Count - $script:hist.Items.Count +
-                      $script:hist.SelectedIndex
-    if ($script:viewIdx -lt 0) { $script:viewIdx = 0 }
-    if ($script:viewIdx -ge $script:invList.Count) { $script:viewIdx = $script:invList.Count - 1 }
-    Update-Current
+$stream.Add_SelectedIndexChanged({
+  if ($script:suppressStreamSel) { return }
+  $i = $script:stream.SelectedIndex
+  if ($i -lt 0 -or $i -ge $script:streamData.Count) { return }
+  # 推理行（seq>0）→ 详情切到该条；纯日志行不可点开——高亮弹回当前推理
+  #（行为同 2026-11-17 前的历史列表，只是行混进了日志行）
+  $ent = $script:streamData[$i]
+  if ($ent.kind -ne 'inv') { Select-Current-In-Stream; return }
+  for ($j = $script:invList.Count - 1; $j -ge 0; $j--) {
+    if ($script:invList[$j].seq -eq $ent.seq) {
+      $script:viewIdx = $j
+      Update-Current
+      return
+    }
   }
+  Select-Current-In-Stream   # 推理行已滚出 50 条窗口 → 保持当前视图
 })
 # CE 子项 2026-11-11 起常驻 CE 格内（计算过程直显），点击展开交互已删
 
@@ -566,6 +627,8 @@ if ([Math]::Abs($script:DpiK - 1.0) -gt 0.001) {
   $lblFoot.Font = [System.Drawing.Font]::new('Segoe UI', [float](8 * $k))
   # 显式设过字体的控件要跟着缩（表单字体不覆盖它们）
   $grid.Font = [System.Drawing.Font]::new('Consolas', [float](9 * $k))
+  # 合并流 owner-draw 的行高 Scale 不会动，手动跟 k
+  $stream.ItemHeight = [int][Math]::Ceiling(18 * $script:DpiK)
   $form.Scale([System.Drawing.SizeF]::new($k, $k))
 }
 

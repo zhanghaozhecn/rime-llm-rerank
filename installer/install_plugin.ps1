@@ -1568,6 +1568,9 @@ function Run-InstallerGui {
   $script:WorkDone = $true
   $script:WorkText = New-Object System.Text.StringBuilder
   $script:WorkAction = ""
+  # 下载模型时路径框为空 = 落默认路径——完成后把实际落点回填到框里
+  # （2026-11-17 用户反馈：下载完成后路径框仍是空的，不知道模型下到了哪）
+  $script:DlFill = ""
   $entryScript = Join-Path $PSScriptRoot "install_plugin.ps1"
   $actionDone = @{
     "copy-files"     = "文件复制完成（rime_llm.dll + lua 已部署，服务已重启）"
@@ -1583,6 +1586,8 @@ function Run-InstallerGui {
     if (-not $script:WorkDone) { return }
     $script:WorkDone = $false; $script:WorkOff = 0
     $script:WorkAction = $action
+    # 记下"点下载时路径框是否为空"：空 = 落默认路径 → 成功后回填（见 DlFill 注释）
+    $script:DlFill = $(if ($action -eq "download-model" -and -not $modelPath) { $DEFAULT_MODEL } else { "" })
     [void]$script:WorkText.Clear()
     if (Test-Path $script:WorkLog) { Remove-Item $script:WorkLog -Force }
     $lblInstallStatus.Text = "执行中…（复制文件 / 模型下载可能需要几分钟）"
@@ -1662,6 +1667,13 @@ function Run-InstallerGui {
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
     } else {
+      # 下载完成回填默认路径（点下载时路径框为空的场合；含"已存在，无需下载"）。
+      # Read-ParamsToUi 刚按方案节重读过模型路径——这里以本次实际落点为准。
+      if ($act -eq "download-model" -and $script:DlFill) {
+        $cmbModel.Text = $script:DlFill
+        Update-ModelStatus
+      }
+      $script:DlFill = ""
       $lblInstallStatus.Text = $(if ($actionDone.ContainsKey($act)) { $actionDone[$act] } else { "完成" })
       $lblInstallStatus.ForeColor = $colOk
     }

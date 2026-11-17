@@ -676,6 +676,42 @@ engine:
     Write-Host "  （跳过 ②：本机无 curl.exe）"
   }
 
+  # ══ G14：下载完成自动回填默认路径（2026-11-17 用户反馈：下载后路径框是空的）══
+  # 点『下载模型』时路径框为空 = 落默认路径——完成（含"已存在无需下载"）后框里
+  # 应填回实际落点。为了不被 Read-ParamsToUi 的"节无 model_path → 显示默认"掩盖：
+  # 先给方案节写入一个显式 model_path（指向别处的小文件），完成回调按节重读会
+  # 把框填成那个路径——回填必须以本次实际落点为准把它覆盖成默认路径才算修好。
+  # 用"已存在"分支秒回（预置 105MB 假体在默认落点），不真下载 500MB。
+  Write-Host "== G14: 下载完成自动回填默认路径（空框点下载 → 框 = 默认路径）=="
+  $g14mp = Join-Path (Join-Path $sandbox "Rime") "g14_other.gguf"
+  [IO.File]::WriteAllBytes($g14mp, (New-Object byte[] 2048))
+  [void][W]::SendMsgStr($modelCmb.h, 0x000C, [IntPtr]::Zero, $g14mp)
+  Start-Sleep -Milliseconds 300
+  Click-Btn (Find-Button "保存并生效")            # 方案节写入显式 model_path
+  # 保存落在**当前选中**的方案上（G12④ 切换后落点不定，别假设是 $test）；
+  # 下载完成前选中项不变 → "任一用户方案含 g14_other" 即前置成立
+  Assert "G14 前置：显式 model_path 已存入选中方案" (@(Get-ChildItem (Join-Path $sandbox "Rime") -Filter *.schema.yaml |
+    Where-Object { (Get-Content $_.FullName -Encoding UTF8 |
+      Where-Object { $_ -match 'model_path:' -and $_ -match 'g14_other' }).Count -ge 1 }).Count -ge 1)
+  $fakeFull = Join-Path (Join-Path $sandbox "Rime") "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  $fs14 = [IO.File]::Create($fakeFull); [void]$fs14.SetLength(105MB); $fs14.Close()
+  [void][W]::SendMsgStr($modelCmb.h, 0x000C, [IntPtr]::Zero, "")   # 清空路径框 = 用户场景
+  Start-Sleep -Milliseconds 300
+  Click-Btn (Find-Button "下载模型")               # 落默认路径；已存在 → 秒完成
+  $g14ok = $false
+  for ($t14 = 0; $t14 -lt 30; $t14++) {
+    Start-Sleep -Milliseconds 500
+    if (Any-Text "模型下载完成") { $g14ok = $true; break }
+  }
+  Assert "已存在分支快速完成（状态行『模型下载完成』）" $g14ok
+  $g14box = (Get-Ctls | Where-Object { $_.cls -match '(?i)COMBOBOX' } | Select-Object -Last 1).text
+  Assert ("模型路径框已回填默认路径（实测 '$g14box'）") ($g14box -eq $expectDef)
+  Assert "模型状态显示已就绪" (Any-Text "模型已就绪")
+  Remove-Item $fakeFull, $g14mp -Force
+  [void][W]::SendMsgStr($modelCmb.h, 0x000C, [IntPtr]::Zero, $expectDef)   # 收尾复原
+  Start-Sleep -Milliseconds 300
+  Click-Btn (Find-Button "保存并生效")
+
   # ══ G13c：真机实测路径（≥5 核 + 真模型 → 弹框给表+推荐值 → 采用回填）══
   # 套件前段全程假 3 核（只覆盖"不实测"分支），这里重开一个假 5 核的 GUI，
   # 把「起子进程 → 读结果文件 → 解析 [RESULT] → 弹框 → 回填」整条链路跑通。
