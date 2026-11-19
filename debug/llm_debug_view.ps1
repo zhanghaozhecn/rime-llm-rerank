@@ -380,7 +380,7 @@ function Get-CeProc($r, $wL, $wC) {
   return $t + ')'
 }
 
-# 衰减词频分格：β·ln(1+eff)，β=14 内置常数（log/ln = 自然对数；2026-11-14
+# 衰减词频分格：β·log1p(eff)，β=14 内置常数（2026-11-14
 # 随默认模型 0.5B 重标定，旧 β=12 为 0.8B v3 值）；
 # $wL=分数宽 $wE=eff 宽
 function Get-FbProc($r, $wL, $wE) {
@@ -389,18 +389,18 @@ function Get-FbProc($r, $wL, $wE) {
   $lead = Pad-L (Format-F1 $fb) $wL
   $eff = Get-Num $r.eff
   if ($null -eq $eff) { return $lead }
-  return $lead + '=14·ln(1+' + (Pad-L (Format-F1 $eff) $wE) + ')'
+  return $lead + '=14·log1p(' + (Pad-L (Format-F1 $eff) $wE) + ')'
 }
 
-# 累计词频分格：ln(1+uni)（与衰减词频分格统一 1 在前；2026-11-11 公式
-# 简化，分母为窗内常数已去除）；$wL=分数宽 $wU=累计次数（整数）宽
+# 累计词频分格：log1p(uni)（2026-11-11 公式简化，分母为窗内常数已去除；
+# 2026-11-18 显示统一 log1p(n)）；$wL=分数宽 $wU=累计次数（整数）宽
 function Get-U1Proc($r, $wL, $wU) {
   $u1 = Get-Num $r.u1
   if ($null -eq $u1) { return '—' }
   $lead = Pad-L (Format-F1 $u1) $wL
   $uni = Get-Num $r.uni
   if ($null -eq $uni) { return $lead }
-  return $lead + ('=ln(1+{0})' -f (Pad-L ([string][int]$uni) $wU))
+  return $lead + ('=log1p({0})' -f (Pad-L ([string][int]$uni) $wU))
 }
 
 # 总分格：融合分纯分值（三项过程各在自带格内，修正分见专属列；$wL=分数宽）

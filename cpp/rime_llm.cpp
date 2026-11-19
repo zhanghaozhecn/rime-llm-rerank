@@ -108,6 +108,29 @@ static std::atomic<int>         g_prep_seq{0};  // 请求序列号，跳过过�
 static long                      g_seq0_gen = 0; // seq0 KV 代次: 任何覆盖 seq0 的 decode 递增
 static long                      g_prep_gen = 0; // prepare 完成时的代次
 
+// 2026-11-18：prepare 撞上推理锁（try_lock 失败）时不再静默丢弃——
+// 记下这次请求，score 结束（释放锁）后自动补跑一次。
+static std::mutex                g_prep_pending_mu;
+static std::vector<llama_token>  g_prep_pending_ctx;
+static int                       g_prep_pending_seq = -1;
+static void request_prepare_retry(const std::vector<llama_token> & ids,
+                                  int seq) {
+    {
+        std::lock_guard<std::mutex> lk(g_prep_pending_mu);
+        g_prep_pending_ctx = ids;
+        g_prep_pending_seq = seq;
+    }
+}
+static bool take_prepare_retry(std::vector<llama_token> & out, int & seq) {
+    std::lock_guard<std::mutex> lk(g_prep_pending_mu);
+    if (g_prep_pending_seq < 0) return false;
+    out = std::move(g_prep_pending_ctx);
+    seq = g_prep_pending_seq;
+    g_prep_pending_ctx.clear();
+    g_prep_pending_seq = -1;
+    return true;
+}
+
 static int g_score_log_cnt = 0;  // score 日志限频计数器
 
 // ============================================================
@@ -294,7 +317,19 @@ static void live_broadcast(const std::string &line) {
 // commit 编辑事件原本是盲区，旧快照 2.5s 新鲜窗内冒充真文）。
 // lua 调用线程经 mutex 快照消费，COM/UIA 调用绝不在按键同步路径。
 // ============================================================
+// 前向声明：快照发布后触发预解码（定义见 prepare 之后）
+static void prepare_from_published_text(const std::string & text);
+
 namespace ctxlink {
+
+// 2026-11-18：commit 后"快照刷新完成即预解码"（修 prepare 与 score 的 ctx 不同源）。
+// kick 之后快照要 ~50ms 才更新；若 prepare 在按键路径立刻用旧快照/历史兜底，
+// 拿到的是缺"刚上屏的词"的 ctx → 满码 score 必 miss。改为：commit 时置位，
+// ctxlink 线程下次发布新鲜快照时用**同一份文本**发起预解码。
+static std::atomic<int> g_prep_after_publish{0};
+static bool take_prep_after_publish() {
+    return g_prep_after_publish.exchange(0) > 0;
+}
 
 static std::mutex g_mu;
 static std::string g_com_text;                 // UTF-8
@@ -799,11 +834,17 @@ static void thread_proc() {
                         wchar_t wt[256] = {0};
                         HWND fh = GetForegroundWindow();
                         if (fh) GetWindowTextW(fh, wt, 256);
-                        std::lock_guard<std::mutex> lk(g_mu);
-                        g_com_text = txt;
-                        g_com_stamp = GetTickCount64();
-                        g_com_title = wt;  // 消费端指纹：标题变=切标签/切窗
-                        published = true;
+                        {
+                            std::lock_guard<std::mutex> lk(g_mu);
+                            g_com_text = txt;
+                            g_com_stamp = GetTickCount64();
+                            g_com_title = wt;  // 消费端指纹：标题变=切标签/切窗
+                            published = true;
+                        }
+                        // 新鲜快照已发布：若本次刷新由 commit 触发（kick 带 1），
+                        // 立刻用**这份文本**预解码（与 score 同源，避免 miss）
+                        if (take_prep_after_publish())
+                            prepare_from_published_text(txt);
                     } else if (r == ComRead::DEAD) {
                         bool & logged = is_p ? logged_p : logged_w;
                         if (logged) {
@@ -845,11 +886,15 @@ static void thread_proc() {
                 wchar_t ut[256] = {0};
                 HWND ufh = GetForegroundWindow();
                 if (ufh) GetWindowTextW(ufh, ut, 256);
-                std::lock_guard<std::mutex> lk(g_mu);
-                g_uia_text = txt;
-                g_uia_stamp = GetTickCount64();
-                g_uia_pid = pid;
-                g_uia_title = ut;  // 消费端指纹：同进程多窗/标签切换即变
+                {
+                    std::lock_guard<std::mutex> lk(g_mu);
+                    g_uia_text = txt;
+                    g_uia_stamp = GetTickCount64();
+                    g_uia_pid = pid;
+                    g_uia_title = ut;  // 消费端指纹：同进程多窗/标签切换即变
+                }
+                if (take_prep_after_publish())
+                    prepare_from_published_text(txt);
             } else {
                 std::lock_guard<std::mutex> lk(g_mu);
                 g_uia_text.clear();
@@ -1428,7 +1473,10 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     // 会让 detached prepare 线程在 g_mutex 上与 score 争用、堆积排队
     std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        log_msg("prepare: SKIP score in progress (seq=%d ctx_tok=%d)",
+        // 2026-11-18：不再静默丢弃——登记 pending，score 结束后补跑
+        //（lua 侧的去重记的是"调用过"，丢弃后再也不会重试，满码必付 S1）
+        request_prepare_retry(ctx_ids, seq);
+        log_msg("prepare: DEFER score in progress (seq=%d ctx_tok=%d)",
                 seq, (int)ctx_ids.size());
         return;
     }
@@ -1481,6 +1529,35 @@ static void prepare(const std::vector<llama_token> & ctx_ids, int seq) {
     logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);
     g_prep_ready = true;
     log_msg("prepare: done ctx_tok=%d seq=%d", ctx_len, seq);
+}
+
+// 快照刷新完成后预解码（2026-11-18）：从 ctxlink 线程调用，文本即
+// consume 端（llm_context）会读到的那一份，保证 prepare 与 score 同源。
+static void prepare_from_published_text(const std::string & text) {
+    if (!g_loaded.load()) return;
+    std::string t;
+    t.reserve(text.size());
+    for (char c : text) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+        t.push_back(c);
+    }
+    auto ids = ctx_token_ids(t.c_str());
+    if (ids.empty()) return;
+    int seq = ++g_prep_seq;
+    std::thread([ids, seq]() { prepare(ids, seq); }).detach();
+    log_msg("prepare: auto after snapshot ctx_tok=%d seq=%d",
+            (int)ids.size(), seq);
+}
+
+// score 释放锁后补跑被延迟的 prepare（2026-11-18）
+static void retry_pending_prepare() {
+    std::vector<llama_token> ids;
+    int seq = -1;
+    if (!take_prepare_retry(ids, seq)) return;
+    if (!g_loaded.load() || ids.empty()) return;
+    if (seq != g_prep_seq.load()) return;      // 已有更新的请求
+    std::thread([ids, seq]() { prepare(ids, seq); }).detach();
+    log_msg("prepare: retry deferred ctx_tok=%d seq=%d", (int)ids.size(), seq);
 }
 
 // ============================================================
@@ -1558,6 +1635,8 @@ static int lua_score(lua_State * L) {
         lua_pushnil(L);
         return 1;
     }
+    // 锁已释放：补跑被延迟的 prepare（2026-11-18）
+    retry_pending_prepare();
 
     // 按分数降序排列
     std::vector<int> order(scores.size());
@@ -1637,9 +1716,16 @@ static int lua_llm_context(lua_State * L) {
 }
 
 // commit 后触发：立即刷新 COM/UIA 快照（新词已入文档/控件，读链 ~6-13ms
-// 异步完成，下一键即有新鲜上文）
+// 异步完成，下一键即有新鲜上文）。
+// 2026-11-18：带参数 1 时同时登记"快照刷新后立刻预解码"——kick 到快照更新
+// 之间 ~50ms，按键路径此刻读到的还是旧文本，用它 prepare 会与满码 score 的
+// ctx 不同源（真机 4 连 miss 的根因）。登记后由 ctxlink 线程在发布新鲜快照
+// 的那一刻用同一份文本预解码。
 static int lua_kick_context(lua_State * L) {
     ctxlink::kick();
+    if (lua_toboolean(L, 1)) {
+        ctxlink::g_prep_after_publish++;
+    }
     return 0;
 }
 

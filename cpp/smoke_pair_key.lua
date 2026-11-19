@@ -106,7 +106,7 @@ local cfgmock = {
     end,
     get_string = function(_, k)
         if k == "llm_rerank/model_path" then
-            return "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
+            return "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf"
         end
         return nil
     end,
@@ -126,7 +126,7 @@ local filter = dofile("..\\user\\llm_filter.lua")
 print("[smoke] filter loaded:", type(filter))
 
 local m = require("rime_llm")
-m.model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
+m.model_path = "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf"
 m.score("预热", { "x" })
 local t0 = os.clock()
 while not m.is_ready() do

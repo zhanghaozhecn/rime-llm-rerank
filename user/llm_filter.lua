@@ -90,8 +90,8 @@ local cfg = {
     code_pattern     = '.{4}',
     -- min_code_len / max_code_len 已废弃（用户配置面移除，2026-09-30）：
     -- 等价写法 = code_pattern '.{4}'
-    max_tokens       = 10,  -- 截取的上文 token 数（与 C++ 默认/源码版/README 统一，2026-09-02）
-    max_candidates   = 5,
+    max_tokens       = 20,  -- 截取的上文 token 数（2026-11-19 随生产模型切 Qwen3-0.6B base 定案，旧 10 为 0.5B 时代值）
+    max_candidates   = 6,   -- 2026-11-19：0.6B k*=6（候选段 100ms / 最优 3.65%）
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
     debug_fusion     = false, -- true = 逐候选融合明细写 rime_llm_debug.txt (诊断用)
     two_code_sentence = false, -- 两码整句：词长==⌊码长/2⌋ 的候选一组优先

@@ -17,7 +17,7 @@ local llm = require("rime_llm")
 local LIVE = {}
 llm.live_write = function(line) LIVE[#LIVE + 1] = line end
 
-local MODEL = "d:/gguf_models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+local MODEL = "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf"
 
 -- 预热：显式加载模型（score 触发异步加载）+ 轮询就绪
 llm.model_path = MODEL

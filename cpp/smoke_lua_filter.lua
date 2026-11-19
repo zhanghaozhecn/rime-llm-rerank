@@ -26,7 +26,7 @@ local cfgmock = {
   end,
   get_string = function(_, k)
     if k == "llm_rerank/model_path" then
-      return "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
+      return "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf"
     end
     return nil
   end,
@@ -52,7 +52,7 @@ print("[smoke] filter loaded:", type(filter))
 
 -- 预热：显式加载模型（score 触发异步加载）+ 轮询就绪（模型加载 ~15s）
 local m = require("rime_llm")
-m.model_path = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf"
+m.model_path = "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf"
 m.score("预热", { "x" })
 local t0 = os.clock()
 while not m.is_ready() do

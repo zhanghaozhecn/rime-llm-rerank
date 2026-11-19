@@ -71,8 +71,11 @@ end
 local function trigger_prepare()
     local cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
     if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
-        last_prep_ctx = cur_ctx
-        llm_prep.prepare(cur_ctx)
+        -- 2026-11-18：只有 DLL 真正受理（返回 true）才记账。此前先记账后调用，
+        -- 一旦 prepare 因"模型加载中 / 推理持锁被跳过"被丢弃就再也不会重试，
+        -- 满码评分只能走完整 S1（真机 4 连 prep=0 的成因之一）。
+        local okp, acc = pcall(llm_prep.prepare, cur_ctx)
+        if okp and acc then last_prep_ctx = cur_ctx end
     end
 end
 
@@ -467,8 +470,11 @@ local function processor(key, env)
 
             -- 上屏后立即刷新 COM/UIA 快照（2026-09-10）：新词此刻已入
             -- 文档/控件，读链 6-13ms 在后台线程完成，下一键即有新鲜上文
+            -- 2026-11-18：带 1 = 快照刷新完成后由 DLL 用**同一份文本**预解码。
+            -- kick→快照更新有 ~50ms 延迟，按键路径此刻读到的仍是旧文本，
+            -- 用它 prepare 会与满码 score 的 ctx 不同源（真机 4 连 miss 根因）。
             if llm_prep and llm_prep.kick_context then
-                pcall(llm_prep.kick_context)
+                pcall(llm_prep.kick_context, 1)
             end
         end
 
@@ -481,6 +487,11 @@ local function processor(key, env)
         prev_hist = {}
         for _, v in ipairs(history) do table.insert(prev_hist, v) end
     end
+
+    -- 2026-11-18：history 已在上面同步完毕，此刻再触发一次预解码。
+    -- 键首那次 trigger_prepare 早于 history 追加（拿不到刚上屏的词），
+    -- 这条补的是"历史兜底路径"的 ctx；ctx 未变时被去重挡住，零额外开销。
+    trigger_prepare()
 
     return 2
 end

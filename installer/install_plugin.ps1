@@ -50,12 +50,13 @@ $LUA_DIR = Join-Path $RIME_USER "lua"
 # 默认模型路径 = 用户文件夹（2026-08-27 用户定案：不假设存在 D: 分区；
 # 有 D 盘模型的机器在 GUI/schema 里显式填 D:\gguf_models\...）
 # 与运行期默认保持一致：C++ 侧取 RIME 用户目录根（同上注册表优先）
-$DEFAULT_MODEL = Join-Path $RIME_USER "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+$DEFAULT_MODEL = Join-Path $RIME_USER "Qwen3-0.6B-Base-Q4_K_M.gguf"
 # 完整模型的体量下限（与"下载完成转正"判据同一个数）：小于它 = 疑似半截/损坏
 $MODEL_MIN_BYTES = 100MB
-# 下载源 = ModelScope 官方仓（2026-11-16 用户定案 base→instruct 切换：
-# 国内直连快；base GGUF 在 ModelScope 无官方/第三方件——逐仓核实过）
-$MODEL_URL = "https://www.modelscope.cn/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/master/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+# 下载源 = ModelScope 自建仓（2026-11-19 用户定案：生产模型切 Qwen3-0.6B **base** 自转
+# Q4_K_M——研究帕累托最优 100ms/3.65%，预填充 79ms；官方 ModelScope 无 0.6B base GGUF，
+# 对话微调版在重排任务上差 0.67pp，故自建上传。旧 instruct 下载源已退役）
+$MODEL_URL = "https://www.modelscope.cn/models/zhanghaozhecn/Qwen3-0.6B-Base-GGUF/resolve/master/Qwen3-0.6B-Base-Q4_K_M.gguf"
 
 function Find-WeaselDir {
   # ① 注册表 WeaselRoot（安装器写入；最可靠）
@@ -213,7 +214,9 @@ function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $
 $PARAM_DEFAULTS = [ordered]@{
   enabled = $false
   code_pattern = '.{4}'   # 仅 4 码；4 码以上 .{4,} / 3-4 码 .{3,4} / 指定字母 [abcde]{4}
-  max_tokens = 10; max_candidates = 5; cpu_cores = 4
+  max_tokens = 20; max_candidates = 6; cpu_cores = 4
+  # ↑ 2026-11-19 随生产模型切 Qwen3-0.6B base 同步定案（研究 ctx\*=20、0.6B k\*=6：
+  #   候选段 100ms / 最优 3.65%；旧 10/5 为 0.5B 时代值）
   two_code_sentence = $false; debug_fusion = $false
 }
 $PARAM_INT_KEYS  = @("max_tokens","max_candidates","cpu_cores")
@@ -280,7 +283,7 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
     "  debug_fusion: $(if ($p.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $sec += "  model_path: " + (Convert-ToYamlPath $modelPath) }
-  else { $sec += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\qwen2.5-0.5b-instruct-q4_k_m.gguf>" }
+  else { $sec += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen3-0.6B-Base-Q4_K_M.gguf>" }
   $out = @()
   if ($start -gt 0) { $out += $lines[0..($start - 1)] }
   $out += $sec
@@ -317,7 +320,7 @@ function Merge-LlmParams($prior) {
 }
 
 # llm_rerank 配置节；modelPath 非空时写为生效行（反斜杠→正斜杠，含空格则加引号），
-# 留空则保持注释示例（运行时默认 %APPDATA%\Rime\qwen2.5-0.5b-instruct-q4_k_m.gguf）。
+# 留空则保持注释示例（运行时默认 %APPDATA%\Rime\Qwen3-0.6B-Base-Q4_K_M.gguf）。
 # prior = 重跑加 LLM 时方案里已有的参数（Read-LlmParams 结果）——先剥后插
 # 重建节时逐键保留，防止重跑把用户自定义参数重置回默认（model_path 同思路）。
 function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
@@ -333,7 +336,7 @@ function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
     "  debug_fusion: $(if ($d.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
-  else { $l += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\qwen2.5-0.5b-instruct-q4_k_m.gguf>" }
+  else { $l += "  # model_path: <绝对路径；默认 = ${env:APPDATA}\Rime\Qwen3-0.6B-Base-Q4_K_M.gguf>" }
   return $l
 }
 function Convert-ToYamlPath([string]$p) {
@@ -849,8 +852,8 @@ function Run-InstallerGui {
   $tipEnabled = "总开关：开 = 加载模型参与候选重排；关 = 卸载模型释放内存。`n保存后自动重新部署生效。"
   $tipModel = "GGUF 模型文件路径（留空 = 用户文件夹里的默认名）。`n下拉列出用户文件夹与本机 gguf_models 下的模型；`n换模型保存后会自动卸载并重载。"
   $tipCodePat = "触发条件：编码串全串正则匹配，只有匹配上的编码才交给 LLM 重排`n（写法与 Rime speller/auto_select_pattern 一致）。`n默认 .{4} = 恰 4 码。例：`n　.{4,} 4 码以上　　.{3,4} 3~4 码`n　[abcde]{4} 指定首码　　空 = 不限制`n含 \ 的写法要用单引号，如 '\d{4}'。"
-  $tipMaxTok = "上文长度上限：取光标前多少个 token 作为重排依据（默认 10）。`n越大越准，但每次都更慢。"
-  $tipMaxCand = "每次按键参与 LLM 打分的候选数上限（默认 5）。`n一般不用改——调大更准但更慢。"
+  $tipMaxTok = "上文长度上限：取光标前多少个 token 作为重排依据（默认 20）。`n越大越准，但每次都更慢。"
+  $tipMaxCand = "每次按键参与 LLM 打分的候选数上限（默认 6）。`n一般不用改——调大更准但更慢。"
   $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
   $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
   $tipTcs = "两码整句 two_code_sentence（默认关闭）。`n开启后（双拼/五笔/郑码等两码一字整句方案）：词长恰为`nfloor(码长/2) 字的候选作为一组直接优先（组内按融合分），`n其余候选按融合分排后——整句方案的满句长候选优先。`n一般字词方案保持关闭。取代原预期词长权重 elw（2026-11-07）。"
@@ -859,7 +862,7 @@ function Run-InstallerGui {
   $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；`n**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
   $tipStrip = "剥离：把选中方案里的 LLM 组件行与 llm_rerank 配置节整个删掉`n（方案回到『未接入』状态），并自动重新部署。`n日常只想改参数请用『保存并生效』。"
   $tipFiles = "复制文件：停服务 → 清理旧二进制 → 替换 rime_llm.dll 与 lua → 启服务。"
-  $tipDownload = "下载模型：ModelScope 直连断点续传（curl -C -），落点 = 左边的模型路径框`n（留空 = 用户文件夹里的默认名 qwen2.5-0.5b-instruct-q4_k_m.gguf）。`n失败会保留 .download 分片，再点一次即续传。"
+  $tipDownload = "下载模型：ModelScope 直连断点续传（curl -C -），落点 = 左边的模型路径框`n（留空 = 用户文件夹里的默认名 Qwen3-0.6B-Base-Q4_K_M.gguf）。`n失败会保留 .download 分片，再点一次即续传。"
 
   # 控件工厂：AutoSize=false —— Label 默认宽度会被缩到文字宽，
   # 破坏公式行"+"右对齐列与编辑框同列对齐（固定宽度才可核对不相交）
