@@ -4,8 +4,13 @@
  *
  * Scans 4..min(8, logical-core-count) (2026-10-01 用户定案：起点 4、终点 8；
  * 1-3 线程实测不可用且 8 以上收益递减，故两端都收窄) and measures the
- * production score-batch workload: Step 1 ctx decode + KV copy + parallel
- * candidate decode + CE (same shape as llm_filter / rime_llm.dll scoring).
+ * production **candidate segment** (研究库口径 `t_cand`): KV copy + parallel
+ * candidate decode + CE for **k candidates, each exactly 3 tokens, first
+ * tokens pairwise distinct** (prefix dedup can never merge them → step2/step3
+ * each decode k rows = true worst case). 2026-11-19 用户定案：与生产配置
+ * 调试窗口统一口径，`k` = 用户填入的 max_candidates（`--cands`，默认 6）。
+ * ctx prefill (step1) is NOT timed — production does it in prepare() behind
+ * the commit, off the per-keystroke path.
  *
  * Machines with fewer than 5 logical cores are NOT benchmarked at all
  * (2026-10-01 用户定案): the tool immediately recommends the max thread
@@ -20,8 +25,12 @@
  * 1.05x of the best latency, capped at the physical core count — beyond the
  * physical cores extra threads are SMT siblings and buy almost nothing.
  *
- * usage: bench_threads.exe [model_path] [--out FILE] [--trials N] [--no-wait]
- *   model_path default: d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf
+ * usage: bench_threads.exe [model_path] [--out FILE] [--trials N] [--cands K]
+ *                          [--no-wait]
+ *   model_path default: d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf
+ *   --cands K    candidate count for the timed segment (= max_candidates;
+ *                default 6, clamped 1..32). Both GUIs pass the value the user
+ *                currently has in the max_candidates box.
  *   --out FILE   result/progress file (default: next to the exe; %TEMP% if
  *                that directory is not writable, e.g. under Program Files).
  *                Flushed per line → the settings GUIs poll it as progress.
@@ -64,9 +73,10 @@ static void out(const char *fmt, ...) {
   fflush(stdout);
 }
 
-static const char *kDefaultModel = "d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf";
-static const int kCtxTokens = 10;   // typical TSF caret context
-static const int kNCands = 5;       // max_candidates default
+static const char *kDefaultModel = "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf";
+static const int kCtxTokens = 20;   // production max_tokens default (ctx20)
+static const int kNCands = 6;       // production max_candidates default
+static const int kMaxCands = 32;    // sanity cap for --cands
 static const int kNTrials = 99;     // CLI default; median + mid-50% reported
 static const int kMinThr = 4;       // scan start (2026-10-01 用户定案)
 static const int kMaxThr = 8;       // scan end   (2026-10-01 用户定案)
@@ -84,6 +94,38 @@ static std::vector<llama_token> tokenize(const char *text) {
     return std::vector<llama_token>();
   toks.resize(std::max(0, n));
   return toks;
+}
+
+// Candidate workload = worst case for the candidate segment (`t_cand`):
+// k sequences of exactly 3 tokens with pairwise-distinct first tokens, so the
+// production prefix dedup can never merge two of them — step2 and step3 each
+// decode k rows. Token ids come straight from the vocab (normal, non-special
+// pieces): only the timed shape matters, not the literal words, and this
+// keeps working for any k instead of running out of a hard-coded word pool.
+static std::vector<std::vector<llama_token>> build_cands(int k, int vs) {
+  std::vector<llama_token> pool;
+  for (llama_token id = 1; id < vs; id++) {
+    if (llama_vocab_is_control(g_vocab, id) || llama_vocab_is_eog(g_vocab, id))
+      continue;
+    const char *t = llama_vocab_get_text(g_vocab, id);
+    if (!t || !*t || t[0] == '<')   // <0xXX> byte fallback / special text
+      continue;
+    pool.push_back(id);
+  }
+  std::vector<std::vector<llama_token>> out;
+  if ((int)pool.size() < 3)
+    return out;
+  // Spread the heads across the vocab: distinct positions → distinct ids.
+  size_t stride = std::max<size_t>(1, pool.size() / (size_t)k);
+  for (int s = 0; s < k; s++) {
+    size_t base = (size_t)s * stride;
+    if (base >= pool.size())
+      break;
+    out.push_back({pool[base],
+                   pool[(base + stride / 3 + 1) % pool.size()],
+                   pool[(base + 2 * stride / 3 + 2) % pool.size()]});
+  }
+  return out;
 }
 
 static double cross_entropy(float *logits, int vs, int target_id) {
@@ -274,6 +316,7 @@ int main(int argc, char **argv) {
   const char *model_path = kDefaultModel;
   const char *out_arg = NULL;
   int trials = kNTrials;
+  int ncands = kNCands;
   bool no_wait = false;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--out") && i + 1 < argc)
@@ -282,6 +325,12 @@ int main(int argc, char **argv) {
       trials = atoi(argv[++i]);
       if (trials < 5)
         trials = 5;   // 太少 → 中位数不稳
+    } else if (!strcmp(argv[i], "--cands") && i + 1 < argc) {
+      ncands = atoi(argv[++i]);
+      if (ncands < 1)
+        ncands = 1;
+      if (ncands > kMaxCands)
+        ncands = kMaxCands;
     } else if (!strcmp(argv[i], "--no-wait")) {
       no_wait = true;
     } else if (argv[i][0] != '-') {
@@ -312,8 +361,8 @@ int main(int argc, char **argv) {
         cores, kMinCoresToTest, cores);
     out("  在方案 llm_rerank 里设 cpu_cores: %d，然后重新部署。\n", cores);
     out("[RESULT] log_cores=%d phys_cores=%d tested=none rec=%d rec_ms=0.0 "
-        "best=-1 best_ms=0.0 threshold=%.2f reason=low_cores\n",
-        cores, phys, cores, kRecThreshold);
+        "best=-1 best_ms=0.0 threshold=%.2f cands=%d reason=low_cores\n",
+        cores, phys, cores, kRecThreshold, ncands);
     if (g_out)
       fclose(g_out);
     wait_exit(no_wait);
@@ -341,35 +390,18 @@ int main(int argc, char **argv) {
   g_vocab = llama_model_get_vocab(g_model);
   int vs = llama_vocab_n_tokens(g_vocab);
 
-  // fixed workload: 10-token context + 5 candidates matching the heaviest
-  // real typing case: 3 x 2-token + 2 x 3-token candidates (triggers the
-  // S3 decode). Common Chinese words are single vocab tokens, so select
-  // from a pool of less-common words and verify token counts at runtime.
-  const char *ctx_text = "今天天气不错我们去公园散步聊聊天然后回家吃晚饭";
+  // fixed workload = production candidate segment (`t_cand`): 20-token
+  // context (prefill NOT timed) + ncands 3-token candidates whose first tokens
+  // are pairwise distinct (prefix dedup off = worst case).
+  const char *ctx_text =
+      "我们明天早上八点在公司门口集合然后一起去图书馆借几本关于计算机系统的书顺便买点水果回来";
   std::vector<llama_token> ctx_ids = tokenize(ctx_text);
   if ((int)ctx_ids.size() > kCtxTokens)
     ctx_ids.erase(ctx_ids.begin(), ctx_ids.end() - kCtxTokens);
-  const char *cand_pool[] = {
-      "错事", "侧式", "测速", "仄声", "佚名", "怅惘", "缱绻", "龌龊",
-      "邂逅", "蹉跎", "饕餮", "犄角", "旮旯", "囫囵", "氤氲", "黢黑",
-      "计算机", "图书馆", "摄像头", "咖啡机", "高跟鞋", "潜台词", "老字号",
-      "双刃剑", "里程碑", "橄榄枝", "绊脚石", "遮羞布", "紧箍咒", "试金石"};
-  std::vector<std::vector<llama_token>> tok2, tok3;
-  for (auto *w : cand_pool) {
-    auto ids = tokenize(w);
-    if (ids.size() == 2 && tok2.size() < 3)
-      tok2.push_back(ids);
-    else if (ids.size() == 3 && tok3.size() < 2)
-      tok3.push_back(ids);
-  }
-  std::vector<std::vector<llama_token>> cands;
-  for (auto &c : tok2)
-    cands.push_back(c);
-  for (auto &c : tok3)
-    cands.push_back(c);
-  if (cands.size() < 5) {
-    fprintf(stderr, "ERROR: pool did not yield 3x2-token + 2x3-token "
-                    "candidates (got %d)\n", (int)cands.size());
+  std::vector<std::vector<llama_token>> cands = build_cands(ncands, vs);
+  if ((int)cands.size() < ncands) {
+    fprintf(stderr, "ERROR: vocab yielded only %d usable tokens - cannot "
+                    "build %d candidates\n", (int)cands.size(), ncands);
     llama_model_free(g_model);
     llama_backend_free();
     if (g_out)
@@ -377,11 +409,9 @@ int main(int argc, char **argv) {
     wait_exit(no_wait);
     return 1;
   }
-  out("workload: ctx_tok=%d cand=%d (tokens:", (int)ctx_ids.size(),
-      (int)cands.size());
-  for (auto &c : cands)
-    out(" %d", (int)c.size());
-  out(", incl. S3 decode)\n");
+  out("workload: t_cand = %d candidates x 3 tokens (distinct first tokens), "
+      "ctx_tok=%d (prefill not timed)\n", (int)cands.size(),
+      (int)ctx_ids.size());
 
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
@@ -393,7 +423,7 @@ int main(int argc, char **argv) {
     cp.n_ctx = 128;
     cp.n_threads = thr;
     cp.n_threads_batch = thr;
-    cp.n_seq_max = 12;
+    cp.n_seq_max = std::max(12, ncands + 2);   // seq 0 = ctx, 1..k = candidates
     llama_context *ctx = llama_init_from_model(g_model, cp);
     if (!ctx) {
       out("  thr=%2d: ctx create FAILED\n", thr);
@@ -426,7 +456,7 @@ int main(int argc, char **argv) {
     double med = samples[n / 2];          // median
     double p25 = samples[n / 4];          // 25th percentile
     double p75 = samples[std::min(n - 1, 3 * n / 4)];  // 75th percentile
-    out("  thr=%2d: median %6.1f ms/pass (mid50 %5.1f-%5.1f)%s\n",
+    out("  thr=%2d: median %6.1f ms/t_cand (mid50 %5.1f-%5.1f)%s\n",
         thr, med, p25, p75, thr > phys ? "  [超物理核]" : "");
     row_thr.push_back(thr);
     row_med.push_back(med);
@@ -483,15 +513,17 @@ int main(int argc, char **argv) {
   out("\n== summary ==\n");
   out("NOTE: run while the system is idle - heavy background load (builds,\n");
   out("      downloads, games) flattens the curve.\n");
-  out("推荐 CPU 线程数 = %d（%.1f ms/pass；最优 %.1f ms @ %d 线程，"
+  out("metric: t_cand = 候选段（step2+step3，%d 个 3-token 候选，首 token 互异；"
+      "预填充不计）。\n", ncands);
+  out("推荐 CPU 线程数 = %d（t_cand %.1f ms；最优 %.1f ms @ %d 线程，"
       "取最优 × %.2f 以内最快的线程数，且不超过物理核 %d）。\n",
       rec, rec_ms, best_ms, best_thr, kRecThreshold, phys);
   out("在方案 llm_rerank 里设 cpu_cores: %d（GUI 点『实测线程数』可直接采用），"
       "然后重新部署。\n", rec);
   out("[RESULT] log_cores=%d phys_cores=%d tested=%d-%d rec=%d rec_ms=%.1f "
-      "best=%d best_ms=%.1f threshold=%.2f reason=ok\n",
+      "best=%d best_ms=%.1f threshold=%.2f cands=%d reason=ok\n",
       cores, phys, kMinThr, last_thr, rec, rec_ms, best_thr, best_ms,
-      kRecThreshold);
+      kRecThreshold, ncands);
 
   llama_model_free(g_model);
   llama_backend_free();

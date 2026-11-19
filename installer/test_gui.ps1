@@ -336,8 +336,8 @@ public class W {
   $e = Get-ParamEdits
   Assert ("参数框数 = 4（实测 $($e.Count)：$(($e | ForEach-Object { $_.text }) -join '|')）") ($e.Count -eq 4)
   Assert "code_pattern = .{4}" ((Get-WText $e[0].h) -eq ".{4}")
-  Assert "max_tokens = 10" ((Get-WText $e[1].h) -eq "10")
-  Assert "max_candidates = 5" ((Get-WText $e[2].h) -eq "5")
+  Assert "max_tokens = 20" ((Get-WText $e[1].h) -eq "20")
+  Assert "max_candidates = 6" ((Get-WText $e[2].h) -eq "6")
   Assert "cpu_cores = 4" ((Get-WText $e[3].h) -eq "4")
   Assert "「用户词频权重」行已移除（β 退出配置面）" (-not (Has-Text "用户词频权重"))
   Assert "「预期词长权重」行已移除（elw 退役）" (-not (Has-Text "预期词长权重"))
@@ -551,7 +551,7 @@ engine:
   Combo-Key $cmb 0x24 "是"
   Start-Sleep -Milliseconds 400
   $modelBox = (Get-Ctls | Where-Object { $_.cls -match '(?i)COMBOBOX' } | Select-Object -Last 1).text
-  $expectDef = Join-Path (Join-Path $sandbox "Rime") "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  $expectDef = Join-Path (Join-Path $sandbox "Rime") "Qwen3-0.6B-Base-Q4_K_M.gguf"
   Write-Host ("  模型路径框 = " + $modelBox)
   Assert ("默认模型路径 = 用户目录下的默认名（实测 '$modelBox'）") ($modelBox -eq $expectDef)
   # ③ 相对路径必须被拒绝（不落盘）
@@ -622,7 +622,7 @@ engine:
   Set-Edit $e13[3] "4"                    # 复原（后续相位不依赖）
 
   Write-Host "== G13b: CLI bench（真机 ≥5 核路径 + 不足 5 核路径）=="
-  $benchModel = "d:/gguf_models/Qwen3-0.6B-Q4_K_M.gguf"
+  $benchModel = "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf"
   if (Test-Path $benchModel) {
     $env:RIME_LLM_FAKE_CORES = "5"       # 5 核 → 实测 4~5 两档（快）
     $o = (& $psExe -NoProfile -ExecutionPolicy Bypass -File $entry -CliAction bench `
@@ -693,7 +693,7 @@ engine:
   Assert "G14 前置：显式 model_path 已存入选中方案" (@(Get-ChildItem (Join-Path $sandbox "Rime") -Filter *.schema.yaml |
     Where-Object { (Get-Content $_.FullName -Encoding UTF8 |
       Where-Object { $_ -match 'model_path:' -and $_ -match 'g14_other' }).Count -ge 1 }).Count -ge 1)
-  $fakeFull = Join-Path (Join-Path $sandbox "Rime") "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  $fakeFull = Join-Path (Join-Path $sandbox "Rime") "Qwen3-0.6B-Base-Q4_K_M.gguf"
   $fs14 = [IO.File]::Create($fakeFull); [void]$fs14.SetLength(105MB); $fs14.Close()
   [void][W]::SendMsgStr($modelCmb.h, 0x000C, [IntPtr]::Zero, "")   # 清空路径框 = 用户场景
   Start-Sleep -Milliseconds 300
@@ -717,7 +717,7 @@ engine:
   # 把「起子进程 → 读结果文件 → 解析 [RESULT] → 弹框 → 回填」整条链路跑通。
   # 依赖本机模型（不存在则跳过）——套件是本机维护用，不发布。
   Write-Host "== G13c: 真机实测路径（假 5 核 + 真模型，约 20 秒）=="
-  $benchModel2 = "d:/gguf_models/Qwen3-0.6B-Q4_K_M.gguf"
+  $benchModel2 = "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf"
   if (-not (Test-Path $benchModel2)) {
     Write-Host "  （跳过：$benchModel2 不存在）"
   } else {

@@ -14,7 +14,8 @@
 #   参数读写选中方案的 llm_rerank 配置节，保存后自动重新部署（两版配置节相同）。
 # CLI：-CliAction status|install|copy-files|schema-add|schema-remove|download-model|bench
 #      -SchemaName pdsp.schema.yaml -ModelPath d:\gguf_models\xxx.gguf（可选，写入配置）
-#      bench = 线程数实测（起点 4 / 终点 8；本机不足 5 线程不实测，直接取最大线程数）
+#      bench = 线程数实测（起点 4 / 终点 8；t_cand = -BenchCands 个 3-token 候选的
+#              候选段延迟；本机不足 5 线程不实测，直接取最大线程数）
 # 设计（2026-08-25 定稿）：安装器只做 文件操作 + schema 加/去 LLM 组件行（幂等）。
 # 不碰注册表、不调 WeaselSetup、不做还原（切换 = 重装小狼毫 + 换原始方案配置）。
 
@@ -22,7 +23,8 @@ param(
   [string]$CliAction = "",
   [string]$SchemaName = "",
   [string]$ModelPath = "",
-  [int]$BenchTrials = 41        # 线程数实测：每档计时次数（GUI/CLI 默认 41 ≈ 30 秒）
+  [int]$BenchTrials = 41,       # 线程数实测：每档计时次数（GUI/CLI 默认 41 ≈ 30 秒）
+  [int]$BenchCands = 0          # 线程数实测：候选数（0 = 用方案/GUI 里的 max_candidates，缺省 6）
 )
 
 $ErrorActionPreference = "Stop"
@@ -619,16 +621,30 @@ function Download-ModelAction([string]$modelPath, $Log) {
   }
 }
 
-# ── 线程数实测（2026-10-01 用户定案）──────────────────────────────
+# ── 线程数实测（2026-10-01 用户定案；2026-11-19 口径改 t_cand）──────────
 # 起点 4 线程、终点 8 线程；本机不足 5 逻辑核**不实测**，直接取最大线程数。
+# 指标 = t_cand：候选段两次 decode（k 个 3-token 候选，首 token 互异，
+# 预填充不计），k = 界面上「参与打分的候选数」当前值（--cands）。
 # 推荐规则本体在 bench_threads.exe 内（它打 `[RESULT]` 机器可读行），本脚本与
 # 两版 GUI 都只做「起进程 → 读结果文件 → 显示/回填」，避免两版各写一套规则。
 $BenchMinCores = 5        # 逻辑核 < 5 → 不实测，直接取最大线程数
 $BenchTrialsDef = 41      # 每档计时次数（41 × 5 档 ≈ 30 秒）
+$BenchCandsDef = 6        # 候选数缺省 = max_candidates 默认 6
+$BenchCandsMax = 32       # 与 bench_threads 的钳位一致
 $BENCH_TMP = Join-Path $env:TEMP "rime_llm_bench_result.txt"
 $BENCH_PID = Join-Path $env:TEMP "rime_llm_bench.pid"
 $BENCH_LOG = Join-Path $env:TEMP "rime_llm_bench_stdout.txt"
 if ($BenchTrials -le 0) { $BenchTrials = $BenchTrialsDef }   # GUI / CLI 共用的每档次数
+
+# 候选数：界面/CLI 值缺省或非法时回退 6，上限与 bench_threads 一致（32）。
+function Get-BenchCands([string]$raw) {
+  $n = 0
+  if ([int]::TryParse(("$raw").Trim(), [ref]$n) -and $n -ge 1) {
+    if ($n -gt $BenchCandsMax) { return $BenchCandsMax }
+    return $n
+  }
+  return $BenchCandsDef
+}
 
 function Get-LogicalCores {
   # 测试钩子（正常部署不设，bench_threads.exe 读同一个变量）：
@@ -667,6 +683,7 @@ function Get-BenchResult([string]$text) {
     Best   = $kv['best']
     BestMs = $kv['best_ms']
     Phys   = $kv['phys_cores']
+    Cands  = $kv['cands']
   }
 }
 
@@ -706,8 +723,8 @@ function Stop-StaleBench {
 }
 
 # 线程数实测（CLI = -CliAction bench；GUI 走同一套探测/规则，只是把推荐值回填输入框）
-function Bench-Action([string]$modelPath, [int]$trials, $Log) {
-  & $Log "── 线程数实测（4~8 线程；本机不足 $BenchMinCores 线程不实测）──"
+function Bench-Action([string]$modelPath, [int]$trials, [int]$cands, $Log) {
+  & $Log "── 线程数实测（4~8 线程；t_cand = $cands 个 3-token 候选的候选段；本机不足 $BenchMinCores 线程不实测）──"
   $cores = Get-LogicalCores
   if ($cores -lt $BenchMinCores) {
     & $Log "本机逻辑核 $cores（不足 $BenchMinCores）→ 不做实测，直接推荐最大线程数 $cores"
@@ -720,7 +737,7 @@ function Bench-Action([string]$modelPath, [int]$trials, $Log) {
   if (-not (Test-Path $modelPath)) { throw "模型文件不存在：$modelPath" }
   if (Stop-StaleBench) { & $Log "已结束上次遗留的实测进程，由本次接管" }
   Remove-Item $BENCH_TMP -Force -ErrorAction SilentlyContinue
-  $argList = @("--out", "`"$BENCH_TMP`"", "--trials", "$trials", "--no-wait", "`"$modelPath`"")
+  $argList = @("--out", "`"$BENCH_TMP`"", "--trials", "$trials", "--cands", "$cands", "--no-wait", "`"$modelPath`"")
   $proc = Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden `
     -RedirectStandardOutput $BENCH_LOG -PassThru
   Set-Content -Path $BENCH_PID -Value $proc.Id -Encoding ASCII
@@ -747,7 +764,7 @@ function Bench-Action([string]$modelPath, [int]$trials, $Log) {
   $lines = @($text -split "`r?`n" | Where-Object { $_ -match '^\s*thr=' })
   while ($off -lt $lines.Count) { & $Log ("  " + $lines[$off].Trim()); $off++ }
   & $Log $r.Line
-  & $Log "推荐 CPU 线程数 = $($r.Rec)（$($r.RecMs) ms/pass；最优 $($r.BestMs) ms @ $($r.Best) 线程，物理核 $($r.Phys)）"
+  & $Log "推荐 CPU 线程数 = $($r.Rec)（t_cand $($r.RecMs) ms = $cands 个 3-token 候选；最优 $($r.BestMs) ms @ $($r.Best) 线程，物理核 $($r.Phys)）"
   & $Log "在方案 llm_rerank 里设 cpu_cores: $($r.Rec)，然后重新部署（GUI 点『实测线程数』可直接采用）"
   return $r.Rec
 }
@@ -787,7 +804,7 @@ function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$mode
           Schema-RemoveAction $schemaName $Log
         }
         "download-model" { Download-ModelAction $modelPath $Log }
-        "bench" { [void](Bench-Action $modelPath $BenchTrials $Log) }
+        "bench" { [void](Bench-Action $modelPath $BenchTrials (Get-BenchCands $BenchCands) $Log) }
         default { & $Log "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove | download-model | bench）"; exit 1 }
       }
     } catch {
@@ -855,7 +872,7 @@ function Run-InstallerGui {
   $tipMaxTok = "上文长度上限：取光标前多少个 token 作为重排依据（默认 20）。`n越大越准，但每次都更慢。"
   $tipMaxCand = "每次按键参与 LLM 打分的候选数上限（默认 6）。`n一般不用改——调大更准但更慢。"
   $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
-  $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
+  $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（t_cand = 当前「候选数」个 3-token 候选的候选段延迟，预填充不计；`n取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
   $tipTcs = "两码整句 two_code_sentence（默认关闭）。`n开启后（双拼/五笔/郑码等两码一字整句方案）：词长恰为`nfloor(码长/2) 字的候选作为一组直接优先（组内按融合分），`n其余候选按融合分排后——整句方案的满句长候选优先。`n一般字词方案保持关闭。取代原预期词长权重 elw（2026-11-07）。"
   $tipDebug = "诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt`n（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。"
   $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n随后自动重新部署生效。`n方案还没接入（缺配置节 / 缺组件行 / 残留另一版组件行）时，`n本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。"
@@ -1344,8 +1361,11 @@ function Run-InstallerGui {
     }
     Remove-Item $BENCH_TMP -Force -ErrorAction SilentlyContinue
     [void]$script:BenchText.Clear()
+    # 候选数跟界面当前值走（= max_candidates；非法/空回退 6），
+    # 让实测的 t_cand 与用户即将保存的推理规模一致
+    $cands = Get-BenchCands $txtMaxCand.Text
     try {
-      $argList = @("--out", "`"$BENCH_TMP`"", "--trials", "$BenchTrials", "--no-wait", "`"$model`"")
+      $argList = @("--out", "`"$BENCH_TMP`"", "--trials", "$BenchTrials", "--cands", "$cands", "--no-wait", "`"$model`"")
       $script:BenchProc = Start-Process -FilePath $exe -ArgumentList $argList `
         -WindowStyle Hidden -RedirectStandardOutput $BENCH_LOG -PassThru
       Set-Content -Path $BENCH_PID -Value $script:BenchProc.Id -Encoding ASCII
@@ -1357,7 +1377,7 @@ function Run-InstallerGui {
       return
     }
     $btnBench.Enabled = $false
-    $lblParamStatus.Text = "实测中…（4~$([Math]::Min($cores, 8)) 线程 × $BenchTrials 次，约 30 秒，期间请勿打字）"
+    $lblParamStatus.Text = "实测中…（4~$([Math]::Min($cores, 8)) 线程 × $BenchTrials 次，t_cand = $cands 个候选，约 30 秒，期间请勿打字）"
     $BenchTimer.Start()
   }
 
@@ -1386,8 +1406,8 @@ function Run-InstallerGui {
       $lblParamStatus.Text = "本机不足 $BenchMinCores 线程，已直接填入最大线程数 $($r.Rec)（点『保存并生效』应用）"
       return
     }
-    $msg = "本机实测（ms/pass，越小越快）：`n`n$($r.Table)`n`n" +
-           "推荐 CPU 线程数 = $($r.Rec)（$($r.RecMs) ms；最优 $($r.BestMs) ms @ $($r.Best) 线程，物理核 $($r.Phys)）。`n`n" +
+    $msg = "本机实测（t_cand = $($r.Cands) 个 3-token 候选的候选段毫秒数，越小越快）：`n`n$($r.Table)`n`n" +
+           "推荐 CPU 线程数 = $($r.Rec)（t_cand $($r.RecMs) ms；最优 $($r.BestMs) ms @ $($r.Best) 线程，物理核 $($r.Phys)）。`n`n" +
            "采用该值吗？（采用后点『保存并生效』应用）"
     $ans = [System.Windows.Forms.MessageBox]::Show($msg, "线程数实测 — 推荐值",
              [System.Windows.Forms.MessageBoxButtons]::YesNo,
