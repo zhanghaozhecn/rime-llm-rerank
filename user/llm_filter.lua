@@ -319,6 +319,13 @@ function _G.llm_debug_e(id, before, after, dirty)
         after or 0, dirty or 0), false)
 end
 
+-- [回撤退款]（2026-11-20）: 退款成功标记行（debug 开启才写）；词/码在
+-- cid 关联的 C 行里，此处只记 id + tick，避免 | 分隔协议转义问题。
+function _G.llm_debug_refund(cid, tick)
+    _G.llm_debug_write(string.format("%s|RF|refund=1|tick=%d", cid,
+        tick or 0), false)
+end
+
 local lat_max   = 0
 local lat_count = 0
 

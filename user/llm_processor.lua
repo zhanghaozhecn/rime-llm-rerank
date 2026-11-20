@@ -230,6 +230,13 @@ local function stats_bump(word, code)
         e = { d = 0, t = 0, c = 0 }
         _G.user_stats[k] = e
     end
+    -- [回撤退款]（2026-11-20）bump 前快照进浅撤销栈（cap 4，回撤环总在
+    -- 近处）——formula_d 递推确定性，恢复前像即精确退款；栈只在内存，
+    -- 跨重启为空则不退（回退现行为）。
+    e.hist = e.hist or {}
+    e.hist[#e.hist + 1] = { tick = _G.user_freq_tick, d = e.d,
+                            t = e.t, c = e.c or 0 }
+    if #e.hist > 4 then table.remove(e.hist, 1) end
     e.d = 1 + e.d * math.exp((e.t - _G.user_freq_tick) / FREQ_TAU)
     e.t = _G.user_freq_tick
     if has_cjk(word) then e.c = (e.c or 0) + 1 end
@@ -238,6 +245,37 @@ local function stats_bump(word, code)
         stats_save()
         stats_dirty = 0
     end
+end
+
+-- [回撤退款]（2026-11-20）: 提交被回撤（M backspace/delete/undo）→ 撤销
+-- 该次 bump。按条目撤销栈顶 tick 匹配提交 tick → 恢复 bump 前像（d/t/c
+-- 精确还原）；栈空/tick 不配 → 不退（现行为）。退款立即落盘（悬在内存
+-- 被杀进程吞掉就白退）；退款后 cum=0 的错词由既有修剪规则自然淘汰。
+_G.stats_refund = function(word, code, tick)
+    if not has_non_ascii(word) then return false end
+    if not _G.user_stats then stats_load() end
+    local e = _G.user_stats[freq_key(word, code)]
+    local h = e and e.hist and e.hist[#e.hist]
+    if not h or h.tick ~= tick then return false end
+    table.remove(e.hist)
+    e.d, e.t, e.c = h.d, h.t, (h.c or 0)
+    stats_save()
+    stats_dirty = 0
+    return true
+end
+
+-- [回撤退款] 提交栈（cap 8）: 与语料 strict 弹栈口径对齐——backspace/
+-- delete/undo 每条 M 弹 1 条提交并退款；navigation/enter/scene 边界清栈。
+local function commit_stack_push(word, code, tick, cid)
+    _G.llm_commit_stack = _G.llm_commit_stack or {}
+    _G.llm_commit_stack[#_G.llm_commit_stack + 1] =
+        { word = word, code = code, tick = tick, cid = cid }
+    if #_G.llm_commit_stack > 8 then
+        table.remove(_G.llm_commit_stack, 1)
+    end
+end
+local function commit_stack_clear()
+    _G.llm_commit_stack = {}
 end
 
 -- 衰减有效计数 (llm_filter 融合用): rime formula_d 查询式 (词码对)
@@ -407,6 +445,29 @@ local function processor(key, env)
         local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
         _G.llm_debug_enabled = dbg_flag or false
         if _G.llm_write_m then _G.llm_write_m(kind) end
+        -- [回撤退款]（2026-11-20）: backspace/delete/undo 弹最近提交并撤销
+        -- 其账本 bump（快照栈精确恢复 d/t/c，退款立即落盘）；navigation/
+        -- enter 是边界不回撤——清提交栈，与语料 strict 弹栈口径一致。
+        if kind == "backspace" or kind == "delete"
+                or kind == "undo-clipboard" then
+            _G.llm_commit_stack = _G.llm_commit_stack or {}
+            if #_G.llm_commit_stack > 0 then
+                local last = table.remove(_G.llm_commit_stack)
+                local okr = _G.stats_refund
+                    and _G.stats_refund(last.word, last.code, last.tick)
+                if dbg_flag then
+                    live("R|" .. os.date("%H:%M:%S") .. "|回撤退款(" .. kind
+                        .. "): " .. (okr and "已退 " or "不退 ")
+                        .. tostring(last.word) .. "[" .. tostring(last.code)
+                        .. "]")
+                end
+                if okr and _G.llm_debug_refund then
+                    _G.llm_debug_refund(last.cid, last.tick)
+                end
+            end
+        else
+            commit_stack_clear()
+        end
         reset_history()
         -- 编辑键: 当前 commit_history 位置记为基座——旧词永久忽略
         -- (librime lua 无法清 commit_history, 旧词留在引擎里;
@@ -453,6 +514,7 @@ local function processor(key, env)
         if #new_words > 0 then
             if overlap == 0 and _G.llm_write_m then
                 _G.llm_write_m("scene")
+                commit_stack_clear()
             end
 
             local dbg_flag = sc:get_bool("llm_rerank/debug_fusion")
@@ -483,6 +545,7 @@ local function processor(key, env)
                     local cid = _G.llm_write_c
                                 and _G.llm_write_c(w, code, tick_after, true)
                                 or nil
+                    commit_stack_push(w, code, tick_after, cid)
                     if dbg_flag then
                         live(string.format("E|%s|%s|%.3f|%.3f|%d|%d",
                             os.date("%H:%M:%S"), live_esc(w), before,
@@ -492,9 +555,11 @@ local function processor(key, env)
                         end
                     end
                 else
-                    if _G.llm_write_c then
-                        _G.llm_write_c(w, code, _G.user_freq_tick or 0, false)
-                    end
+                    local tick0 = _G.user_freq_tick or 0
+                    local cid0 = _G.llm_write_c
+                                 and _G.llm_write_c(w, code, tick0, false)
+                                 or nil
+                    commit_stack_push(w, code, tick0, cid0)
                 end
             end
 
@@ -512,6 +577,7 @@ local function processor(key, env)
             pending_code = ""
             last_full = ""
             if _G.llm_write_m then _G.llm_write_m("scene") end
+            commit_stack_clear()
         end
 
         prev_hist = {}
