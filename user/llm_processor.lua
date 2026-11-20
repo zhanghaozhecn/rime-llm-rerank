@@ -344,6 +344,36 @@ local function processor(key, env)
         reset_history()
     end
 
+    -- [拆分提交]（2026-11-20）: 词 composition + 标点键 → 词先单独提交、
+    -- 标点独立成段提交。punctuator 原路径把标点 PushInput 进同一
+    -- composition 一并 Commit，提交码变 "muak,"：词频键脏（干净键永不
+    -- 积累）、C 行 ref 断链（同码才回挂）、回撤整提交粒度（删标点连词
+    -- 一起回撤）。屏幕文本不变：confirm 提交的正是当前高亮（重排后首选），
+    -- 标点键放行后 punctuator 在空 composition 上独立成段、独立提交。
+    -- 门: 纯字母码 composition（punct 段 input 含标点不命中 %l+$，天然防
+    -- 重入）× 标点类键（可打印非字母数字；数字=选择键、空格 0x20、回车/
+    -- 退格 <0x21 都不在区间）。confirm 后走既有"输入变空捕获码"路径，
+    -- bump/C 行零改动；候选/段绑定缺失时 pcall 兜底回原行为。
+    do
+        local kc = key:keycode()
+        if ctx.input ~= "" and ctx.input:match("^%l+$")
+                and kc >= 0x21 and kc <= 0x7e
+                and not (kc >= 0x30 and kc <= 0x39)
+                and not (kc >= 0x41 and kc <= 0x5a)
+                and not (kc >= 0x61 and kc <= 0x7a) then
+            local okc, cand = pcall(function()
+                return ctx.composition:back():get_selected_candidate()
+            end)
+            if okc and cand and cand.type ~= "raw" then
+                ctx:confirm_current_selection()
+                if sc:get_bool("llm_rerank/debug_fusion") then
+                    live("R|" .. os.date("%H:%M:%S")
+                        .. "|标点拆分: 词已独立提交，标点随后独立提交")
+                end
+            end
+        end
+    end
+
     -- 追踪满码（顶屏时回退用）
     if ctx.input ~= "" and #ctx.input >= MAX_CODE then
         last_full = ctx.input
