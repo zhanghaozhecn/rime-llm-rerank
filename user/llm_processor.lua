@@ -93,8 +93,10 @@ end
 -- τ=400 (2026-11-06 v3 六维联合标定; 词频记忆半衰 ~277 次上屏)
 -- 累计计数 c 不衰减（log(c+1) 融合项）；只计含中文的词条。
 -- 文件: 用户目录 user_ledger.tsv（两版共用）
---   首行 "#tick=N"；数据行 "s\t词\t码\tdee\ttick\tcum"（码可空）。
---   行首 s = 行类型（旧账本 u/b 行天然不匹配，防同形异义误读）。
+--   首行 "#tick=N"；随后 # 注释行（列含义，落盘自带）；数据行
+--   "词\t码\tdee\ttick\tcum"（2026-11-20 去掉行类型列 s——每行省 2 字节，
+--   词必非 ASCII 不会与注释/旧格式混淆；码可空）。
+--   读取端兼容旧 6 列 s 行（s\t词\t码\tdee\ttick\tcum，2026-11-20 前）。
 --   修剪: eff < 1e-3 且 cum=0 才丢——含中文词条终身保留（旧累计账语义），
 --   全角标点等非中文行随衰减淘汰。
 -- 旧两账本一次性迁移（只读，旧文件保留不删；落盘写新名）:
@@ -183,9 +185,14 @@ local function stats_load()
             if t then
                 tick = tonumber(t)
             else
-                -- s\t词\t码\tdee\ttick\tcum（码可空；只认 s 行）
+                -- 新: 词\t码\tdee\ttick\tcum；旧(2026-11-20 前):
+                -- s\t词\t码\tdee\ttick\tcum（码可空；读取端兼容旧 s 行）
                 local w, c, d, tk, cu =
-                    line:match("^s\t([^\t]+)\t([^\t]*)\t([%d%.]+)\t(%d+)\t(%d+)$")
+                    line:match("^([^\t#]+)\t([^\t]*)\t([%d%.]+)\t(%d+)\t(%d+)$")
+                if not w then
+                    w, c, d, tk, cu =
+                        line:match("^s\t([^\t]+)\t([^\t]*)\t([%d%.]+)\t(%d+)\t(%d+)$")
+                end
                 if w and d and tk and cu then
                     _G.user_stats[w .. "\t" .. c] =
                         { d = tonumber(d), t = tonumber(tk),
@@ -207,13 +214,18 @@ local function stats_save()
     local f = io.open(ledger_file(), "w")
     if f then
         f:write("#tick=" .. (_G.user_freq_tick or 0) .. "\n")
+        -- 列含义注释（2026-11-20 起每帧自带；读取端跳过一切 # 行）
+        f:write("#词\t码\t衰减计数dee\t最近提交tick\t累计次数cum\n")
+        f:write("#码可空（2026-11-21 起简码/顶屏提交也记录完整输入码，空码仅剩"
+            .. "无 composition 的边缘提交）；dee 每词提交 = 1 + dee·exp(-Δ/400)；"
+            .. "tick 每词提交 +1；cum 仅中文词递增\n")
         local now = _G.user_freq_tick or 0
         for k, e in pairs(_G.user_stats) do
             -- 修剪: 衰减到噪声级且无累计提交的冷词条不落盘；含中文词条
             -- cum>0 终身保留（旧累计账语义），文件有界于中文词表规模。
             local eff = e.d * math.exp((e.t - now) / FREQ_TAU)
             if eff >= 1e-3 or (e.c or 0) > 0 then
-                f:write(string.format("s\t%s\t%.3f\t%d\t%d\n",
+                f:write(string.format("%s\t%.3f\t%d\t%d\n",
                     k, e.d, e.t, e.c or 0))
             end
         end
@@ -222,6 +234,11 @@ local function stats_save()
 end
 local function stats_bump(word, code)
     if not has_non_ascii(word) then return end
+    -- 纯标点提交不入账（2026-11-20 用户定案：带标点行从账本删除）——
+    -- 标点永不进重排窗口，dee 纯浪费且常用标点（，。）持续 bump 永不达
+    -- 修剪线；连 tick 也不推（更同源 rime userdb "词条提交才推 tick"）。
+    -- 退款弹栈照常（无账目 → 不退）。含中文词条不受影响。
+    if not has_cjk(word) then return end
     if not _G.user_stats then stats_load() end
     _G.user_freq_tick = (_G.user_freq_tick or 0) + 1
     local k = freq_key(word, code)
@@ -322,6 +339,24 @@ end
 
 local function processor(key, env)
     if key:release() then return 2 end
+
+    -- [简码/顶屏码补录]（2026-11-21）: commit_notifier 在 composition 清空
+    -- (Clear) 前触发, c.input 即本次提交的完整输入码（简码 1-2 码也完整）
+    -- ——旧滞后捕获（输入变空瞬间）对顶屏提交拿不到码：提交与清空发生在
+    -- 同一个键内、speller 先于本 processor。每次提交（含标点/ASCII）压
+    -- 一条进队列, 与 commit_history 新条目 1:1 对齐消费（见下方词循环）。
+    if not env._commit_hook then
+        env._commit_hook = true
+        _G.llm_commit_inputs = _G.llm_commit_inputs or {}
+        pcall(function()
+            env.engine.context.commit_notifier:connect(function(c)
+                table.insert(_G.llm_commit_inputs, c.input or "")
+                if #_G.llm_commit_inputs > 16 then
+                    table.remove(_G.llm_commit_inputs, 1)
+                end
+            end)
+        end)
+    end
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
     local sc = env.engine.schema.config
@@ -472,6 +507,16 @@ local function processor(key, env)
         -- 编辑键: 当前 commit_history 位置记为基座——旧词永久忽略
         -- (librime lua 无法清 commit_history, 旧词留在引擎里;
         --  退格会被引擎清空 commit_history → 同步段检测缩短自动重置基座)
+        -- 被跳过的历史条目对应的通知器队列条目一并丢弃（1:1 对齐防串码）
+        local all_e = ch:to_table()
+        if all_e and #all_e > commit_base and _G.llm_commit_inputs
+                and #_G.llm_commit_inputs > 0 then
+            local skip = math.min(#all_e - commit_base,
+                                  #_G.llm_commit_inputs)
+            for _ = 1, skip do
+                table.remove(_G.llm_commit_inputs, 1)
+            end
+        end
         commit_base = #ch:to_table()
         -- 评分结果缓存已于 2026-11-11 删除（同 ctx+input 复用命中率过低）；
         -- 每次触发都是真实推理，编辑键无需再清缓存
@@ -522,12 +567,21 @@ local function processor(key, env)
             for _, w in ipairs(new_words) do
                 -- 含中文才分配码，跳过纯英文/数字/标点
                 local has_chinese = w:match("[^\1-\127]")
+                -- 1:1 取本提交的捕获输入码（通知器每提交压一条, 含标点/ASCII）
+                local live_code = ""
+                if _G.llm_commit_inputs and #_G.llm_commit_inputs > 0 then
+                    live_code = table.remove(_G.llm_commit_inputs, 1)
+                end
                 local code = ""
                 if has_chinese then
-                    -- 优先手动捕获的码，其次满码（顶屏回退），用完即清
+                    -- 优先手动捕获的码，其次满码（顶屏回退），用完即清；
+                    -- 都没有（简码/顶屏提交）→ 通知器捕获（唯一完整来源）
                     code = pending_code
                     if code == "" then
                         code = last_full
+                    end
+                    if code == "" and live_code ~= "" then
+                        code = live_code
                     end
                 end
                 pending_code = ""
