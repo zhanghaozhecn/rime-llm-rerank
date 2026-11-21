@@ -21,19 +21,21 @@ local FREQ_BETA = 14 -- 对数词频融合系数（2026-11-14 默认模型改
 -- （组内融合分降序、同分稳定），其余候选按融合分降序在后——即原 elw
 -- 的极限行为（elw·span 加成→∞），不再需要 span 间接量。默认 false。
 
--- 词码对分数修正（2026-11-17 用户定案：固顶与 pairfix 合并为一张有符号表）：
--- 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>[+|-]分数`：
---   +200 / 200 = 加分（固定首选，09876 上屏时写入）
---   +100 / 100 = 加分（固定次选，手动编辑）
---   -5         = 扣分（pairfix 预置降噪；无第三列 = 旧默认扣 5）
--- `#` 注释；无文件 = 机制休眠；每次窗口准入/融合轻量重读，编辑即时生效。
--- 正分不受 fade 限制（09876 上屏会累计 uni 计数，固定首选必须持久）；
--- 负分保留 fade（用户该词码对累计 >= PAIRFIX_FADE_UNI 次 -> 预置让位）。
--- 正分候选即使不在层1 前 k，也优先占用评分窗名额（见窗口准入段）。
+-- 词码对扣分修正（2026-11-21 用户定案解耦：只承载负分 CE 偏差降噪）：
+-- 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>-分数`
+--   （无第三列 = 旧默认扣 5）；`#` 注释；无文件 = 机制休眠；
+-- 每次窗口准入/融合轻量重读，编辑即时生效。负分保留 fade（用户该词码对
+-- 累计 >= PAIRFIX_FADE_UNI 次 -> 预置让位）。正分行读取端跳过（2026-11-17
+-- 的 +200 固定首选/+100 固定次选语义废除——固定候选归拼读双拼
+-- pin_candidates.tsv + pin_filter.lua 全局重排，与 LLM 重排解耦）。
 -- 旧 2026-11-13 pairfix 推导（wiki 拆半/用户域回放）保留在文件头历史注释：
 -- 与@vkh 等污染对按字频抬分；负分只破 CE 险胜的近平局。
 local PAIRFIX_PENALTY_DEFAULT = 5.0
 local PAIRFIX_FADE_UNI = 3
+-- 2026-11-21 用户定案：词码对扣分修正与固定候选**解耦**——本表只承载
+-- 负分（CE 系统性偏差降噪，只在重排评分窗内生效，受 fade）；正分（固定
+-- 候选）行读取端跳过，固定候选归拼读双拼 pin_candidates.tsv +
+-- pin_filter.lua（全局生效、优先于重排，0/9/8/7/6 键写入/解除）。
 
 -- 读参考表 → { ["词\t码"] = 有符号分数 }; 无文件返回 nil（机制休眠）
 local function pairfix_table()
@@ -53,6 +55,11 @@ local function pairfix_table()
                     w, c = nil, nil   -- 第三列非法：跳过，不并进码键
                 else
                     delta = tonumber(sv)
+                    if delta > 0 then
+                        -- 2026-11-21 解耦：正分（固定候选）行跳过——归
+                        -- pin_candidates.tsv / pin_filter.lua，本表只留负分
+                        w, c = nil, nil
+                    end
                 end
             else
                 w, c = line:match("^(.-)\t(.-)$")
@@ -549,9 +556,9 @@ return function(translation, env)
             return a.idx < b.idx   -- 稳定: 同分保引擎序
         end)
     end
-    -- 词码对分数表：正分（固定首选 +200 / 固定次选 +100）在层1 排序后
-    -- 优先占用评分窗名额；窗口大小仍不超过 max_candidates（不扩窗、不增
-    -- decode 行数）。分数表在窗口准入前读一次，本窗融合复用同一份。
+    -- 词码对分数表（2026-11-21 解耦后只含负分扣分修正）：不参与窗口
+    -- 准入，仅融合时叠加（评分窗内生效）。分数表在窗口准入前读一次，
+    -- 本窗融合复用同一份。
     local pftbl = pairfix_table()
     local cands = {}
     local l1win = {}
@@ -564,24 +571,9 @@ return function(translation, env)
         cands[#cands + 1] = t
         l1win[#l1win + 1] = t
     end
-    -- 正分候选优先占位：+200 先于 +100；同分按层1 分、再按引擎序。
-    if pftbl then
-        local pos = {}
-        for _, e in ipairs(layer1) do
-            local d = pairfix_delta(pftbl, e.c.text, input)
-            if d > 0 then pos[#pos + 1] = { e = e, d = d } end
-        end
-        table.sort(pos, function(a, b)
-            if a.d ~= b.d then return a.d > b.d end
-            if a.e.s ~= b.e.s then return a.e.s > b.e.s end
-            return a.e.idx < b.e.idx
-        end)
-        for _, p in ipairs(pos) do add_win(p.e) end
-    end
     -- two_code_sentence 准入优先（2026-11-16 用户定案，取代 2026-11-07 的
-    -- "词频前 k 全参评 + 最终排序满长组置顶"）：正分固定词先占位后，剩余
-    -- 名额里词长==⌊码长/2⌋ 的候选优先；不足就空着——不匹配词长的候选
-    -- 不进窗、不算 CE。固定词不受满长限制（固定首选优先于整句规则）。
+    -- "词频前 k 全参评 + 最终排序满长组置顶"）：剩余名额里词长==⌊码长/2⌋
+    -- 的候选优先；不足就空着——不匹配词长的候选不进窗、不算 CE。
     local tcs_elen = cfg.two_code_sentence and math.floor(#input / 2) or 0
     if tcs_elen >= 1 then
         for _, e in ipairs(layer1) do
@@ -882,7 +874,8 @@ return function(translation, env)
             w_written = true
         end
         -- 来源徽章已删（2026-11-10 用户定案：实时调试窗口上线——上文来源/
-        -- 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment）
+        -- 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment；
+        -- 固定候选提示亦归拼读双拼 pin_filter.lua，2026-11-21 解耦）
         for _, c in ipairs(ordered) do yield(c) end
         for _, e in ipairs(layer1) do
             if not seen[e.c.text] then yield(e.c) end
