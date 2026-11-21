@@ -730,13 +730,25 @@ return function(translation, env)
                 local okc, m = pcall(llm.get_ce3)
                 if okc and type(m) == "table" then ce3map = m end
             end
+            -- token 边界段显（2026-11-21 协议 v7）：get_seg = text → "cm/ak"
+            -- ——段只落在 token 边界 ∩ 字符边界（单 token 多字不劈，字内
+            -- 多 token 合并不劈字）；旧 DLL 无此函数时静默缺省（"词"列显示原词）
+            local segmap = nil
+            if llm.get_seg then
+                local oks, ms = pcall(llm.get_seg)
+                if oks and type(ms) == "table" then segmap = ms end
+            end
             -- 无 CE 分候选的融合（2026-11-13 用户定案，取代 2026-11-07
             -- "回退后两项和"）: CE 取窗内已算 CE 的**最低分**（score =
             -- −CE 负值域，最低分 = 最差证据 → 该候选排到窗底但保留与
-            -- 层1 的正常耦合）。旧语义（融合=层1 分）会让无法表示的字
-            -- （如 tokenizer 打不出的 生僻字「𬤊」）以 S1=0 压过全部
-            -- 负分候选跳首选——aki 实况窗两例实证。全窗无有效 CE 时
-            -- min_valid 为 nil、加 0 = 自然回退层1 序。
+            -- 层1 的正常耦合）。旧语义（融合=层1 分）会让无 CE 候选以
+            -- S1=0 压过全部负分候选跳首选——aki 实况窗两例实证。
+            -- 触发器随时代更替：当年 = tokenizer 打不出「𬤊」（2026-11-15
+            -- llama 升级后已可表示——2026-11-21 全词典 8133 单字核查，
+            -- 99.7% 单 token、余 24 字 2 token，无一不可表示）；现在 =
+            -- 评分批次 decode 失败的逐候选哨兵分（score_batch step2/3
+            -- 失败路径 + 失败自愈）。全窗无有效 CE 时 min_valid 为 nil、
+            -- 加 0 = 自然回退层1 序。
             local min_valid = nil
             for _, c in ipairs(ordered) do
                 local s = scores[c.text]
@@ -880,7 +892,10 @@ return function(translation, env)
                     -- v5: 旧 pf = 负分幅度（仅扣分，0=未命中），保留给旧查看器
                     d and live_fmt3(d.pf or 0) or "0",
                     -- v6 (2026-11-17): 有符号词码对修正分（+200/+100/−5/0）
-                    d and live_fmt3(d.sdelta or 0) or "0"
+                    d and live_fmt3(d.sdelta or 0) or "0",
+                    -- v7 (2026-11-21): token 边界段显（"词"列：单 token 词原样、
+                    -- 真实多 token 词段间 '/'；尾窗透传无 d → 空串，查看器显示原词）
+                    segmap and segmap[c.text] or ""
                 }, "|"))
             end
             for i, c in ipairs(ordered) do live_c(c, i) end

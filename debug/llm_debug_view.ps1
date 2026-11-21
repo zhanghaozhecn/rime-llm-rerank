@@ -15,9 +15,12 @@
                                                         v4 尾字段 ctx_used=推理用尾部，查看器灰显
                                                         其余前缀——缺字段不灰显；n_seen 字段
                                                         2026-11-17 删除，按字段数兼容旧行）
-   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf|sdelta
+   C|eng|word|s1|ce|eff|uni|fused|full|cerank|fin|win|ce1|ce2|ce3|fb|u1|pf|sdelta|seg
                                                        pf=旧修正分 λ（v5, 0=未命中）
                                                        sdelta=有符号分数（v6, +200/+100/-5/0）
+                                                       seg=token 边界段显（v7, "词"列：
+                                                       单 token 词原样、多 token 词段间
+                                                       '/'；空=旧发送端显示原词）
                                                        逐候选按最终序（上限 20 行）：
                                                        eng=引擎原序 s1=层1分(=fb+u1)
                                                        ce=加权 CE（空=无分）
@@ -27,6 +30,8 @@
                                                        fin=最终位置 win=1 层2窗内/0 尾窗透传
                                                        ce1/2/3=各分位原始 CE（未乘权重）
                                                        fb=β·log1p(eff) u1=ln(uni+1)
+                                                       修正分无专属列（2026-11-21 v7：命中
+                                                       时折进 CE 格数值 + 公式尾项）
    S|HH:MM:SS|reason|input|src                        跳过原因：pattern/ctx_empty/
                                                        not_ready/ctx_short/scores_nil/
                                                        score_failed/few_candidates
@@ -196,17 +201,19 @@ $grid.SelectionMode = 'FullRowSelect'
 $grid.AutoSizeColumnsMode = 'None'
 # 列头禁换行 + 短文案：窄列两行表头会被默认行高裁掉下半行（2026-11-10 实测）
 $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::False
-# 分数部分五列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
-# 累计词频 / 总分 / 修正分，格内 = 得分 + '=' + 具体计算（成分统一 3 位小数，
+# 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
+# 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 3 位小数，
 # 等宽字体逐位对齐），公式不再单独展示；身份列只剩 #/词
 # 「窗」「匹配词长」列均已删（2026-11-16 用户定案：窗内/尾窗灰字区分、
 # 满长准入优先下"有无 CE 分"即满长标志——列冗余）；
-# 修正分为专属列（2026-11-16 定案，取代 v5 总分格尾追 −λ——pf=0 时尾追
-# 什么都不显示，命中与否完全不可见）
-# 列宽与源码版 WeaselLLMDebug 同值（GDI 实测取宽 + 对齐补空格的余量）
+# 「修正分」列已删（2026-11-21 用户定案 v7：命中修正折进 CE 格数值 +
+# 公式尾项，见 Get-CeProc——0 不显示，恒 0 的专属列无观察价值）
+# 列宽与源码版 WeaselLLMDebug 同值（GDI 实测取宽 + 对齐补空格的余量；
+# 词 100 = 字符段显带 '/'（4 字词 ≈77px，容 5 字词）；CE 352 = 原 310
+# + 公式尾修正项余量）
 $cols = @(
-  @('#', 26), @('词', 64), @('总分', 64), @('CE', 310), @('衰减词频分', 140),
-  @('累计词频分', 112), @('修正分', 64))
+  @('#', 26), @('词', 100), @('总分', 64), @('CE', 352), @('衰减词频分', 140),
+  @('累计词频分', 112))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
   $grid.Columns[$i].Width = $c[1]
@@ -234,7 +241,12 @@ $stream.Add_DrawItem({
   }
   $bg = [System.Drawing.Color]::White
   $fg = [System.Drawing.Color]::Gray
-  if ($sel) { $bg = [System.Drawing.Color]::Highlight; $fg = [System.Drawing.Color]::White }
+  # 选中高亮取 SystemColors（2026-11-21：pwsh 7.7 的 System.Drawing.Color
+  # 来自精简版 System.Drawing.Primitives v11——KnownColor 系静态色
+  # Highlight/HighlightText/Control 等不存在（静默返回 null，SolidBrush
+  # 收到 null 即弹 .ctor 异常框）；基础色 White/Gray/Black/Green/DimGray
+  # 仍在。WinForms 下 SystemColors.Highlight 同源可用）
+  if ($sel) { $bg = [System.Drawing.SystemColors]::Highlight; $fg = [System.Drawing.Color]::White }
   elseif ($isInv) { $fg = [System.Drawing.Color]::Black }
   $b = [System.Drawing.SolidBrush]::new($bg)
   $e.Graphics.FillRectangle($b, $e.Bounds)
@@ -304,9 +316,11 @@ function Update-Current {
   $script:grid.Rows.Clear()
   # 动态对齐（2026-11-11 用户定案）：本次调用内每个数值组向最宽者看齐、
   # 右对齐（补空格）——等宽字体下小数点逐位对齐，整数部分位数不同不再错位
-  $wCeL = 0; $wCeC = 0; $wFbL = 0; $wFbE = 0; $wU1L = 0; $wUni = 0; $wFuL = 0; $wPfL = 0
+  $wCeL = 0; $wCeC = 0; $wFbL = 0; $wFbE = 0; $wU1L = 0; $wUni = 0; $wFuL = 0
   foreach ($r in $inv.rows) {
-    $v = Get-Num $r.ce;   if ($null -ne $v) { $wCeL = [Math]::Max($wCeL, (Format-F1 $v).Length) }
+    # 词码对修正折叠（2026-11-21 v7）：CE 分数列量的是折叠后的值
+    $sdV = Get-Corr $r
+    $v = Get-Num $r.ce;   if ($null -ne $v) { $wCeL = [Math]::Max($wCeL, (Format-F1 ($v + $sdV)).Length) }
     foreach ($raw in @($r.ce1, $r.ce2, $r.ce3)) {
       $v = Get-Num $raw;  if ($null -ne $v) { $wCeC = [Math]::Max($wCeC, (Format-F1 $v).Length) }
     }
@@ -315,23 +329,12 @@ function Update-Current {
     $v = Get-Num $r.u1;   if ($null -ne $v) { $wU1L = [Math]::Max($wU1L, (Format-F1 $v).Length) }
     $v = Get-Num $r.uni;  if ($null -ne $v) { $wUni = [Math]::Max($wUni, ([string][int]$v).Length) }
     $v = Get-Num $r.fused; if ($null -ne $v) { $wFuL = [Math]::Max($wFuL, (Format-F1 $v).Length) }
-    $v = Get-Num $r.sdelta; if ($null -ne $v) {
-      # v6 有符号：正分带 '+'（+200.0），负分自带 '-'
-      $n = (Format-F1 $v).Length + $(if ($v -gt 0) { 1 } else { 0 })
-      $wPfL = [Math]::Max($wPfL, $n)
-    } else {
-      $v = Get-Num $r.pf; if ($null -ne $v) {
-        # 旧 v5 回退：命中 = -λ 带 ASCII 负号；未命中 = "0.0"（3 字符）
-        $n = if ($v -gt 0) { (Format-F1 $v).Length + 1 } else { 3 }
-        $wPfL = [Math]::Max($wPfL, $n)
-      }
-    }
   }
   $i = 0
   foreach ($r in $inv.rows) {
-    [void]$script:grid.Rows.Add(($i + 1), $r.word, (Get-FusedProc $r $wFuL),
+    [void]$script:grid.Rows.Add(($i + 1), (Get-WordText $r), (Get-FusedProc $r $wFuL),
       (Get-CeProc $r $wCeL $wCeC), (Get-FbProc $r $wFbL $wFbE),
-      (Get-U1Proc $r $wU1L $wUni), (Get-PfProc $r $wPfL))
+      (Get-U1Proc $r $wU1L $wUni))
     if ($r.win -eq '0') {
       $script:grid.Rows[$i].DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gray
     }
@@ -356,15 +359,46 @@ function Pad-L([string]$s, [int]$w) {
   return (' ' * ($w - $s.Length)) + $s
 }
 
-# CE 格：加权 CE 与其三分量。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
+# 词列文本：token 边界段显（v7 seg，如 cm/ak；单 token 词服务端原样发）
+# 优先，空（旧发送端/尾窗）回退原词。参数 = 行哈希表
+function Get-WordText($r) {
+  if ($r.seg) { return $r.seg }
+  return $r.word
+}
+
+# 词码对修正值（显示端折叠用，2026-11-21）：sdelta 为准，旧发送端无
+# 该字段时回退 v5 的 pf（-λ）。代码里 CE 与修正仍分离（发送端照发），仅
+# 显示端折叠。返回标量（无修正 = 0.0）
+function Get-Corr($r) {
+  $sd = Get-Num $r.sdelta
+  if ($null -ne $sd) { return $sd }
+  $pf = Get-Num $r.pf
+  if ($null -ne $pf -and $pf -gt 0) { return -$pf }
+  return 0.0
+}
+# 修正项后缀（公式右侧）：负 -5.0 / 正 +5.0；0 = 不显示
+function Get-CorrSuffix([double]$sd) {
+  if ($sd -eq 0) { return '' }
+  return ($(if ($sd -gt 0) { '+' } else { '-' })) + (Format-F1 ([Math]::Abs($sd)))
+}
+
+# CE 格：加权 CE 与其三分量 + 词码对修正折叠（2026-11-21 用户定案 v7：
+# 修正分专属列删除——对几乎所有候选恒为 0 的独立列无观察价值；命中时
+# 把修正值折进 CE 数值本身并在公式右侧追修正项，如
+#   -34.7=-(14.0+1.10·10.1+0.60·7.6)-5.0
+# 修正为 0 不追加任何显示。无 CE 分（尾窗/无法表示）→ 格保持 '—'
+# （修正项只随融合分隐含）。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
 # 交叉熵、正值；分值取负号进融合），故等号右为带负号的括号和。
 # ce2/ce3 带权重前缀（1.10/0.60 = 标定常数，原样显示不四舍五入；2026-11-14
 # 随默认模型 0.5B 重标定，旧 1.05/0.45 为 0.8B v3 值）；ce1 权重
 # 恒 1 → 前缀不显示（2026-11-12 用户定案）；数据浮点统一 1 位小数。
 # $wL = 分数列内最宽值宽，$wC = 三分量列内最宽值宽
 function Get-CeProc($r, $wL, $wC) {
+  $sd = Get-Corr $r
   $ce = Get-Num $r.ce
   if ($null -eq $ce) { return '—' }
+  if ($sd -ne 0) { $ce += $sd }
+  $tail = Get-CorrSuffix $sd
   $lead = Pad-L (Format-F1 $ce) $wL
   $t = $lead + '=-('
   $any = $false
@@ -376,8 +410,8 @@ function Get-CeProc($r, $wL, $wC) {
     $t += Pad-L (Format-F1 $v) $wC
     $any = $true
   }
-  if (-not $any) { return $lead }
-  return $t + ')'
+  if (-not $any) { return $lead + $tail }
+  return $t + ')' + $tail
 }
 
 # 衰减词频分格：β·log1p(eff)，β=14 内置常数（2026-11-14
@@ -403,33 +437,20 @@ function Get-U1Proc($r, $wL, $wU) {
   return $lead + ('=log1p({0})' -f (Pad-L ([string][int]$uni) $wU))
 }
 
-# 总分格：融合分纯分值（三项过程各在自带格内，修正分见专属列；$wL=分数宽）
+# 总分格：融合分纯分值（三项过程各在自带格内，词码对修正折进 CE 格见
+# Get-CeProc；$wL=分数宽）
 function Get-FusedProc($r, $wL) {
   $fu = Get-Num $r.fused
   if ($null -eq $fu) { return '—' }
   return Pad-L (Format-F1 $fu) $wL
 }
 
-# 修正分格（2026-11-17 v6：有符号词码对分数）：+200/+100 = 固定首选/
-# 次选加分，-5 = pairfix 扣分，0.0 = 未命中；验算
-# 总分 = CE + 衰减词频分 + 累计词频分 + 修正分。旧发送端无 sdelta 时
-# 回退 v5 的 -λ/0.0；协议缺字段 → —；$wL=列内最宽值宽
-function Get-PfProc($r, $wL) {
-  $sd = Get-Num $r.sdelta
-  if ($null -ne $sd) {
-    $s = if ($sd -gt 0) { '+' + (Format-F1 $sd) } else { Format-F1 $sd }
-    return Pad-L $s $wL
-  }
-  $pf = Get-Num $r.pf
-  if ($null -eq $pf) { return '—' }
-  $s = if ($pf -gt 0) { '-' + (Format-F1 $pf) } else { '0.0' }
-  return Pad-L $s $wL
-}
-
 # ── 合并流（2026-11-17：历史+事件两块合一）─────────────────────────────────
 function Get-InvRowText($inv) {
-  # 推理行：◆ 时间 输入 词1,词2,词3（前 3 词；C 行到达时补齐）
-  $words = ($inv.rows | Select-Object -First 3 | ForEach-Object { $_.word }) -join ','
+  # 推理行：◆ 时间 输入 词1,词2,词3（前 3 词；C 行到达时补齐；有 token
+  # 段显（v7 seg）用段显——与"词"列同口径）
+  $words = ($inv.rows | Select-Object -First 3 |
+    ForEach-Object { Get-WordText $_ }) -join ','
   if ($words) { return ('◆ {0} {1} {2}' -f $inv.t, $inv.input, $words) }
   return ('◆ {0} {1}' -f $inv.t, $inv.input)
 }
@@ -537,7 +558,9 @@ function Handle-Line {
                        # v5: 旧修正分 pf（负分幅度, 0=未命中）
                        pf = $(if ($f.Count -gt 17) { $f[17] } else { '' })
                        # v6: 有符号词码对分数（+200/+100/-5/0）
-                       sdelta = $(if ($f.Count -gt 18) { $f[18] } else { '' }) })
+                       sdelta = $(if ($f.Count -gt 18) { $f[18] } else { '' })
+                       # v7: token 边界段显（"词"列 cm/ak；空=显示原词）
+                       seg = $(if ($f.Count -gt 19) { $f[19] } else { '' }) })
       if (-not $script:paused -and $script:viewIdx -eq ($script:invList.Count - 1)) {
         Update-Current
       }

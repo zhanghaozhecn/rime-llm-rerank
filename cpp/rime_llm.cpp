@@ -93,6 +93,7 @@ static std::atomic<bool>    g_loading{false};
 static std::vector<double>      g_last_scores;
 static std::vector<std::string> g_last_cands;
 static std::vector<std::array<double, 3>> g_last_ce3;  // 与 g_last_cands 对齐的 CE 三分量（调试 get_ce3）
+static std::vector<std::string> g_last_seg;   // 与 g_last_cands 对齐的 token 边界段显（调试 get_seg，协议 v7）
 static bool                     g_last_prep_hit = false;  // 上次 score 的预解码命中（调试）
 
 // ============================================================
@@ -1106,6 +1107,52 @@ static std::string tokens_piece(const std::vector<llama_token> & ids) {
     return s;
 }
 
+// 候选词 token 边界段显（2026-11-21 调试窗口协议 v7，"词"列；源码版
+// llm_filter.cc 同款实现）：逐 token 拼 piece，每个 token 结束时若已拼出
+// 完整 UTF-8 字符则封一段——分隔符只落在 token 边界 ∩ 字符边界：单 token
+// 含多字不劈（标志/测试 在 Qwen3-0.6B 为单 token → 原样显示），一个字由
+// 2 token 拼成 → 合并成一段（不劈字），多 token 词按真实边界分段
+//（错事=[错][事] → 错/事，cmak=[cm][ak] → cm/ak）。段间 '/'。
+// 拼接结果 = 原词文本（字节级 BPE 的 piece 拼接恰好还原原文）。
+// ⚠ 字符完整性判定（2026-11-21 踩坑修正）：UTF-8 多字节字符**以续字节
+// 结尾**（错 = E9 94 99，末字节 0x99 是续字节）——"末字节非续字节"判定
+// 是反的，会让 CJK 永不封段、整词并一段（曾据此误报 错事/标志 等全为
+// 单 token；评分路径 ce2 有值才暴露）。正确做法 = 用 lead 字节推断期望
+// 长度、数续字节凑齐才算完整。
+static std::string token_seg_display(const std::vector<llama_token> & ids) {
+    std::string out, cur;
+    char buf[256];
+    int remain = 0;  // 当前字符还差的续字节数（0 = 处于字符边界）
+    for (auto id : ids) {
+        int n = llama_token_to_piece(g_vocab, id, buf, sizeof(buf), 0, true);
+        for (int k = 0; k < n; k++) {
+            unsigned char b = (unsigned char)buf[k];
+            cur += (char)b;
+            if (remain > 0) {
+                remain--;
+            } else if (b < 0x80) {
+                // ASCII：自身即完整字符，remain 保持 0
+            } else if ((b & 0xE0) == 0xC0) {
+                remain = 1;   // 2 字节字符（还差 1 续字节）
+            } else if ((b & 0xF0) == 0xE0) {
+                remain = 2;   // 3 字节字符（CJK 常态）
+            } else {
+                remain = 3;   // 4 字节字符（扩展区）
+            }
+        }
+        if (remain == 0 && !cur.empty()) {  // token 结束且字符完整 → 封段
+            if (!out.empty()) out += '/';
+            out += cur;
+            cur.clear();
+        }
+    }
+    if (!cur.empty()) {  // 末段残字节（正常不可达）原样收尾，不丢字
+        if (!out.empty()) out += '/';
+        out += cur;
+    }
+    return out;
+}
+
 // 上文 token 化 + min_tokens/max_ctx 截尾（prepare/score 入口共用）。
 // token 数不足 min_tokens（方案 llm_rerank/min_tokens，lua 传入）→ 返回空
 //（空 ctx 无推理是配置语义, 非 bug）。
@@ -1619,10 +1666,13 @@ static int lua_score(lua_State * L) {
     if (ctx_ids.empty()) { lua_pushnil(L); return 1; }
 
     std::vector<std::vector<llama_token>> cand_ids;
+    std::vector<std::string> cand_segs;  // token 边界段显（协议 v7 调试）
+    cand_segs.reserve(cand_texts.size());
     for (auto & s : cand_texts) {
         auto ids = tokenize(s.c_str());
         if (ids.empty()) ids.push_back(0);
         cand_ids.push_back(ids);
+        cand_segs.push_back(token_seg_display(ids));
     }
 
     std::vector<double> scores;
@@ -1647,6 +1697,7 @@ static int lua_score(lua_State * L) {
     g_last_scores = scores;
     g_last_cands  = cand_texts;
     g_last_ce3    = ce3;
+    g_last_seg    = std::move(cand_segs);
     g_last_prep_hit = prep_hit;
 
     lua_newtable(L);
@@ -1688,6 +1739,20 @@ static int lua_get_ce3(lua_State * L) {
                 lua_rawseti(L, -2, k + 1);
             }
         }
+        lua_setfield(L, -2, g_last_cands[i].c_str());
+    }
+    return 1;
+}
+
+// 上次 score 的候选 token 边界段显（2026-11-21 调试窗口协议 v7）：
+// text → "cm/ak"——段只落在 token 边界 ∩ 字符边界（单 token 多字不劈，
+// 字内多 token 合并不劈字）；旧 DLL 无此函数时 lua 侧静默缺省
+//（"词"列显示原词）。
+static int lua_get_seg(lua_State * L) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    lua_newtable(L);
+    for (size_t i = 0; i < g_last_cands.size(); i++) {
+        lua_pushstring(L, g_last_seg[i].c_str());
         lua_setfield(L, -2, g_last_cands[i].c_str());
     }
     return 1;
@@ -1862,6 +1927,7 @@ static int lua_index(lua_State * L) {
     if (strcmp(key, "is_ready") == 0)       lua_pushcfunction(L, lua_is_ready);
     else if (strcmp(key, "get_scores") == 0) lua_pushcfunction(L, lua_get_scores);
     else if (strcmp(key, "get_ce3") == 0)    lua_pushcfunction(L, lua_get_ce3);
+    else if (strcmp(key, "get_seg") == 0)    lua_pushcfunction(L, lua_get_seg);
     else if (strcmp(key, "get_ctx_used") == 0) lua_pushcfunction(L, lua_get_ctx_used);
     else if (strcmp(key, "prep_hit") == 0)   lua_pushboolean(L, g_last_prep_hit ? 1 : 0);
     else if (strcmp(key, "score") == 0)     lua_pushcfunction(L, lua_score);
