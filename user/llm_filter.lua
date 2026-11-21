@@ -37,11 +37,54 @@ local PAIRFIX_FADE_UNI = 3
 -- 候选）行读取端跳过，固定候选归拼读双拼 pin_candidates.tsv +
 -- pin_filter.lua（全局生效、优先于重排，0/9/8/7/6 键写入/解除）。
 
+-- ── LLM 记录子目录（2026-11-21 用户定案）────────────────────────────
+-- 用户文件夹下建 llm_rerank 子目录收纳全部 LLM 数据/日志文件
+-- （corpus/debug/账本/词码对）；固定候选 pin_candidates.tsv 属拼读双拼
+-- 本机功能，仍留用户文件夹根。resolve 规则：
+--   子目录已有 → 用之；根目录旧文件在 → 建目录后 os.rename 一次性迁移
+--   （目录建不出/改名失败 → 暂读暂写根目录，下次再迁，绝不丢数据）；
+--   全新写场景 → 建目录后用子目录；读场景两处皆无 → nil（机制休眠）。
+-- 目录由 rime_llm.dll ensure_dir 建立（rime-lua 无 mkdir）。
+local function llm_user_dir()
+    local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
+    if ok and type(ud) == "string" and ud ~= "" then return ud end
+    return os.getenv("TEMP") or "C:\\Windows\\Temp"
+end
+
+local function llm_dir_ensure(dir)
+    local ok, cpp = pcall(require, "rime_llm")
+    if not ok or not cpp or not cpp.ensure_dir then return false end
+    local ok2, made = pcall(cpp.ensure_dir, dir)
+    return ok2 and made == true
+end
+
+local function llm_resolve(name, for_write)
+    local ud = llm_user_dir()
+    if not ud or ud == "" then return nil end
+    local dir = ud .. "\\llm_rerank"
+    local new = dir .. "\\" .. name
+    local f = io.open(new, "rb")
+    if f then f:close() return new end
+    local old = ud .. "\\" .. name
+    local g = io.open(old, "rb")
+    if g then
+        g:close()
+        if for_write and llm_dir_ensure(dir) and os.rename(old, new) then
+            os.remove(old .. ".old")    -- 顺迁 .old 轮转副本（无则无操作）
+            os.rename(old .. ".old", new .. ".old")
+            return new
+        end
+        return old                      -- 读场景 / 目录未就绪：暂用根目录
+    end
+    if for_write and llm_dir_ensure(dir) then return new end
+    return for_write and old or nil
+end
+
 -- 读参考表 → { ["词\t码"] = 有符号分数 }; 无文件返回 nil（机制休眠）
 local function pairfix_table()
-    local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
-    if not ok or type(ud) ~= "string" or ud == "" then return nil end
-    local f = io.open(ud .. "\\llm_pairfix.tsv", "r")
+    local path = llm_resolve("llm_pairfix.tsv", false)
+    if not path then return nil end
+    local f = io.open(path, "r")
     if not f then return nil end
     local tbl = {}
     for line in f:lines() do
@@ -118,12 +161,6 @@ local cfg = {
 _G.llm_ev_seq = _G.llm_ev_seq or 0
 _G.llm_debug_enabled = _G.llm_debug_enabled or false
 
-local function rec_user_dir()
-    local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
-    if ok and type(ud) == "string" and ud ~= "" then return ud end
-    return os.getenv("TEMP") or "C:\\Windows\\Temp"
-end
-
 local function rec_esc(s)
     s = tostring(s or "")
     s = s:gsub("\\", "\\\\"):gsub("\t", "\\t")
@@ -192,8 +229,8 @@ local function rec_append(path, line)
 end
 
 function _G.llm_corpus_write(line)
-    local ud = rec_user_dir()
-    local path = ud .. "\\rime_llm_corpus.tsv"
+    local path = llm_resolve("rime_llm_corpus.tsv", true)
+    if not path then return end
     if _G.llm_corpus_header_path ~= path then
         _G.llm_corpus_header_path = path
         _G.llm_corpus_ok = rec_header_ok(path, "#RIME_CORPUS\tv2\t",
@@ -205,8 +242,8 @@ end
 
 function _G.llm_debug_write(line, force)
     if not force and not _G.llm_debug_enabled then return end
-    local ud = rec_user_dir()
-    local path = ud .. "\\rime_llm_debug.txt"
+    local path = llm_resolve("rime_llm_debug.txt", true)
+    if not path then return end
     if _G.llm_debug_header_path ~= path then
         _G.llm_debug_header_path = path
         _G.llm_debug_ok = rec_header_ok(path, "#RIME_DEBUG|v2|",
@@ -402,9 +439,10 @@ local function load_llm(env)
         cpp.max_ctx    = cfg.max_tokens
         -- min_tokens 不设置：固定用 C++ 默认 1（用户配置面已移除，2026-09-30）
         if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end
-        -- 日志目录: RIME 用户目录 (未设置时 C++ 回退 %TEMP%)
-        local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
-        if okd and ud and ud ~= "" then cpp.log_dir = ud end
+        -- 日志目录: RIME 用户目录 llm_rerank 子目录（2026-11-21 记录文件
+        -- 收进子目录；dll 设置端顺手建目录，未设置时 C++ 回退 %TEMP%）
+        local okd, ud = pcall(llm_user_dir)
+        if okd and ud and ud ~= "" then cpp.log_dir = ud .. "\\llm_rerank" end
         llm = cpp
         llm_loaded_for = true
     end

@@ -1789,6 +1789,20 @@ static int lua_click_happened(lua_State * L) {
 //   性能：仅当模式字符串变化时重新编译（用户改配置才触发）。
 static const char *kDefaultCodePattern = ".{4}";  // 恰 4 码 = 原 min_code_len=4
 
+// ensure_dir(path) -> bool（2026-11-21）：rime-lua 无 mkdir，lua 侧记录
+// 文件收进用户文件夹 llm_rerank 子目录后，迁移/首写前用它建目录。
+// 已存在 = true（幂等）。函数注册 setfield 直挂（同 match_code）。
+static int lua_ensure_dir(lua_State * L) {
+    const char *dir = luaL_checkstring(L, 1);
+    if (!dir || !*dir || strlen(dir) >= MAX_PATH) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    BOOL ok = CreateDirectoryA(dir, nullptr);
+    lua_pushboolean(L, (ok || GetLastError() == ERROR_ALREADY_EXISTS) ? 1 : 0);
+    return 1;
+}
+
 static int lua_match_code(lua_State * L) {
     const char * pat = luaL_optstring(L, 1, NULL);
     const char * code = luaL_optstring(L, 2, "");
@@ -1884,7 +1898,13 @@ static int lua_newindex(lua_State * L) {
     else if (strcmp(key, "n_threads") == 0)  g_n_threads = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_ctx") == 0)      g_n_ctx = (int)luaL_checkinteger(L, 3);
     else if (strcmp(key, "n_seq_max") == 0)  g_n_seq_max = (int)luaL_checkinteger(L, 3);
-    else if (strcmp(key, "log_dir") == 0)    g_log_dir = luaL_checkstring(L, 3);  // RIME 用户目录
+    else if (strcmp(key, "log_dir") == 0) {
+        g_log_dir = luaL_checkstring(L, 3);  // RIME 用户目录 llm_rerank 子目录
+        // 2026-11-21 记录文件收进子目录：设置目录时顺手确保存在（已存在
+        // 无害），dll 侧 debug 写入不致因目录缺失回退 %TEMP%
+        if (!g_log_dir.empty() && g_log_dir.size() < MAX_PATH)
+            CreateDirectoryA(g_log_dir.c_str(), nullptr);
+    }
     return 0;
 }
 
@@ -1924,6 +1944,11 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
     // 不走 __newindex 属性语义——可写属性预填充禁令不适用于函数）
     lua_pushcfunction(L, lua_live_write);
     lua_setfield(L, -2, "live_write");
+
+    // 目录确保（2026-11-21）：llm_rerank 子目录收纳记录文件，lua 侧
+    // 迁移/首写前调用（rime-lua 无 mkdir）
+    lua_pushcfunction(L, lua_ensure_dir);
+    lua_setfield(L, -2, "ensure_dir");
 
     // 编码模式匹配（2026-09-30）：取代 min_code_len/max_code_len 区间，
     // 与 Rime 自身 auto_select_pattern 同语义（全串匹配）

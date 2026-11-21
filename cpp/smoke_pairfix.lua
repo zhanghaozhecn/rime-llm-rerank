@@ -1,13 +1,16 @@
--- smoke_pairfix.lua — 词码对分数修正专项冒烟（2026-11-17 有符号表）
--- 新口径: 词<TAB>码<TAB>[+|-]分数; +200/+100=加分, -5=扣分;
--- 正分不受 fade 限制，负分保留 fade；正分候选不在层1前k也优先占窗。
+-- smoke_pairfix.lua — 词码对扣分修正专项冒烟（2026-11-21 负分口径 + 子目录）
+-- 口径（2026-11-21 解耦定案）: 词<TAB>码<TAB>-分数 只承载负分（CE 偏差
+-- 降噪，评分窗内生效、受 fade）；正分行/非法行读取端跳过（固定候选归
+-- 拼读双拼 pin_candidates.tsv + pin_filter.lua）。记录文件在用户文件夹
+-- llm_rerank 子目录（迁移逻辑冒烟 = smoke_pair_key A 段）。
 package.cpath = [[build/Release/?.dll]]
 
 local SMK = os.getenv("TEMP") .. "\\pairfix_smoke"
 os.execute('mkdir "' .. SMK .. '" 2>nul')
-os.remove(SMK .. "\\rime_llm_debug.txt")
-os.remove(SMK .. "\\rime_llm_corpus.tsv")
-local TBL = SMK .. "\\llm_pairfix.tsv"
+require("rime_llm").ensure_dir(SMK .. "\\llm_rerank")
+os.remove(SMK .. "\\llm_rerank\\rime_llm_debug.txt")
+os.remove(SMK .. "\\llm_rerank\\rime_llm_corpus.tsv")
+local TBL = SMK .. "\\llm_rerank\\llm_pairfix.tsv"
 os.remove(TBL)
 
 rime_api = { get_user_data_dir = function() return SMK end }
@@ -81,8 +84,8 @@ local function read_file(path)
     local s = f:read("*a"); f:close(); return s
 end
 local function read_record()
-    return read_file(SMK .. "\\rime_llm_debug.txt") .. "\n"
-        .. read_file(SMK .. "\\rime_llm_corpus.tsv")
+    return read_file(SMK .. "\\llm_rerank\\rime_llm_debug.txt") .. "\n"
+        .. read_file(SMK .. "\\llm_rerank\\rime_llm_corpus.tsv")
 end
 local function tsv_split(line)
     local out, pos = {}, 1
@@ -153,11 +156,10 @@ print(string.format("[smoke] 无表休眠: key=%.3f = ce %.3f + fb %.3f + u1 %.3
 local pos1 = #read_record() + 1
 
 -- ── ② 负分: 与@vkh -5, key = 三项和 - 5, 行尾 修正-5 ──
-write_tbl({ "与\tvkh\t-5", "查\tesm" })
+write_tbl({ "与\tvkh\t-5" })
 run()
 assert(#OUT == 5, "yield count 2")
-local blk = read_record():sub(pos1)
-local l1 = cand_line(blk, "与")
+local l1 = cand_line(read_record():sub(pos1), "与")
 assert(l1, "debug 与 line missing (2)")
 local ce, fb, u1, key, sd1 = nums(l1)
 assert(sd1 == -5, "修正-5 标注缺失: " .. l1)
@@ -168,24 +170,34 @@ print(string.format("[smoke] 负分: key=%.3f = ce %.3f + fb %.3f + u1 %.3f - 5 
     key, ce, fb, u1))
 local pos2 = #read_record() + 1
 
--- ── ③ 正分 +200: 不受 fade 影响, key = 三项和 + 200, 与排第一 ──
-UNI["与\tvkh"] = 3
-write_tbl({ "与\tvkh\t+200" })
+-- ── ③ 正分行/非法行读取端跳过（2026-11-21 解耦）──
+UNI["与\tvkh"] = 0
+write_tbl({ "与\tvkh\t+200", "予\tvkh\t+100", "玉\tvkh\tabc" })
 run()
 assert(#OUT == 5, "yield count 3")
-local l2 = cand_line(read_record():sub(pos2), "与")
+local b3 = read_record():sub(pos2)
+local l2 = cand_line(b3, "与")
 assert(l2, "debug 与 line missing (3)")
 local ce2, fb2, u12, key2, sd2 = nums(l2)
-assert(sd2 == 200, "修正+200 标注缺失: " .. l2)
+assert(not sd2 or sd2 == 0, "正分行应被跳过、无修正标注: " .. l2)
 assert(ce2 and key2, "数字解析失败 (3): " .. l2)
-assert(math.abs(key2 - (ce2 + fb2 + u12 + 200)) < 0.02,
-    "正分 key 应= ce+fb+u1+200: " .. l2)
-assert(OUT[1].text == "与", "正分应排第一: " .. OUT[1].text)
-print(string.format("[smoke] 正分 +200 (uni=3 仍生效): key=%.3f = "
-    .. "ce %.3f + fb %.3f + u1 %.3f + 200 OK", key2, ce2, fb2, u12))
+assert(math.abs(key2 - (ce2 + fb2 + u12)) < 0.02,
+    "正分行跳过后 key 应=三项和: " .. l2)
+local l2b = cand_line(b3, "予")
+if l2b then
+    local _, _, _, _, sdb = nums(l2b)
+    assert(not sdb or sdb == 0, "予 正分行应被跳过: " .. l2b)
+end
+local l2c = cand_line(b3, "玉")
+if l2c then
+    local _, _, _, _, sdc = nums(l2c)
+    assert(not sdc or sdc == 0, "非法第三列行应被跳过: " .. l2c)
+end
+print("[smoke] 正分行 + 非法行读取端跳过 OK")
 local pos3 = #read_record() + 1
 
 -- ── ④ fade 对负分仍生效: 与@vkh uni=3 + -5 → 无修正、三项和 ──
+UNI["与\tvkh"] = 3
 write_tbl({ "与\tvkh\t-5" })
 run()
 local l3 = cand_line(read_record():sub(pos3), "与")
@@ -195,47 +207,5 @@ assert(not sd3 or sd3 == 0, "负分 fade 后不应有修正标注: " .. l3)
 assert(math.abs(key3 - (ce3 + fb3 + u13)) < 0.02,
     "负分 fade 后 key 应=三项和: " .. l3)
 print("[smoke] 负分 fade 让位 OK")
-local pos4 = #read_record() + 1
-
--- ── ⑤ +200 / +100: 首选第一、次选第二 ──
-UNI["与\tvkh"] = 0
-write_tbl({ "与\tvkh\t+200", "予\tvkh\t+100" })
-run()
-assert(#OUT == 5, "yield count 5")
-assert(OUT[1].text == "与", "固定首选应排第一: " .. OUT[1].text)
-assert(OUT[2].text == "予", "固定次选应排第二: " .. OUT[2].text)
-local b5 = read_record():sub(pos4)
-local a5 = cand_line(b5, "与")
-local b5l = cand_line(b5, "予")
-assert(a5 and b5l, "debug 行缺失 (+200/+100)")
-local _, _, _, _, sd5a = nums(a5)
-local _, _, _, _, sd5b = nums(b5l)
-assert(sd5a == 200, "与 应标 修正+200: " .. a5)
-assert(sd5b == 100, "予 应标 修正+100: " .. b5l)
-print("[smoke] 固定首选 +200 / 次选 +100 OK")
-local pos5 = #read_record() + 1
-
--- ── ⑥ 正分候选不在层1前5: 仍占窗并排第一 ──
--- 8 个候选; 前5个高词频, 玉 层1 第8; 表给 玉 +200。
-UNI["玉\tvkh"] = 0
-_G.user_freq_eff = function(w, c)
-    if c ~= "vkh" then return 0 end
-    if w == "与" or w == "予" or w == "语" or w == "育" or w == "雨" then
-        return 0.717
-    end
-    return 0
-end
-local words8 = { "语", "与", "予", "育", "雨", "玉", "鱼", "遇" }
-local translation8 = make_translation(words8)
-write_tbl({ "玉\tvkh\t+200" })
-OUT = {}
-filter(translation8, env)
-assert(#OUT == 8, "yield count 6")
-local l6 = cand_line(read_record():sub(pos5), "玉")
-assert(l6, "正分窗准入失败: 玉 无 debug 行")
-local _, _, _, _, sd6 = nums(l6)
-assert(sd6 == 200, "玉 应标 修正+200: " .. l6)
-assert(OUT[1].text == "玉", "正分窗准入后应排第一: " .. OUT[1].text)
-print("[smoke] 层1前5外正分占窗 OK")
 
 print("[smoke] SMOKE-PAIRFIX OK")

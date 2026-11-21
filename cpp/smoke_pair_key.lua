@@ -7,12 +7,16 @@ local SMK = os.getenv("TEMP") .. "\\pairkey_smoke"
 os.execute('mkdir "' .. SMK .. '" 2>nul')
 
 -- ═══ A. processor 单元（单账本 user_ledger.tsv, 2026-11-17 合并）═══
+-- 账本在用户文件夹 llm_rerank 子目录（2026-11-21 起）；本段顺带冒烟
+-- 根目录旧账本的一次性迁移（dofile processor 时 resolve 迁移）。
 rime_api = { get_user_data_dir = function() return SMK end }
 for _, n in ipairs({ "user_ledger.tsv", "user_eff.tsv", "user_unigram.tsv",
                      "user_freq.tsv", "user_bigram.tsv" }) do
     os.remove(SMK .. "\\" .. n)
+    os.remove(SMK .. "\\llm_rerank\\" .. n)
 end
--- 新格式: "#tick=N" + "s\t词\t码\tdee\ttick\tcum"（只认 s 行）
+-- 新格式: "#tick=N" + "词\t码\tdee\ttick\tcum"（兼容旧 s 行）——
+-- 故意写根目录旧位置，dofile processor 应迁移到子目录
 local pf = io.open(SMK .. "\\user_ledger.tsv", "w")
 pf:write("#tick=10\n")
 pf:write("s\t键\tjki\t2.000\t10\t3\n")   -- 衰减计数 2.0 / 累计 3
@@ -38,8 +42,17 @@ approx(_G.user_unigram_term("忽略", "x"), math.log(1), "旧行类型忽略")
 approx(_G.user_freq_eff("键", "jki"), 2.0, "eff(键,jki)=2.0 同账本")
 approx(_G.user_freq_eff("键", "jk"), 0, "eff(键,jk) 异码无史")
 
+-- 子目录迁移断言: 根目录旧账本已被一次性迁入 llm_rerank/
+-- （探测句柄必须关闭——Windows 句柄锁会令后续 os.remove 失败）
+local mig = io.open(SMK .. "\\llm_rerank\\user_ledger.tsv", "r")
+assert(mig, "账本未迁移到 llm_rerank 子目录")
+mig:close()
+assert(io.open(SMK .. "\\user_ledger.tsv", "r") == nil,
+       "根目录旧账本应已迁走")
+print("[smoke] 账本迁移 llm_rerank/ 子目录 OK")
+
 -- 旧两账本一次性迁移: cum = max(eff.commits, uni), 只对含中文词条
-os.remove(SMK .. "\\user_ledger.tsv")
+os.remove(SMK .. "\\llm_rerank\\user_ledger.tsv")
 pf = io.open(SMK .. "\\user_eff.tsv", "w")
 pf:write("#tick=100\n")
 pf:write("键\tjki\t5\t2.000\t100\n")   -- commits=5 > uni=2

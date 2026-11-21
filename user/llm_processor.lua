@@ -111,8 +111,36 @@ local stats_dirty = 0
 local function freq_key(word, code)
     return word .. "\t" .. (code or "")
 end
+-- 账本路径（2026-11-21 用户定案）：用户文件夹下 llm_rerank 子目录收纳
+-- 全部 LLM 数据/日志（固定候选 pin_candidates.tsv 属拼读双拼本机功能，
+-- 仍留根）。resolve：子目录已有 → 用之；根目录旧账本在 → 建目录后
+-- os.rename 一次性迁移（目录建不出/改名失败 → 暂读暂写根目录，下次再迁，
+-- 绝不丢数据）。目录由 rime_llm.dll ensure_dir 建立（rime-lua 无 mkdir）。
+local function llm_dir_ensure(dir)
+    local ok, cpp = pcall(require, "rime_llm")
+    if not ok or not cpp or not cpp.ensure_dir then return false end
+    local ok2, made = pcall(cpp.ensure_dir, dir)
+    return ok2 and made == true
+end
 local function ledger_file()
-    return rime_api.get_user_data_dir() .. "\\user_ledger.tsv"
+    local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
+    if not ok or type(ud) ~= "string" or ud == "" then
+        local tmp = os.getenv("TEMP") or "C:\\Windows\\Temp"
+        return tmp .. "\\user_ledger.tsv"
+    end
+    local dir = ud .. "\\llm_rerank"
+    local new = dir .. "\\user_ledger.tsv"
+    local f = io.open(new, "rb")
+    if f then f:close() return new end
+    local old = ud .. "\\user_ledger.tsv"
+    local g = io.open(old, "rb")
+    if g then
+        g:close()
+        if llm_dir_ensure(dir) and os.rename(old, new) then return new end
+        return old
+    end
+    if llm_dir_ensure(dir) then return new end
+    return old
 end
 local function has_non_ascii(w)
     return w:match("[^\1-\127]") ~= nil
@@ -367,9 +395,12 @@ local function processor(key, env)
         if not llm_prep then
             local ok, result = pcall(require, "rime_llm")
             if ok then
-                -- 日志目录: RIME 用户目录 (与 filter 共用同一模块实例)
+                -- 日志目录: RIME 用户目录 llm_rerank 子目录（2026-11-21 起；
+                -- 与 filter 共用同一模块实例；dll 设置端顺手建目录）
                 local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
-                if okd and ud and ud ~= "" then result.log_dir = ud end
+                if okd and ud and ud ~= "" then
+                    result.log_dir = ud .. "\\llm_rerank"
+                end
                 llm_prep = result
             end
         end

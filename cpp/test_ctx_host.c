@@ -88,10 +88,11 @@ int main(void) {
         return 1;
     Sleep(400);   /* 广播送达 */
 
-    /* 模型加载：设路径（本机实际位置）+ score 首调懒触发 + 宿主轮询 */
+    /* 模型加载：设路径（本机实际位置）+ score 首调懒触发 + 宿主轮询
+     * （2026-11-21 跟进 0.6B base 时代——此前还停在更旧 Qwen3.5-0.8B）*/
     if (run(L,
         "package.loaded.rime_llm.model_path = "
-        "'d:/gguf_models/Qwen3.5-0.8B-Q4_K_M.gguf'\n"
+        "'d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf'\n"
         "package.loaded.rime_llm.score('预热', {'x'})\n"))
         return 1;
     if (!wait_ready(L, 60000)) return fail("model load timeout");
