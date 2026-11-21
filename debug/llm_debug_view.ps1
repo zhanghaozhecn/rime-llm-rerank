@@ -202,18 +202,21 @@ $grid.AutoSizeColumnsMode = 'None'
 # 列头禁换行 + 短文案：窄列两行表头会被默认行高裁掉下半行（2026-11-10 实测）
 $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::False
 # 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
-# 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 3 位小数，
+# 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 1 位小数，
 # 等宽字体逐位对齐），公式不再单独展示；身份列只剩 #/词
 # 「窗」「匹配词长」列均已删（2026-11-16 用户定案：窗内/尾窗灰字区分、
 # 满长准入优先下"有无 CE 分"即满长标志——列冗余）；
 # 「修正分」列已删（2026-11-21 用户定案 v7：命中修正折进 CE 格数值 +
 # 公式尾项，见 Get-CeProc——0 不显示，恒 0 的专属列无观察价值）
 # 列宽与源码版 WeaselLLMDebug 同值（GDI 实测取宽 + 对齐补空格的余量；
-# 词 100 = 字符段显带 '/'（4 字词 ≈77px，容 5 字词）；CE 352 = 原 310
-# + 公式尾修正项余量）
+# 词 100 = 字符段显带 '/'（4 字词 ≈77px，容 5 字词）；2026-11-21 公式空格
+# （'='、'+' 两边各一空格）列宽重分配（合计 878 < 888 Studio 右列网格宽）：
+# CE 380 = 352 + 空格余量 − 挪给分式列的 12；衰减词频分 168 = 140 + 空格
+# 2 字符（真机实测 "=14·log1p(…)" 被截成 …）；累计词频分 140 = 112 + 容
+# 5 位数累计次数）
 $cols = @(
-  @('#', 26), @('词', 100), @('总分', 64), @('CE', 352), @('衰减词频分', 140),
-  @('累计词频分', 112))
+  @('#', 26), @('词', 100), @('总分', 64), @('CE', 380), @('衰减词频分', 168),
+  @('累计词频分', 140))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
   $grid.Columns[$i].Width = $c[1]
@@ -385,12 +388,14 @@ function Get-CorrSuffix([double]$sd) {
 # CE 格：加权 CE 与其三分量 + 词码对修正折叠（2026-11-21 用户定案 v7：
 # 修正分专属列删除——对几乎所有候选恒为 0 的独立列无观察价值；命中时
 # 把修正值折进 CE 数值本身并在公式右侧追修正项，如
-#   -34.7=-(14.0+1.10·10.1+0.60·7.6)-5.0
+#   -34.7 = -(14.0 + 1.1·10.1 + 0.6·7.6) - 5.0
 # 修正为 0 不追加任何显示。无 CE 分（尾窗/无法表示）→ 格保持 '—'
-# （修正项只随融合分隐含）。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
+# （修正项只随融合分隐含）。公式排版（2026-11-21 用户定案）：'=' 与 '+'
+# 两边各留一个空格。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
 # 交叉熵、正值；分值取负号进融合），故等号右为带负号的括号和。
-# ce2/ce3 带权重前缀（1.10/0.60 = 标定常数，原样显示不四舍五入；2026-11-14
-# 随默认模型 0.5B 重标定，旧 1.05/0.45 为 0.8B v3 值）；ce1 权重
+# ce2/ce3 带权重前缀（系数 = 标定内置常数 1.10/0.60，显示 1.1/0.6——
+# 第二位小数不显示，与数据 1 位小数一致；2026-11-14 随默认模型 0.5B
+# 重标定，旧 1.05/0.45 为 0.8B v3 值）；ce1 权重
 # 恒 1 → 前缀不显示（2026-11-12 用户定案）；数据浮点统一 1 位小数。
 # $wL = 分数列内最宽值宽，$wC = 三分量列内最宽值宽
 function Get-CeProc($r, $wL, $wC) {
@@ -399,13 +404,14 @@ function Get-CeProc($r, $wL, $wC) {
   if ($null -eq $ce) { return '—' }
   if ($sd -ne 0) { $ce += $sd }
   $tail = Get-CorrSuffix $sd
+  if ($tail) { $tail = ' ' + $tail }  # 修正项前空一格
   $lead = Pad-L (Format-F1 $ce) $wL
-  $t = $lead + '=-('
+  $t = $lead + ' = -('
   $any = $false
-  foreach ($pair in @(@($null, $r.ce1), @('1.10', $r.ce2), @('0.60', $r.ce3))) {
+  foreach ($pair in @(@($null, $r.ce1), @('1.1', $r.ce2), @('0.6', $r.ce3))) {
     $v = Get-Num $pair[1]
     if ($null -eq $v) { continue }
-    if ($any) { $t += '+' }
+    if ($any) { $t += ' + ' }
     if ($pair[0]) { $t += $pair[0] + '·' }
     $t += Pad-L (Format-F1 $v) $wC
     $any = $true
@@ -423,7 +429,7 @@ function Get-FbProc($r, $wL, $wE) {
   $lead = Pad-L (Format-F1 $fb) $wL
   $eff = Get-Num $r.eff
   if ($null -eq $eff) { return $lead }
-  return $lead + '=14·log1p(' + (Pad-L (Format-F1 $eff) $wE) + ')'
+  return $lead + ' = 14·log1p(' + (Pad-L (Format-F1 $eff) $wE) + ')'
 }
 
 # 累计词频分格：log1p(uni)（2026-11-11 公式简化，分母为窗内常数已去除；
@@ -434,7 +440,7 @@ function Get-U1Proc($r, $wL, $wU) {
   $lead = Pad-L (Format-F1 $u1) $wL
   $uni = Get-Num $r.uni
   if ($null -eq $uni) { return $lead }
-  return $lead + ('=log1p({0})' -f (Pad-L ([string][int]$uni) $wU))
+  return $lead + (' = log1p({0})' -f (Pad-L ([string][int]$uni) $wU))
 }
 
 # 总分格：融合分纯分值（三项过程各在自带格内，词码对修正折进 CE 格见
