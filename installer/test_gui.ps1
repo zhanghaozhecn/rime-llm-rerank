@@ -347,10 +347,20 @@ public class W {
   # 内部态（渲染/保存均正确，2026-09-29 截图+落盘双验证）——复选框断言
   # 统一走 BM_CLICK 切换 + 保存落盘（G4 读入态保持 / G7 点击翻转）
 
+  Write-Host "== G1b: A1 拦截——启用但模型缺失，保存弹确认；选『否』= 取消且文件未动 =="
+  $beforeG1b = (Get-FileHash $test -Algorithm SHA1).Hash
+  Click-Btn (Find-Button "保存并生效")
+  Start-Sleep -Milliseconds 400
+  $hitG1b = Dismiss-Prompt "否"
+  Assert "模型缺失保存弹确认框（A1）" $hitG1b
+  Assert "选否后取消保存（状态行）" (Any-Text "已取消保存")
+  Assert "选否后方案文件未改动" ((Get-FileHash $test -Algorithm SHA1).Hash -eq $beforeG1b)
+
   Write-Host "== G2: 未接入方案点保存 → 自动接入（补组件行 + 写节；无节默认勾选启用）=="
   $before = (Get-Item $test).LastWriteTimeUtc
   $beforeText = Get-Content $test -Raw -Encoding UTF8
   Click-Btn (Find-Button "保存并生效")
+  [void](Dismiss-Prompt "是")   # A1：启用但模型缺失 → 确认框，沙箱无模型 → 答"是"继续
   Start-Sleep -Milliseconds 900
   Assert "状态含 已接入并保存" (Any-Text "已接入并保存")
   $f2 = Get-Content $test -Encoding UTF8
@@ -366,6 +376,7 @@ public class W {
   Set-Content -Path $test -Value $stripped -Encoding ascii -NoNewline
   Reload-Params
   Click-Btn (Find-Button "保存并生效")
+  [void](Dismiss-Prompt "是")   # A1 确认框（同 G2）
   Start-Sleep -Milliseconds 900
   $f2b = Get-Content $test -Encoding UTF8
   Assert "缺组件行时状态含 已接入并保存" (Any-Text "已接入并保存")
@@ -451,7 +462,8 @@ engine:
   Write-Host "== G4: 保存（mode→[abcde]{4}；复选框按读入态原样落盘；freq_beta 旧行被剥）=="
   Set-Edit $e[0] "[abcde]{4}"
   Click-Btn (Find-Button "保存并生效")
-  Assert "状态含 已保存…并触发重新部署" (Any-Text "并触发重新部署")
+  [void](Dismiss-Prompt "是")   # A1 确认框（同 G2）
+  Assert "状态含 已保存（A2 部署反馈改版后措辞）" (Any-Text "已保存")
   $f = Get-Content $test -Encoding UTF8
   Assert "enabled: true（读入态保持）" (($f | Where-Object { $_ -match '^\s+enabled: true\s*$' }).Count -eq 1)
   Assert "debug_fusion: true（读入态保持）" (($f | Where-Object { $_ -match '^\s+debug_fusion: true\s*$' }).Count -eq 1)
@@ -473,6 +485,7 @@ engine:
   Write-Host "== G5: 幂等重存（逐字节一致）=="
   $h1 = (Get-FileHash $test -Algorithm MD5).Hash
   Click-Btn (Find-Button "保存并生效")
+  [void](Dismiss-Prompt "是")   # A1 确认框（同 G2）
   $h2 = (Get-FileHash $test -Algorithm MD5).Hash
   Assert "文件逐字节一致" ($h1 -eq $h2)
 
@@ -527,6 +540,7 @@ engine:
   Assert ("已选中预装方案（实测 '$sel'）") ($sel -like "*（程序）")
   Assert "选中预装方案时状态提示会先复制" (Any-Text "程序文件夹里的预装方案")
   Click-Btn (Find-Button "保存并生效")
+  [void](Dismiss-Prompt "是")   # A1 确认框（预装方案无节默认勾选启用，沙箱无模型）
   $copiedFile = Join-Path (Join-Path $sandbox "Rime") $progName
   $ok = $false
   for ($t = 0; $t -lt 40 -and -not $ok; $t++) {
@@ -542,9 +556,20 @@ engine:
     Remove-Item $copiedFile -Force
   }
   Assert "程序文件夹原件未被改动" ((Get-FileHash $sharedFile -Algorithm SHA256).Hash -eq $before)
+  # G10 留下的死项必须清掉：预装方案复制到用户文件夹后又删除，但下拉列表还列着
+  # 它——不清的话 G12 的 HOME 切换会落在死项上（文件已删 = 按"未接入"处理 →
+  # 默认勾选启用 + 模型缺失 → A1 确认框无人应答，模态卡死后续所有保存；
+  # 2026-11-21 A1 上线后暴露的这个测试自身死角，旧套件靠"保存总是静默成功"掩盖）
+  Rescan-Schemas
 
   Write-Host "== G12: 五处薄弱点修复的覆盖（默认路径 / 可疑文件 / 下载确认 / 相对路径 / 遗留 curl 接管）=="
-  # ⑤ 默认模型路径跟着"用户目录"（沙箱由 RIME_LLM_USER_DIR 钉住；此前硬编码 %APPDATA%）
+  # ⑤ 默认模型路径跟着"用户目录"（沙箱由 RIME_LLM_USER_DIR 钉住；此前硬编码 %APPDATA%）。
+  # 2026-11-21：zz_test 经 G3/G4 已带显式 model_path——先剥掉它，让"节无 model_path
+  # → 框显示默认路径"分支真正走到（旧套件靠 G10 死项的"未接入默认值"意外覆盖，
+  # 死项清掉后该断言会落到 zz_test 的显式路径上而假失败）
+  (Get-Content $test -Raw -Encoding UTF8) -replace '(?m)^\s*model_path:[^\r\n]*\r?\n?', '' |
+    Set-Content $test -Encoding ascii -NoNewline
+  Rescan-Schemas
   $modelCmb = (Get-Ctls | Where-Object { $_.cls -match '(?i)COMBOBOX' } | Select-Object -Last 1)
   # 回到沙箱用户方案（G10 停在预装方案上）
   Combo-SelectLast $cmb
@@ -681,7 +706,36 @@ engine:
   # 应填回实际落点。为了不被 Read-ParamsToUi 的"节无 model_path → 显示默认"掩盖：
   # 先给方案节写入一个显式 model_path（指向别处的小文件），完成回调按节重读会
   # 把框填成那个路径——回填必须以本次实际落点为准把它覆盖成默认路径才算修好。
-  # 用"已存在"分支秒回（预置 105MB 假体在默认落点），不真下载 500MB。
+  # 用"已存在"分支秒回（预置**精确体量**假体在默认落点），不真下载。
+  # A4（2026-11-21）：已存在跳过判据收紧为精确字节 396,704,640（与
+  # install_plugin.ps1 的 $MODEL_EXPECTED_BYTES 同值）——此前预置 105MB 假体
+  # 也能走"已存在"分支，正是这次修掉的半截误判
+  Write-Host "== G14-pre: A4——默认名半截文件（105MB）点下载先确认（体量提示）=="
+  # 体量提示从**确认框文本**断言：跨进程 WM_SETTEXT 不触发 WinForms TextChanged
+  # （本套件 646 行注释的同款已知怪癖），状态行的模型可疑显示走不了这条路；
+  # A4 的用户可见文案在确认框里逐字出现，通道可靠
+  $fakeHalf = Join-Path (Join-Path $sandbox "Rime") "Qwen3-0.6B-Base-Q4_K_M.gguf"
+  $fsH = [IO.File]::Create($fakeHalf); [void]$fsH.SetLength(105MB); $fsH.Close()
+  [void][W]::SendMsgStr($modelCmb.h, 0x000C, [IntPtr]::Zero, "")   # 清空 = 默认路径
+  Start-Sleep -Milliseconds 300
+  $curlCntH = @(Get-Process curl -ErrorAction SilentlyContinue).Count
+  Click-Btn (Find-Button "下载模型")
+  $gpidH = 0
+  [void][W]::GetWindowThreadProcessId($hw, [ref]$gpidH)
+  $dlgH = [IntPtr]::Zero
+  for ($tH = 0; $tH -lt 25; $tH++) {
+    $dlgH = [W]::FindDialog([int]$gpidH)
+    if ($dlgH -ne [IntPtr]::Zero) { break }
+    Start-Sleep -Milliseconds 200
+  }
+  Assert "半截文件点下载弹确认框（A4）" ($dlgH -ne [IntPtr]::Zero)
+  $dtxtH = (@([W]::Children($dlgH)) | ForEach-Object { Get-WText $_ }) -join "`n"
+  Assert "确认框含体量提示（应为 397 MB）" $dtxtH.Contains("应为 397 MB")
+  [void](Dismiss-Prompt "否")
+  Assert "取消下载（保留现有文件）" (Any-Text "已取消下载")
+  Assert ("取消后未启动 curl（实测 {0} 个）" -f @(Get-Process curl -ErrorAction SilentlyContinue).Count) `
+    (@(Get-Process curl -ErrorAction SilentlyContinue).Count -eq $curlCntH)
+  Remove-Item $fakeHalf -Force
   Write-Host "== G14: 下载完成自动回填默认路径（空框点下载 → 框 = 默认路径）=="
   $g14mp = Join-Path (Join-Path $sandbox "Rime") "g14_other.gguf"
   [IO.File]::WriteAllBytes($g14mp, (New-Object byte[] 2048))
@@ -694,7 +748,7 @@ engine:
     Where-Object { (Get-Content $_.FullName -Encoding UTF8 |
       Where-Object { $_ -match 'model_path:' -and $_ -match 'g14_other' }).Count -ge 1 }).Count -ge 1)
   $fakeFull = Join-Path (Join-Path $sandbox "Rime") "Qwen3-0.6B-Base-Q4_K_M.gguf"
-  $fs14 = [IO.File]::Create($fakeFull); [void]$fs14.SetLength(105MB); $fs14.Close()
+  $fs14 = [IO.File]::Create($fakeFull); [void]$fs14.SetLength(396704640); $fs14.Close()
   [void][W]::SendMsgStr($modelCmb.h, 0x000C, [IntPtr]::Zero, "")   # 清空路径框 = 用户场景
   Start-Sleep -Milliseconds 300
   Click-Btn (Find-Button "下载模型")               # 落默认路径；已存在 → 秒完成

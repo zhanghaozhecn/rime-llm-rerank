@@ -493,11 +493,12 @@ return function(translation, env)
     local sc = env.engine.schema.config
     local enabled = sc:get_bool("llm_rerank/enabled") or false
 
-    -- Init config once (non-DLL config doesn't invalidate on redeploy)
-    if not cfg._inited then
-        init_config(env)
-        cfg._inited = true
-    end
+    -- 每次调用重读方案配置（2026-11-21 A3）：原模块级 cfg._inited 守卫每进程只
+    -- 读一次，而 Lua state 进程级单例 → code_pattern/max_tokens/max_candidates/
+    -- cpu_cores/debug_fusion/two_code_sentence 重部署后冻结到重启，"保存并生效"
+    -- 改参数不生效（enabled 每键读、model_path processor 每键同步所以正常）。
+    -- 改每调用重读后与 enabled 同模式；配置树查询微秒级，无性能顾虑
+    init_config(env)
 
     local input = env.engine.context.input or ""
     local all = {}

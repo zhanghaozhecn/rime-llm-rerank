@@ -53,8 +53,22 @@ $LUA_DIR = Join-Path $RIME_USER "lua"
 # 有 D 盘模型的机器在 GUI/schema 里显式填 D:\gguf_models\...）
 # 与运行期默认保持一致：C++ 侧取 RIME 用户目录根（同上注册表优先）
 $DEFAULT_MODEL = Join-Path $RIME_USER "Qwen3-0.6B-Base-Q4_K_M.gguf"
-# 完整模型的体量下限（与"下载完成转正"判据同一个数）：小于它 = 疑似半截/损坏
+# 完整模型的体量下限（任意 .gguf 通用）：小于它 = 疑似半截/损坏
 $MODEL_MIN_BYTES = 100MB
+# A4（2026-11-21）：默认模型**精确体量** 396,704,640 B（实测）——下载转正与
+# "已存在跳过"判据从 ≥100MB 收紧为精确值，100~396MB 的半截下载不再溜进生产；
+# 精确判据只约束默认模型名（自定义模型仍走 100MB 下限）
+$MODEL_EXPECTED_BYTES = 396704640
+$DEFAULT_MODEL_NAME = "Qwen3-0.6B-Base-Q4_K_M.gguf"
+# 模型完整性判定：missing / suspect / ok（判据见上；GUI 状态行 / 保存拦截 /
+# 下载确认 / 下载动作共用这一个口径，两版一致）
+function Get-ModelState([string]$path) {
+  $fi = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+  if (-not $fi) { return "missing" }
+  if ([IO.Path]::GetFileName($path) -ieq $DEFAULT_MODEL_NAME -and $fi.Length -lt $MODEL_EXPECTED_BYTES) { return "suspect" }
+  if ($fi.Length -lt $MODEL_MIN_BYTES) { return "suspect" }
+  return "ok"
+}
 # 下载源 = ModelScope 自建仓（2026-11-19 用户定案：生产模型切 Qwen3-0.6B **base** 自转
 # Q4_K_M——研究帕累托最优 100ms/3.65%，预填充 79ms；官方 ModelScope 无 0.6B base GGUF，
 # 对话微调版在重排任务上差 0.67pp，故自建上传。旧 instruct 下载源已退役）
@@ -170,10 +184,18 @@ function Clean-OldBinaries([string]$dir, $Log) {
   if ($old) { $old | Remove-Item -Force -ErrorAction SilentlyContinue; & $Log ("  清理 " + $old.Count + " 个改名残留") }
 }
 
+# A2（2026-11-21）：部署结果结构化——返回 ok / background / manual / failed / skipped，
+# 并打 [REDEPLOY=…] 机器可读行（GUI 子进程动作按输出扫描，直接调用按返回值）。
+# 此前保存流程的失败判定靠"提示|失败|错误"关键词匹配日志行，"请手动重新部署"
+# 这类消息不含关键词 → 被误报成成功，用户以为生效了实际没部署。
 function Invoke-Redeploy([string]$installDir, $Log) {
   # 测试钩子：沙箱 GUI/CLI 自动化静默跳过（机制同源码版
   # WEASEL_LLM_SETUP_NO_REDEPLOY；测试子进程继承环境变量一并生效）
-  if ($env:LLM_INSTALLER_NO_REDEPLOY) { & $Log "  （测试模式：跳过重新部署）"; return }
+  if ($env:LLM_INSTALLER_NO_REDEPLOY) {
+    & $Log "  （测试模式：跳过重新部署）"
+    & $Log "  [REDEPLOY=skipped]"
+    return "skipped"
+  }
   $deployer = Join-Path $installDir "WeaselDeployer.exe"
   if (Test-Path $deployer) {
     & $Log "  触发重新部署（WeaselDeployer /deploy）…"
@@ -184,12 +206,22 @@ function Invoke-Redeploy([string]$installDir, $Log) {
       # 不能无限 -Wait 卡死安装器；超时则留后台继续，不杀进程
       if ($p.WaitForExit(15000)) {
         & $Log ("  重新部署退出码: " + $p.ExitCode)
+        & $Log "  [REDEPLOY=ok]"
+        return "ok"
       } else {
         & $Log "  重新部署仍在后台进行（已不再等待）；完成后输入法自动生效，若候选异常请托盘手动重新部署"
+        & $Log "  [REDEPLOY=background]"
+        return "background"
       }
-    } catch { & $Log "  [警告] 自动重新部署失败，请手动：托盘小狼毫 → 重新部署" }
+    } catch {
+      & $Log "  [警告] 自动重新部署失败，请手动：托盘小狼毫 → 重新部署"
+      & $Log "  [REDEPLOY=failed]"
+      return "failed"
+    }
   } else {
     & $Log "  请手动重新部署：托盘小狼毫 → 重新部署"
+    & $Log "  [REDEPLOY=manual]"
+    return "manual"
   }
 }
 
@@ -519,6 +551,18 @@ function Copy-FilesPluginAction($Log) {
     Copy-Item (Join-Path $PluginSrc $l) (Join-Path $LUA_DIR $l) -Force
     & $Log ("  + lua\" + $l)
   }
+  # B1（2026-11-21）：实时调试查看器随安装部署——此前只随仓库分发（debug\），
+  # 启动又依赖仓库路径，用户删了仓库就永久失去排障入口。落 Rime 用户目录
+  # llm_rerank\viewer\（与本 dll/lua 同一"用户文件夹"口径）
+  $dbgSrc = Join-Path (Split-Path $PSScriptRoot -Parent) "debug"
+  if (Test-Path (Join-Path $dbgSrc "llm_debug_view.ps1")) {
+    $dbgDir = Join-Path $RIME_USER "llm_rerank\viewer"
+    if (-not (Test-Path $dbgDir)) { New-Item -ItemType Directory -Path $dbgDir -Force | Out-Null }
+    foreach ($f in @("llm_debug_view.ps1", "open_debug_window.bat")) {
+      Copy-Item (Join-Path $dbgSrc $f) (Join-Path $dbgDir $f) -Force
+      & $Log ("  + viewer\" + $f)
+    }
+  }
   & $Log "[3/3] 启动服务"
   Start-WeaselService $installDir $Log
   & $Log "完成。"
@@ -582,13 +626,14 @@ function Download-ModelAction([string]$modelPath, $Log) {
   & $Log ("  目标: " + $modelPath)
   if (Test-Path $modelPath) {
     $sz = (Get-Item $modelPath).Length
-    if ($sz -ge $MODEL_MIN_BYTES) {
-      & $Log ("  模型已存在（{0:N0} MB），无需下载" -f ($sz / 1MB))
+    if ((Get-ModelState $modelPath) -eq "ok") {
+      & $Log ("  模型已存在（{0} MB），无需下载" -f [Math]::Round($sz / 1e6))
       & $Log "完成。"
       return
     }
-    # ① 半截/损坏文件不再被当成"已存在"：小于下限 → 清掉重下（GUI 侧已确认过）
-    & $Log ("  已存在文件仅 {0:N0} MB（小于 {1} MB，疑似未下完/损坏）→ 删除后重新下载" -f ($sz / 1MB), ($MODEL_MIN_BYTES / 1MB))
+    # ① 不完整文件不再被当成"已存在"（GUI 侧已确认过）：默认名体量不符 / 小于下限
+    #    → 清掉重下（A4 2026-11-21：此前 ≥100MB 即跳过，半截模型直接溜进生产）
+    & $Log ("  已存在文件不完整（{0} MB，完整应为 397 MB）→ 删除后重新下载" -f [Math]::Round($sz / 1e6))
     Remove-Item -LiteralPath $modelPath -Force -ErrorAction SilentlyContinue
   }
   $dir = Split-Path $modelPath -Parent
@@ -596,7 +641,7 @@ function Download-ModelAction([string]$modelPath, $Log) {
   $tmp = $modelPath + ".download"
   [void](Stop-StaleDownloader $tmp $Log)
   if ((Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 0)) {
-    & $Log ("  发现未完成分片 {0:N0} MB — 断点续传" -f ((Get-Item $tmp).Length / 1MB))
+    & $Log ("  发现未完成分片 {0} MB — 断点续传" -f [Math]::Round((Get-Item $tmp).Length / 1e6))
   }
   $p = Start-Process -FilePath "curl.exe" `
     -ArgumentList @("-L", "-C", "-", "-s", "-S", "-o", "`"$tmp`"", "`"$MODEL_URL`"") `
@@ -606,15 +651,23 @@ function Download-ModelAction([string]$modelPath, $Log) {
   while (-not $p.HasExited) {
     Start-Sleep -Seconds 5
     if (Test-Path $tmp) {
-      & $Log ("  进度: {0:N0} MB / 约 500MB" -f ((Get-Item $tmp).Length / 1MB))
+      $len = (Get-Item $tmp).Length
+      $pct = [Math]::Min(99, [int][Math]::Floor(($len * 100) / $MODEL_EXPECTED_BYTES))
+      & $Log ("  进度: {0} MB / 397 MB（{1}%）" -f [Math]::Round($len / 1e6), $pct)
     }
   }
   $code = $p.ExitCode
-  if ($code -eq 0 -and (Test-Path $tmp) -and ((Get-Item $tmp).Length -ge $MODEL_MIN_BYTES)) {
+  $tlen = if (Test-Path $tmp) { (Get-Item $tmp).Length } else { 0 }
+  # A4：转正判据 = 精确字节。curl 成功但体量不符（截断/服务端变更）→ 不转正，
+  # 保留分片提示续传
+  if ($code -eq 0 -and $tlen -eq $MODEL_EXPECTED_BYTES) {
     Move-Item $tmp $modelPath -Force
     Remove-Item -LiteralPath ($tmp + ".pid") -Force -ErrorAction SilentlyContinue
-    & $Log ("  下载完成: {0:N0} MB → {1}" -f ((Get-Item $modelPath).Length / 1MB), $modelPath)
+    & $Log ("  下载完成: {0} MB → {1}" -f [Math]::Round($tlen / 1e6), $modelPath)
     & $Log "完成。"
+  } elseif ($code -eq 0) {
+    & $Log ("  [ERROR] 下载体量不符（{0} MB，应为 397 MB）——分片已保留，重试可续传；或手动下载: $MODEL_URL" -f [Math]::Round($tlen / 1e6))
+    throw ("模型下载体量不符（{0} MB，应为 397 MB）——重试可断点续传" -f [Math]::Round($tlen / 1e6))
   } else {
     & $Log ("  [ERROR] 下载失败（curl 退出码 $code）；分片已保留，重试可续传；或手动下载: $MODEL_URL")
     throw ("模型下载失败（curl 退出码 $code）——重试可断点续传")
@@ -874,7 +927,7 @@ function Run-InstallerGui {
   $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
   $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（t_cand = 当前「候选数」个 3-token 候选的候选段延迟，预填充不计；`n取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
   $tipTcs = "两码整句 two_code_sentence（默认关闭）。`n开启后（双拼/五笔/郑码等两码一字整句方案）：词长恰为`nfloor(码长/2) 字的候选作为一组直接优先（组内按融合分），`n其余候选按融合分排后——整句方案的满句长候选优先。`n一般字词方案保持关闭。取代原预期词长权重 elw（2026-11-07）。"
-  $tipDebug = "诊断日志：开启后每次重排都往用户文件夹写 rime_llm_debug.txt`n（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。"
+  $tipDebug = "诊断日志：开启后每次重排都往用户文件夹的 llm_rerank 子目录写`nrime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化）。排障用，平时关闭。`n实时调试窗口：插件版随『复制文件』装到 Rime 用户文件夹`nllm_rerank\viewer\open_debug_window.bat；源码版走托盘「LLM 设置+调试」。"
   $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n随后自动重新部署生效。`n方案还没接入（缺配置节 / 缺组件行 / 残留另一版组件行）时，`n本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。"
   $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；`n**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
   $tipStrip = "剥离：把选中方案里的 LLM 组件行与 llm_rerank 配置节整个删掉`n（方案回到『未接入』状态），并自动重新部署。`n日常只想改参数请用『保存并生效』。"
@@ -1141,20 +1194,26 @@ function Run-InstallerGui {
     if (-not $p) { $p = $DEFAULT_MODEL }
     if (Test-Path $p) {
       $len = (Get-Item $p).Length
-      $mb = [int][Math]::Floor($len / 1MB)
-      if ($len -ge $MODEL_MIN_BYTES) {
-        $lblModelStatus.Text = "模型已就绪：$mb MB"
-        $lblModelHint.Text = ""
-      } else {
-        # ① 半截/损坏文件不能显示成"已就绪"（否则重排静默失败、用户找不到原因）
+      $mb = [Math]::Round($len / 1e6)
+      # ② A4（2026-11-21）：默认名模型体量精确已知——100~396MB 的半截下载不再
+      #    显示"已就绪"（此前 ≥100MB 就报就绪，重排静默失效、用户找不到原因）
+      if ((Get-ModelState $p) -eq "suspect") {
         # 文案长度受 $lblModelStatus(140) + $lblModelHint(480) 的**可见宽度**约束
         # （2026-10-09 实测：超长会被 Label 直接截断，末尾看不见）——改文案先量宽
         $lblModelStatus.Text = "模型可疑：仅 $mb MB"
-        $lblModelHint.Text = "疑似未下完或损坏——点『下载模型』重下，或用『浏览…』换一个"
+        $lblModelHint.Text = $(if ([IO.Path]::GetFileName($p) -ieq $DEFAULT_MODEL_NAME) {
+          "应为 397 MB（疑似未下完）——点『下载模型』续传/重下"
+        } else {
+          "疑似未下完或损坏——点『下载模型』重下，或用『浏览…』换一个"
+        })
+      } else {
+        $lblModelStatus.Text = "模型已就绪：$mb MB"
+        $lblModelHint.Text = ""
       }
     } else {
+      # B3（2026-11-21）：缺失态提示补"下一步"链（与源码版逐字一致）
       $lblModelStatus.Text = "模型文件不存在"
-      $lblModelHint.Text = "点『下载模型』（可续传），或用『浏览…』选已有的 .gguf"
+      $lblModelHint.Text = "点『下载模型』或『浏览…』选模型，再点『保存并生效』启用重排"
     }
   }
 
@@ -1494,6 +1553,31 @@ function Run-InstallerGui {
       $lblParamStatus.ForeColor = $colErr
       return
     }
+    # ④ A1（2026-11-21）：启用重排但模型文件缺失/可疑 → 保存前先确认。此前照样
+    #    绿字成功、重排静默不生效，是"装了没效果"的头号来源（源码版同款拦截）
+    if ($p.enabled) {
+      $mpChk = if ($mpRaw) { $mpRaw } else { $DEFAULT_MODEL }
+      $fiChk = Get-Item -LiteralPath $mpChk -ErrorAction SilentlyContinue
+      $bad = $false
+      $why = ""
+      if (-not $fiChk) {
+        $bad = $true; $why = "模型文件不存在：$mpChk"
+      } elseif ((Get-ModelState $mpChk) -eq "suspect") {
+        $bad = $true
+        $why = ("模型文件可疑（{0} MB，完整应为 397 MB）：$mpChk" -f [Math]::Round($fiChk.Length / 1e6))
+      }
+      if ($bad) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+          ($why + "`n`n启用重排将不会生效（打字保持引擎原序）。仍要保存吗？"),
+          "模型未就绪", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+          [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
+          $lblParamStatus.Text = "已取消保存——先点『下载模型』或『浏览…』就位模型，再保存"
+          $lblParamStatus.ForeColor = $colInfo
+          return
+        }
+      }
+    }
     # 模型路径归本页管理（= llm_rerank.model_path）；与源码版同规则：
     # 空 或 等于默认路径 → 写注释占位（默认路径由 llm_filter 兜底）
     $mp = $cmbModel.Text.Trim()
@@ -1532,14 +1616,25 @@ function Run-InstallerGui {
     $note = $(if ($note.Count) { "（" + ($note -join "；") + "）" } else { "" })
     $installDir = Find-WeaselDir
     if ($installDir) {
+      # A2（2026-11-21）：部署结果按结构化状态反馈——此前失败判定靠"提示|失败|错误"
+      # 关键词正则，"请手动重新部署"这类消息不含关键词 → 被误报成成功
       $notes = New-Object System.Collections.Generic.List[string]
-      Invoke-Redeploy $installDir { param($t) [void]$notes.Add($t) }
-      $bad = @($notes | Where-Object { $_ -match '提示|失败|错误' })
-      if ($bad.Count) {
-        $lblParamStatus.Text = "$act$note；重新部署有提示：" + ($bad[-1] -replace '^\s+', '')
+      $rdT0 = Get-Date
+      $rd = Invoke-Redeploy $installDir { param($t) [void]$notes.Add($t) }
+      $rdSecs = [Math]::Round(((Get-Date) - $rdT0).TotalSeconds)
+      if ($rd -eq "ok") {
+        $lblParamStatus.Text = "$act $name$note，部署完成（$rdSecs 秒）——可以打字验证了"
+        $lblParamStatus.ForeColor = $colOk
+      } elseif ($rd -eq "background") {
+        $lblParamStatus.Text = "$act $name$note；部署仍在后台进行（通常 1 分钟内生效）——若长时间无效请托盘手动重新部署"
+        $lblParamStatus.ForeColor = $colInfo
+      } elseif ($rd -eq "manual" -or $rd -eq "failed") {
+        # 文案与源码版逐字一致（状态细节在日志行 [REDEPLOY=…] 里，不进界面）
+        $lblParamStatus.Text = "$act$note；自动重新部署未完成——请手动重新部署：托盘小狼毫 → 重新部署"
         $lblParamStatus.ForeColor = $colErr
       } else {
-        $lblParamStatus.Text = "$act $name$note 并触发重新部署——部署完成后参数生效"
+        $lblParamStatus.Text = "$act $name$note（测试模式：未重新部署）"
+        $lblParamStatus.ForeColor = $colInfo
       }
     } else {
       $lblParamStatus.Text = "$act$note；未找到小狼毫目录，请托盘手动重新部署"
@@ -1594,6 +1689,9 @@ function Run-InstallerGui {
   # 下载模型时路径框为空 = 落默认路径——完成后把实际落点回填到框里
   # （2026-11-17 用户反馈：下载完成后路径框仍是空的，不知道模型下到了哪）
   $script:DlFill = ""
+  # A5（2026-11-21）：下载进行中标志 + 目标快照（关窗确认 / 清理杀 curl 用）
+  $script:DlInProgress = $false
+  $script:DlTarget = ""
   $entryScript = Join-Path $PSScriptRoot "install_plugin.ps1"
   $actionDone = @{
     "copy-files"     = "文件复制完成（rime_llm.dll + lua 已部署，服务已重启）"
@@ -1609,6 +1707,14 @@ function Run-InstallerGui {
     if (-not $script:WorkDone) { return }
     $script:WorkDone = $false; $script:WorkOff = 0
     $script:WorkAction = $action
+    # A5（2026-11-21）：下载目标在点击时快照——关窗清理按快照杀 curl，不再按
+    # "当前路径框文本"（下载中改过输入框就杀不掉真正的下载进程 = 孤儿 curl 续写分片）
+    $script:DlTarget = ""
+    $script:DlInProgress = $false
+    if ($action -eq "download-model") {
+      $script:DlTarget = if ($modelPath) { $modelPath } else { $DEFAULT_MODEL }
+      $script:DlInProgress = $true
+    }
     # 记下"点下载时路径框是否为空"：空 = 落默认路径 → 成功后回填（见 DlFill 注释）
     $script:DlFill = $(if ($action -eq "download-model" -and -not $modelPath) { $DEFAULT_MODEL } else { "" })
     [void]$script:WorkText.Clear()
@@ -1630,6 +1736,7 @@ function Run-InstallerGui {
       $timer.Start()
     } catch {
       $script:WorkDone = $true; $script:WorkProc = $null
+      $script:DlInProgress = $false; $script:DlTarget = ""
       $form.Cursor = [System.Windows.Forms.Cursors]::Default
       $lblInstallStatus.Text = "[失败] 无法启动子进程：" + $_.Exception.Message
       $lblInstallStatus.ForeColor = $colErr
@@ -1650,7 +1757,8 @@ function Run-InstallerGui {
         $chunk = [Text.Encoding]::UTF8.GetString($buf, 0, $n)
         [void]$script:WorkText.Append($chunk)
         # 进度反馈：把子进程输出的最后一行（curl 百分比等）显示到状态行
-        $last = ($chunk -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
+        # （[REDEPLOY=…] 是机器可读行，不进状态行显示）
+        $last = ($chunk -split "`r?`n" | Where-Object { $_.Trim() -and $_ -notmatch '\[REDEPLOY=' } | Select-Object -Last 1)
         if ($last) {
           $last = $last.Trim()
           if ($last.Length -gt 110) { $last = $last.Substring(0, 110) + "…" }
@@ -1677,6 +1785,7 @@ function Run-InstallerGui {
     $script:WorkDone = $true
     $script:WorkProc = $null
     $script:WorkAction = ""
+    $script:DlInProgress = $false; $script:DlTarget = ""
     $form.Cursor = [System.Windows.Forms.Cursors]::Default
     Refresh-Ui
     Read-ParamsToUi
@@ -1697,8 +1806,22 @@ function Run-InstallerGui {
         Update-ModelStatus
       }
       $script:DlFill = ""
-      $lblInstallStatus.Text = $(if ($actionDone.ContainsKey($act)) { $actionDone[$act] } else { "完成" })
-      $lblInstallStatus.ForeColor = $colOk
+      $doneMsg = $(if ($actionDone.ContainsKey($act)) { $actionDone[$act] } else { "完成" })
+      # B2（2026-11-21）：真下载完成 → 状态行补"下一步"指引（"已存在"秒回分支不补）
+      if ($act -eq "download-model" -and ($text -match '下载完成:')) {
+        $doneMsg = $doneMsg + "——接着选方案、点『保存并生效』启用重排"
+      }
+      # A2（2026-11-21）：子进程动作里的重新部署结果按 [REDEPLOY=…] 机器可读行判定，
+      # 未完成（manual/failed/background）→ 绿字改红字提示手动重新部署
+      # （此前子进程把重部署警告吞掉，GUI 一律显示成功）
+      $rdTok = [regex]::Match($text, '\[REDEPLOY=(\w+)').Groups[1].Value
+      if ($rdTok -and $rdTok -ne "ok" -and $rdTok -ne "skipped") {
+        $lblInstallStatus.Text = "$doneMsg；自动重新部署未完成（$rdTok）——请托盘手动重新部署"
+        $lblInstallStatus.ForeColor = $colErr
+      } else {
+        $lblInstallStatus.Text = $doneMsg
+        $lblInstallStatus.ForeColor = $colOk
+      }
     }
   })
 
@@ -1724,14 +1847,17 @@ function Run-InstallerGui {
   $btnFiles.Add_Click({ Start-Work "copy-files" "" "" })
   $btnBench.Add_Click({ Start-Bench })
   $btnDownload.Add_Click({
-    # ① 已存在但明显偏小 → 先确认再覆盖（此前会被当成"已存在"直接跳过）
+    # ① 已存在但不完整 → 先确认再覆盖（A4 2026-11-21：默认名体量不符同样拦——
+    #    100~396MB 的半截此前会被当成"已存在"直接跳过）
     $target = $cmbModel.Text.Trim()
     if (-not $target) { $target = $DEFAULT_MODEL }
     if (Test-Path $target) {
       $len = (Get-Item $target).Length
-      if ($len -lt $MODEL_MIN_BYTES) {
+      if ((Get-ModelState $target) -eq "suspect") {
+        $isDef = [IO.Path]::GetFileName($target) -ieq $DEFAULT_MODEL_NAME
+        $why = if ($isDef) { "体量不符（{0} MB，完整模型应为 397 MB）" } else { "只有 {0} MB（疑似未下完或损坏）" }
         $ans = [System.Windows.Forms.MessageBox]::Show(
-          ("目标路径已有文件，但只有 {0:N0} MB（疑似未下完或损坏）：`n{1}`n`n删除它并重新下载？" -f ($len / 1MB), $target),
+          ("目标路径已有模型文件但" + $why + "：`n{1}`n`n删除它并重新下载？" -f [Math]::Round($len / 1e6), $target),
           "模型文件可疑", [System.Windows.Forms.MessageBoxButtons]::YesNo,
           [System.Windows.Forms.MessageBoxIcon]::Warning)
         if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
@@ -1759,6 +1885,21 @@ function Run-InstallerGui {
   })
   $btnParamSave.Add_Click({ Save-ParamsFromUi })
   $btnClose.Add_Click({ $form.Close() })
+  # A5（2026-11-21）：下载进行中关窗 → 先确认（此前直接关窗杀 curl，用户无感知，
+  # 可能以为下载在后台继续）。分片保留可续传，确认弹框里说明。
+  $form.Add_FormClosing({
+    param($s, $e)
+    if ($script:DlInProgress) {
+      $mbDone = 0
+      $tmp = if ($script:DlTarget) { $script:DlTarget + ".download" } else { "" }
+      if ($tmp -and (Test-Path $tmp)) { $mbDone = [Math]::Round((Get-Item $tmp).Length / 1e6) }
+      $ans = [System.Windows.Forms.MessageBox]::Show(
+        ("模型下载进行中（已下 $mbDone MB，分片保留可续传）。`n关闭将中止下载，确定关闭？"),
+        "下载进行中", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+      if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true }
+    }
+  })
   # 切方案 = 切配置（配置节在方案里）；重扫列表时的恢复选择被抑制。
   # ④ 有未保存改动时先问（否则切换会把界面改动静默丢掉）；选"否"把下拉拨回去
   $cmbSchema.Add_SelectedIndexChanged({
@@ -1827,8 +1968,10 @@ function Run-InstallerGui {
     # ② 关窗时把 curl 一并结束：下载动作的 curl 是"子进程的孙进程"，
     #    只杀包装 pwsh 会留下一个仍在写分片的孤儿（重开再点会变成两个写入者）。
     #    分片本身保留 → 下次点『下载模型』照样断点续传。
+    #    A5（2026-11-21）：目标按点击时快照杀——下载中改过路径框也杀得掉。
     try {
-      $dlTarget = if ($cmbModel) { $cmbModel.Text.Trim() } else { "" }
+      $dlTarget = $script:DlTarget
+      if (-not $dlTarget -and $cmbModel) { $dlTarget = $cmbModel.Text.Trim() }
       if (-not $dlTarget) { $dlTarget = $DEFAULT_MODEL }
       Stop-StaleDownloader ($dlTarget + ".download") $null | Out-Null
     } catch { }
