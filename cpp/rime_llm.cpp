@@ -1662,6 +1662,9 @@ struct AsyncTask {
     std::string fingerprint;
     std::string context;          // 上文原串（worker 内 token 化 + ctx_used）
     std::vector<std::string> cand_texts;
+    // 子词（PM，部分覆盖候选）清单（2026-11-23）：整句模式才有；只做 token
+    // 前缀复用评分（零 decode）与指纹绑定，不进评分窗
+    std::vector<std::string> pm_texts;
     std::chrono::steady_clock::time_point enq_at;
 };
 static AsyncTask g_async_task;
@@ -1673,6 +1676,8 @@ struct AsyncRes {
     std::vector<double> scores;
     std::vector<std::array<double, 3>> ce3;
     std::vector<std::string> segs;
+    std::vector<std::string> pm_texts;   // 子词文本（提交序）
+    std::vector<double> pm_scores;       // 子词复用分（-1e10 = 无前缀匹配）
     bool prep_hit = false;
     std::string ctx_used;
     double ev_ms = 0;
@@ -1680,12 +1685,22 @@ struct AsyncRes {
 static AsyncRes g_async_result;
 
 static std::string async_fingerprint(const char * context,
-                                     const std::vector<std::string> & cands) {
+                                     const std::vector<std::string> & cands,
+                                     const std::vector<std::string> & pm) {
     std::string fp = context ? context : "";
     fp.push_back('\x1f');
     for (size_t i = 0; i < cands.size(); i++) {
         if (i) fp.push_back('\x1e');
         fp += cands[i];
+    }
+    // 子词清单也绑进指纹（2026-11-23）：子词复用分与候选集属同一快照，
+    // 否则同 FM 不同 PM 的 query 会错命中缓存（与 lua make_fp 同构）
+    if (!pm.empty()) {
+        fp.push_back('\x1d');
+        for (size_t i = 0; i < pm.size(); i++) {
+            if (i) fp.push_back('\x1e');
+            fp += pm[i];
+        }
     }
     return fp;
 }
@@ -1726,12 +1741,56 @@ static void pack_async_result(lua_State * L, const AsyncRes & r) {
         lua_setfield(L, -2, r.cand_texts[i].c_str());
     }
     lua_setfield(L, -2, "segs");
+    // 子词复用分（2026-11-23）：text → score，无前缀匹配者不设（= nil）
+    lua_createtable(L, 0, (int)r.pm_texts.size());
+    for (size_t i = 0; i < r.pm_texts.size() && i < r.pm_scores.size(); i++) {
+        if (r.pm_scores[i] <= -1e9) continue;
+        lua_pushnumber(L, r.pm_scores[i]);
+        lua_setfield(L, -2, r.pm_texts[i].c_str());
+    }
+    lua_setfield(L, -2, "pm");
     lua_pushboolean(L, r.prep_hit ? 1 : 0);
     lua_setfield(L, -2, "prep");
     lua_pushstring(L, r.ctx_used.c_str());
     lua_setfield(L, -2, "ctx_used");
     lua_pushnumber(L, r.ev_ms);
     lua_setfield(L, -2, "ev_ms");
+}
+
+// 子词（PM，比等长词短的词典词）的零成本评分（2026-11-23 用户定案）：
+// 复用满覆盖（FM）评分窗已算好的 token 前缀 CE——PM 的前 k 个 token 与某个
+// FM 候选的前 k 个 token 逐位相同（k = min(PM token 数, 3)）时，其条件概率
+// 与 FM 的同位置分量完全相同（同一上文 + 同一前缀），直接取加权和即可，
+// 全程零 decode。无匹配（典型 = 单字 PM 而 FM 首 token 是多字 token）→
+// 哨兵 -1e10，子词块这些条目保引擎序殿后（不参与排序）。
+static void reuse_pm_scores(
+    const std::vector<std::vector<llama_token>> & fm_ids,
+    const std::vector<std::array<double, 3>> & fm_ce3,
+    const std::vector<std::string> & pm_texts,
+    std::vector<double> & out) {
+    static constexpr double W[3] = {1.0, 1.10, 0.60};  // 与 kCeW 同值
+    out.assign(pm_texts.size(), -1e10);
+    for (size_t p = 0; p < pm_texts.size(); p++) {
+        auto ids = tokenize(pm_texts[p].c_str());
+        if (ids.empty()) continue;
+        size_t need = ids.size() < 3 ? ids.size() : 3;
+        for (size_t f = 0; f < fm_ids.size(); f++) {
+            const auto & fm = fm_ids[f];
+            if (fm.size() < need) continue;
+            size_t k = 0;
+            for (; k < need; k++)
+                if (fm[k] != ids[k]) break;
+            if (k < need) continue;          // 前缀不同：不可复用
+            double s = 0;
+            bool ok = true;
+            for (size_t j = 0; j < need; j++) {
+                double v = fm_ce3[f][j];
+                if (!(v == v) || v <= -1e9) { ok = false; break; }
+                s += W[j] * v;
+            }
+            if (ok) { out[p] = -s; break; }  // 同前缀的 FM 分量相同，取首个
+        }
+    }
 }
 
 static void async_worker_loop() {
@@ -1812,6 +1871,13 @@ static void async_worker_loop() {
         auto t1 = std::chrono::high_resolution_clock::now();
         res.ev_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (done) {
+            // 子词复用评分（2026-11-23）：只用已算好的 FM token/CE 做前缀
+            // 匹配，零 decode——必须先于发布（面板/缓存统一读快照）
+            if (!task.pm_texts.empty()) {
+                reuse_pm_scores(cand_ids, res.ce3, task.pm_texts,
+                                res.pm_scores);
+                res.pm_texts = task.pm_texts;
+            }
             res.valid = true;
             std::lock_guard<std::mutex> lk(g_async_mu);
             g_async_result = std::move(res);
@@ -1841,6 +1907,19 @@ static int lua_async_submit(lua_State * L) {
         if (s && *s) cands.push_back(s);
         lua_pop(L, 1);
     }
+    // 第 4 参（可选，2026-11-23）：子词（PM）文本表——只做 token 前缀复用
+    // 评分（零 decode）与指纹绑定；字词模式不传（指纹格式保持不变）
+    std::vector<std::string> pm;
+    if (lua_istable(L, 4)) {
+        int pn = (int)luaL_len(L, 4);
+        if (pn > g_n_seq_max) pn = g_n_seq_max;
+        for (int i = 1; i <= pn; i++) {
+            lua_rawgeti(L, 4, i);
+            const char * s = lua_tostring(L, -1);
+            if (s && *s) pm.push_back(s);
+            lua_pop(L, 1);
+        }
+    }
     if ((int)cands.size() < 2 || !context || !*context) {
         lua_pushnil(L);   // 任务不成立（调用方走层1 序）
         return 1;
@@ -1861,9 +1940,10 @@ static int lua_async_submit(lua_State * L) {
         g_async_task.valid = true;
         g_async_task.gen = gen;
         g_async_task.immediate = immediate != 0;
-        g_async_task.fingerprint = fp = async_fingerprint(context, cands);
+        g_async_task.fingerprint = fp = async_fingerprint(context, cands, pm);
         g_async_task.context = context;
         g_async_task.cand_texts = std::move(cands);
+        g_async_task.pm_texts = std::move(pm);
         g_async_task.enq_at = std::chrono::steady_clock::now();
     }
     g_async_cv.notify_all();

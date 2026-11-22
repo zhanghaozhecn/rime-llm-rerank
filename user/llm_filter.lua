@@ -523,8 +523,16 @@ local function cache_trim()
     for _ in pairs(pending) do n = n + 1 end
     if n > 32 then pending = {} end
 end
-local function make_fp(context, cands)
-    return context .. "\x1f" .. table.concat(cands, "\x1e")
+-- 指纹（2026-11-22）：上文 \x1f 候选 \x1e 拼接；2026-11-23 追加子词清单
+-- （整句模式才有，\x1d 分隔）——子词复用分与候选集属同一快照，指纹必须
+-- 绑定，否则同 FM 不同 PM 的 query 会错命中缓存（与 DLL async_fingerprint
+-- 同构；字词模式 pm 为空 → 指纹格式保持不变）。
+local function make_fp(context, cands, pm)
+    local fp = context .. "\x1f" .. table.concat(cands, "\x1e")
+    if pm and #pm > 0 then
+        fp = fp .. "\x1d" .. table.concat(pm, "\x1e")
+    end
+    return fp
 end
 
 -- 收割点（2026-11-22）：回收最近完成的评分成果——回填缓存 + 补写挂账。
@@ -914,6 +922,19 @@ return function(translation, env)
             add_win(e)
         end
     end
+    -- 子词（PM，比等长词短的词典词）清单（2026-11-23 用户定案）：非满覆盖
+    -- 候选按引擎序去重——只用于"共用 FM 推理结果"的零成本排序与指纹绑定，
+    -- 不进评分窗（整句模式三块输出的第三块；关闭态无子词概念）
+    local pm_texts = {}
+    if sent_on then
+        local pm_seen = {}
+        for _, c in ipairs(all) do
+            if not is_fm(c) and not pm_seen[c.text] then
+                pm_seen[c.text] = true
+                pm_texts[#pm_texts + 1] = c.text
+            end
+        end
+    end
     local w_written = false
     -- 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在
     -- 生产里命中率极低（每个新词的上文都变），却要维护一整套失效逻辑（编辑键清
@@ -944,12 +965,12 @@ return function(translation, env)
     local sent_pending = false   -- 整句模式已投递挂账（本轮层1 序输出）
     local prep_flag = "0"
     if #cands >= 2 then
-        local fp = make_fp(context, cands)
+        local fp = make_fp(context, cands, pm_texts)
         snap = res_cache[fp]
         if snap and not snap.scores then snap = nil end
         if not snap and llm.async_submit then
             local okp, fp_r = pcall(llm.async_submit, context, cands,
-                                    not sent_on)
+                                    not sent_on, pm_texts)
             if okp and fp_r then
                 if sent_on then
                     -- 整句模式：0 LLM 投递即走（打字流畅优先——40ms 去抖 +
@@ -1169,6 +1190,51 @@ return function(translation, env)
             end)
             for i = 1, #arr do ordered[i] = arr[i].c end
         end
+        -- ═══ 子词块排序（2026-11-23 用户定案：共用等长词的推理结果，零成本）═══
+        -- PM 的前 k 个 token 与某个 FM 候选的前 k 个 token 逐位相同（k =
+        -- min(PM token 数, 3)）时，其条件概率与 FM 的同位置 CE 分量完全
+        -- 相同（同一上文 + 同一前缀）——DLL 在评分线程里用已算好的 FM
+        -- token 前缀做匹配（零 decode），快照 pm 表给出复用分。
+        -- 有复用分 → 与 FM 同款融合（CE + β·log1p(eff) + 累计 + pairfix）
+        -- 后按分降序（同分保引擎序）；无复用分（典型 = 单字 PM 而 FM 首
+        -- token 是多字 token）→ 保引擎序殿后；评分未就绪（挂账轮）或旧
+        -- DLL 无 pm 表 → 整块引擎序（旧行为不变）。
+        local pm_order = nil
+        if sent_on then
+            local pmsc = snap and snap.pm or nil
+            local pm_list, pidx = {}, {}
+            for _, c in ipairs(all) do
+                if not seen[c.text] and not is_fm(c) then
+                    pm_list[#pm_list + 1] = c
+                    pidx[c.text] = #pm_list
+                end
+            end
+            if pmsc and #pm_list > 0 then
+                local freq_eff2 = _G.user_freq_eff
+                local scored, unscored = {}, {}
+                for _, c in ipairs(pm_list) do
+                    local s = pmsc[c.text]
+                    if is_valid_llm_score(s) then
+                        local n = freq_eff2 and freq_eff2(c.text, code) or 0
+                        local u1 = _G.user_unigram_term
+                                and _G.user_unigram_term(c.text, code) or 0
+                        local t = s + FREQ_BETA * math.log(1 + n) + u1
+                                + pairfix_delta(pftbl, c.text, code)
+                        scored[#scored + 1] = { c = c, t = t,
+                                                idx = pidx[c.text] }
+                    else
+                        unscored[#unscored + 1] = c
+                    end
+                end
+                table.sort(scored, function(a, b)
+                    if a.t ~= b.t then return a.t > b.t end
+                    return a.idx < b.idx   -- 同分保引擎序
+                end)
+                pm_order = {}
+                for _, e in ipairs(scored) do pm_order[#pm_order + 1] = e.c end
+                for _, c in ipairs(unscored) do pm_order[#pm_order + 1] = c end
+            end
+        end
         -- 两码整句最终置顶块已删（2026-11-22 整句模式定案）：满覆盖候选已在
         -- 窗口准入时结构性占满评分窗（窗内全 FM），融合序即满覆盖组内序——
         -- 旧保险块对最终序恒 no-op，连同词长==⌊码长/2⌋ 判据一并退役。
@@ -1247,7 +1313,7 @@ return function(translation, env)
             end
             for i, c in ipairs(ordered) do live_c(c, i) end
             local tail_pos = #ordered
-            -- 尾窗 fin 位置与实际输出序一致（整句模式 = FM 窗外层1序 + PM 引擎序）
+            -- 尾窗 fin 位置与实际输出序一致（整句模式 = FM 窗外层1序 + 子词块）
             for _, e in ipairs(layer1) do
                 if not seen[e.c.text] and (not sent_on or is_fm(e.c)) then
                     tail_pos = tail_pos + 1
@@ -1255,11 +1321,18 @@ return function(translation, env)
                 end
             end
             if sent_on then
-                for _, c in ipairs(all) do
-                    if not seen[c.text] and not is_fm(c) then
-                        tail_pos = tail_pos + 1
-                        live_c(c, tail_pos)
+                local pm_emit = pm_order
+                if not pm_emit then
+                    pm_emit = {}
+                    for _, c in ipairs(all) do
+                        if not seen[c.text] and not is_fm(c) then
+                            pm_emit[#pm_emit + 1] = c
+                        end
                     end
+                end
+                for _, c in ipairs(pm_emit) do
+                    tail_pos = tail_pos + 1
+                    live_c(c, tail_pos)
                 end
             end
             -- debug P/D：只写语料没有的字段；词/候选序在语料 W，
@@ -1286,18 +1359,26 @@ return function(translation, env)
         -- 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment；
         -- 固定候选提示亦归拼读双拼 pin_filter.lua，2026-11-21 解耦）
         for _, c in ipairs(ordered) do yield(c) end
-        -- 整句模式（2026-11-22）：三块输出——FM 窗外按层1 序，PM 恒按引擎序
-        -- （保引擎"匹配在前、部分在后"不变量，层1 不再混合重排 PM）。
-        -- 关闭态保持旧行为：窗外全部按层1 序。
+        -- 整句模式（2026-11-22）：三块输出——FM 窗外按层1 序，子词块在最后
+        -- （保引擎"匹配在前、部分在后"不变量）。子词块序（2026-11-23）=
+        -- 有复用分者按融合分降序 + 无复用分者引擎序殿后（pm_order）；评分
+        -- 未就绪/旧 DLL → 整块引擎序。关闭态保持旧行为：窗外全部按层1 序。
         for _, e in ipairs(layer1) do
             if not seen[e.c.text] and (not sent_on or is_fm(e.c)) then
                 yield(e.c)
             end
         end
         if sent_on then
-            for _, c in ipairs(all) do
-                if not seen[c.text] and not is_fm(c) then yield(c) end
+            local pm_emit = pm_order
+            if not pm_emit then
+                pm_emit = {}
+                for _, c in ipairs(all) do
+                    if not seen[c.text] and not is_fm(c) then
+                        pm_emit[#pm_emit + 1] = c
+                    end
+                end
             end
+            for _, c in ipairs(pm_emit) do yield(c) end
         end
     else
         -- 评分未就绪/失败: 按层1 序展示。整句模式保持三块不变量

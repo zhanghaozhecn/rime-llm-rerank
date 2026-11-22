@@ -11,6 +11,9 @@
 --      精简）：旧键直升整句模式 + code_pattern 锁定（.{4} 旧值被覆盖，
 --      2 码即触发）+ 长度规则路径的 full_len_lt2 skip + 层1 序输出
 --      （smoke_tcs 场景 B 与本文件 E 同代码路径同断言，不再单测）
+--   G  子词复用排序（2026-11-23）：PM token 前缀命中 FM → 复用 CE 融合分
+--      参与排序（"错" 的 token 是 FM "错事/错失" 首 token → 有分），无前缀
+--      匹配的 PM（"混能"）保引擎序殿后
 -- 真 DLL + 真模型（Qwen3-0.6B base）；live_write 打桩截获管道行。
 -- C 行 1 基下标：C=1 eng=2 word=3 s1=4 ce=5 … full=9 cerank=10 fin=11 win=12
 package.cpath = [[build/Release/?.dll]]
@@ -270,5 +273,30 @@ assert(OUT[1].text == "一点点" and OUT[2].text == "一下子",
 assert(saw_skip("full_len_lt2"), "F2: 未发 S|full_len_lt2")
 assert(#crows() == 0, "F2: 不应有 C 行（整窗跳过）")
 print("[smoke] F 旧键迁移 + 锁定 + 长度规则 skip OK")
+
+-- ═══ 场景 G：子词（PM）复用 FM 推理结果的零成本排序（2026-11-23）═══
+-- 候选：FM = 错事 / 错失（Qwen3-0.6B 下"错事"= 2 token [错][事]），
+-- PM 引擎序 = 混能 / 错。DLL 用 FM 已算 token 前缀匹配：PM "错" 的 token
+-- 与 FM 首 token 相同 → 复用 ce1 得融合分；"混能" 前缀不匹配 → 无分。
+-- 期望：PM 块 = 错（有分在前）+ 混能（无分引擎序殿后）——与引擎序相反。
+-- 用新候选词隔离指纹（同候选会命中前面场景缓存）。
+sent_run({
+    mkc("错事", 0, 6), mkc("错失", 0, 6), mkc("混能", 0, 3), mkc("错", 0, 3),
+  }, "cuoshi", { start = 0, _end = 6 })
+assert(#OUT == 4, "G: yield count=" .. #OUT)
+local gtop2 = OUT[1].text .. "," .. OUT[2].text
+assert(gtop2 == "错事,错失" or gtop2 == "错失,错事",
+    "G: FM 未置顶: " .. gtop2)
+assert(OUT[3].text == "错", "G: 有复用分的子词应排 PM 块首: " ..
+    OUT[3].text .. "," .. OUT[4].text)
+assert(OUT[4].text == "混能", "G: 无复用分子词应引擎序殿后: " ..
+    OUT[3].text .. "," .. OUT[4].text)
+-- 复核复用分确实来自前缀匹配（而非巧合保序）：PM "错" 必须有分
+local sawc = false
+for _, f in ipairs(crows()) do
+  if f[3] == "错" then sawc = true end
+end
+assert(sawc, "G: 缺 PM 行")
+print("[smoke] G 子词复用排序 OK")
 
 print("[smoke] SMOKE-SENTENCE-MODE OK")
