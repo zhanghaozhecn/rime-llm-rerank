@@ -111,36 +111,88 @@ local stats_dirty = 0
 local function freq_key(word, code)
     return word .. "\t" .. (code or "")
 end
--- 账本路径（2026-11-21 用户定案）：用户文件夹下 llm_rerank 子目录收纳
--- 全部 LLM 数据/日志（固定候选 pin_candidates.tsv 属拼读双拼本机功能，
--- 仍留根）。resolve：子目录已有 → 用之；根目录旧账本在 → 建目录后
--- os.rename 一次性迁移（目录建不出/改名失败 → 暂读暂写根目录，下次再迁，
--- 绝不丢数据）。目录由 rime_llm.dll ensure_dir 建立（rime-lua 无 mkdir）。
+-- 账本路径（2026-11-22 用户定案：四件全分）：账本按方案分目录
+-- <用户文件夹>\llm_rerank\<方案 ID>\user_ledger.tsv。账本属"有状态资产"：
+-- 该方案首次读写时从旧位置（llm_rerank 根 / 用户文件夹根）**复制**一份
+-- （旧文件保留不删）——每个方案各得一份快照，此后独立演进；键 = 词+码，
+-- 码与方案绑定、天然不相交，历史条目跨方案共存无害。目录由
+-- rime_llm.dll ensure_dir 建立（rime-lua 无 mkdir，单层 → 父/子两次）。
 local function llm_dir_ensure(dir)
     local ok, cpp = pcall(require, "rime_llm")
     if not ok or not cpp or not cpp.ensure_dir then return false end
     local ok2, made = pcall(cpp.ensure_dir, dir)
     return ok2 and made == true
 end
-local function ledger_file()
+
+local function schema_safe(sid)
+    if type(sid) ~= "string" or sid == "" then return "" end
+    sid = sid:gsub("[^%w_%.%-]", "_")
+    if #sid > 64 then sid = sid:sub(1, 64) end
+    return sid
+end
+
+local function rerank_root()
     local ok, ud = pcall(function() return rime_api.get_user_data_dir() end)
-    if not ok or type(ud) ~= "string" or ud == "" then
+    if not ok or type(ud) ~= "string" or ud == "" then return nil, ud end
+    return ud .. "\\llm_rerank", ud
+end
+
+-- 方案目录；方案不可得 → llm_rerank 根（部署期/冒烟桩）
+local function rerank_dir()
+    local root = rerank_root()
+    if not root then return nil end
+    local sid = schema_safe(_G.llm_schema_id)
+    return sid ~= "" and (root .. "\\" .. sid) or root
+end
+
+local function dir_ensure2(dir)
+    local root = rerank_root()
+    if root then llm_dir_ensure(root) end
+    return llm_dir_ensure(dir)
+end
+
+local function file_copy(src, dst)
+    local fi = io.open(src, "rb")
+    if not fi then return false end
+    local fo = io.open(dst, "wb")
+    if not fo then fi:close() return false end
+    while true do
+        local chunk = fi:read(65536)
+        if not chunk then break end
+        fo:write(chunk)
+    end
+    fi:close()
+    fo:close()
+    return true
+end
+
+-- sid 省略 = 当前方案；方案不可得 → llm_rerank 根（部署期/冒烟桩）；
+-- 用户目录不可得 → %TEMP%（旧行为）
+local function ledger_file(sid)
+    local root, ud = rerank_root()
+    if not root then
         local tmp = os.getenv("TEMP") or "C:\\Windows\\Temp"
         return tmp .. "\\user_ledger.tsv"
     end
-    local dir = ud .. "\\llm_rerank"
+    sid = schema_safe(sid or _G.llm_schema_id)
+    local dir = sid ~= "" and (root .. "\\" .. sid) or root
     local new = dir .. "\\user_ledger.tsv"
     local f = io.open(new, "rb")
     if f then f:close() return new end
-    local old = ud .. "\\user_ledger.tsv"
-    local g = io.open(old, "rb")
-    if g then
-        g:close()
-        if llm_dir_ensure(dir) and os.rename(old, new) then return new end
-        return old
+    -- 旧位置 1 = llm_rerank 根（方案层还不存在时）；旧位置 2 = 用户文件夹根
+    local legacy = {}
+    if dir ~= root then legacy[#legacy + 1] = root .. "\\user_ledger.tsv" end
+    legacy[#legacy + 1] = ud .. "\\user_ledger.tsv"
+    for _, old in ipairs(legacy) do
+        local g = io.open(old, "rb")
+        if g then
+            g:close()
+            if dir_ensure2(dir) and file_copy(old, new) then return new end
+            return old          -- 复制失败：暂用旧位置，下次再试
+        end
     end
-    if llm_dir_ensure(dir) then return new end
-    return old
+    if dir_ensure2(dir) then return new end
+    return ud .. "\\user_ledger.tsv"
 end
 local function has_non_ascii(w)
     return w:match("[^\1-\127]") ~= nil
@@ -202,10 +254,13 @@ local function stats_load_legacy_uni()
     end
     f:close()
 end
-local function stats_load()
+local stats_schema = nil   -- 内存账本所属方案（切方案时落盘旧账本再重载）
+local function stats_load(sid)
+    sid = schema_safe(sid or _G.llm_schema_id)
     _G.user_stats = _G.user_stats or {}
+    stats_schema = sid
     local tick = nil
-    local f = io.open(ledger_file(), "r")
+    local f = io.open(ledger_file(sid), "r")
     if f then
         local maxt = 0
         for line in f:lines() do
@@ -238,8 +293,8 @@ local function stats_load()
     end
     _G.user_freq_tick = tick or _G.user_freq_tick or 0
 end
-local function stats_save()
-    local f = io.open(ledger_file(), "w")
+local function stats_save(sid)
+    local f = io.open(ledger_file(sid or stats_schema), "w")
     if f then
         f:write("#tick=" .. (_G.user_freq_tick or 0) .. "\n")
         -- 列含义注释（2026-11-20 起每帧自带；读取端跳过一切 # 行）
@@ -260,6 +315,17 @@ local function stats_save()
         f:close()
     end
 end
+-- 账本方案同步（2026-11-22 分目录）：每键由 processor 入口调用。
+-- 切方案 → 旧方案内存账本先落盘（写到**旧方案**目录），清空后载入新方案
+-- 账本（首次 = 从旧位置复制快照）。同方案 = 字符串比较即返回，零开销。
+local function stats_ensure_schema()
+    local sid = schema_safe(_G.llm_schema_id)
+    if _G.user_stats and stats_schema == sid then return end
+    if _G.user_stats then stats_save(stats_schema) end
+    _G.user_stats = nil
+    stats_load(sid)
+end
+
 local function stats_bump(word, code)
     if not has_non_ascii(word) then return end
     -- 纯标点提交不入账（2026-11-20 用户定案：带标点行从账本删除）——
@@ -267,7 +333,7 @@ local function stats_bump(word, code)
     -- 修剪线；连 tick 也不推（更同源 rime userdb "词条提交才推 tick"）。
     -- 退款弹栈照常（无账目 → 不退）。含中文词条不受影响。
     if not has_cjk(word) then return end
-    if not _G.user_stats then stats_load() end
+    stats_ensure_schema()
     _G.user_freq_tick = (_G.user_freq_tick or 0) + 1
     local k = freq_key(word, code)
     local e = _G.user_stats[k]
@@ -298,7 +364,7 @@ end
 -- 被杀进程吞掉就白退）；退款后 cum=0 的错词由既有修剪规则自然淘汰。
 _G.stats_refund = function(word, code, tick)
     if not has_non_ascii(word) then return false end
-    if not _G.user_stats then stats_load() end
+    stats_ensure_schema()
     local e = _G.user_stats[freq_key(word, code)]
     local h = e and e.hist and e.hist[#e.hist]
     if not h or h.tick ~= tick then return false end
@@ -325,7 +391,7 @@ end
 
 -- 衰减有效计数 (llm_filter 融合用): rime formula_d 查询式 (词码对)
 _G.user_freq_eff = function(w, code)
-    if not _G.user_stats then stats_load() end
+    stats_ensure_schema()
     local e = _G.user_stats[freq_key(w, code)]
     if not e or e.d <= 0 then return 0 end
     return e.d * math.exp((e.t - (_G.user_freq_tick or e.t)) / FREQ_TAU)
@@ -338,14 +404,14 @@ end
 -- 累计计数与衰减计数同存 user_ledger.tsv 的 cum 列（2026-11-17 合并）；
 -- n_seen 连记录一并取消（不参与打分，无消费方）。
 _G.user_unigram_term = function(x, code)
-    if not _G.user_stats then stats_load() end
+    stats_ensure_schema()
     local e = _G.user_stats[freq_key(x, code)]
     return math.log(((e and e.c or 0) + 1))
 end
 
 -- 累计 unigram 原始计数（llm_filter 调试行"累计频"列 / pairfix fade 门用）
 _G.user_uni_count = function(x, code)
-    if not _G.user_stats then stats_load() end
+    stats_ensure_schema()
     local e = _G.user_stats[freq_key(x, code)]
     return e and e.c or 0
 end
@@ -367,6 +433,14 @@ end
 
 local function processor(key, env)
     if key:release() then return 2 end
+
+    -- 当前方案 ID（2026-11-22 按方案分文件夹）：每键刷新，账本/日志按方案
+    -- 选子目录；切方案时 stats_ensure_schema 落盘旧账本并载入新账本
+    do
+        local sid = env.engine.schema and env.engine.schema.schema_id
+        if sid and sid ~= "" then _G.llm_schema_id = sid end
+        stats_ensure_schema()
+    end
 
     -- [简码/顶屏码补录]（2026-11-21）: commit_notifier 在 composition 清空
     -- (Clear) 前触发, c.input 即本次提交的完整输入码（简码 1-2 码也完整）
@@ -400,13 +474,25 @@ local function processor(key, env)
         if not llm_prep then
             local ok, result = pcall(require, "rime_llm")
             if ok then
-                -- 日志目录: RIME 用户目录 llm_rerank 子目录（2026-11-21 起；
-                -- 与 filter 共用同一模块实例；dll 设置端顺手建目录）
-                local okd, ud = pcall(function() return rime_api.get_user_data_dir() end)
-                if okd and ud and ud ~= "" then
-                    result.log_dir = ud .. "\\llm_rerank"
+                -- 日志目录: RIME 用户目录 llm_rerank\<方案> 子目录（2026-11-22
+                -- 按方案分文件夹；与 filter 共用同一模块实例；dll 设置端建目录）
+                local sdir = rerank_dir()
+                if sdir then
+                    dir_ensure2(sdir)
+                    result.log_dir = sdir
+                    _G.llm_log_dir = sdir
                 end
                 llm_prep = result
+            end
+        end
+        -- 方案切换：DLL 日志目录跟随当前方案（g_log_dir 进程级，只在首次
+        -- require 时设 → 切方案后 X 行会继续写旧目录）
+        if llm_prep then
+            local sdir = rerank_dir()
+            if sdir and _G.llm_log_dir ~= sdir then
+                dir_ensure2(sdir)
+                llm_prep.log_dir = sdir
+                _G.llm_log_dir = sdir
             end
         end
         -- model_path 每键轻量同步（仅变化时写，2026-08-31 修配置不生效的
@@ -626,7 +712,7 @@ local function processor(key, env)
                 -- 2026-11-13 词码对记账: bump 键 = (词, 完整提交码)
                 -- 2026-11-17 单账本: dee 与累计计数同一次 bump/落盘
                 if has_chinese then
-                    if not _G.user_stats then stats_load() end
+                    stats_ensure_schema()
                     local before = _G.user_freq_eff and _G.user_freq_eff(w, code) or 0
                     local t_before = _G.user_freq_tick or 0
                     stats_bump(w, code)

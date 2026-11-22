@@ -42,17 +42,20 @@ approx(_G.user_unigram_term("忽略", "x"), math.log(1), "旧行类型忽略")
 approx(_G.user_freq_eff("键", "jki"), 2.0, "eff(键,jki)=2.0 同账本")
 approx(_G.user_freq_eff("键", "jk"), 0, "eff(键,jk) 异码无史")
 
--- 子目录迁移断言: 根目录旧账本已被一次性迁入 llm_rerank/
--- （探测句柄必须关闭——Windows 句柄锁会令后续 os.remove 失败）
+-- 子目录迁移断言（2026-11-22 四件全分语义修订：有状态资产 = **复制**快照，
+-- 旧文件保留——多个方案各自复制一份，不能 move 走让后来者无源可复制）
 local mig = io.open(SMK .. "\\llm_rerank\\user_ledger.tsv", "r")
-assert(mig, "账本未迁移到 llm_rerank 子目录")
+assert(mig, "账本未复制到 llm_rerank 子目录")
 mig:close()
-assert(io.open(SMK .. "\\user_ledger.tsv", "r") == nil,
-       "根目录旧账本应已迁走")
-print("[smoke] 账本迁移 llm_rerank/ 子目录 OK")
+local oldl = io.open(SMK .. "\\user_ledger.tsv", "r")
+assert(oldl, "根目录旧账本应保留（复制迁移，不再 move）")
+oldl:close()
+print("[smoke] 账本复制迁移 llm_rerank/ 子目录 OK（旧文件保留）")
 
 -- 旧两账本一次性迁移: cum = max(eff.commits, uni), 只对含中文词条
 os.remove(SMK .. "\\llm_rerank\\user_ledger.tsv")
+os.remove(SMK .. "\\user_ledger.tsv")   -- 复制迁移后旧文件保留：这里显式清掉，
+                                        -- 才能走到 eff/unigram 旧账迁移分支
 pf = io.open(SMK .. "\\user_eff.tsv", "w")
 pf:write("#tick=100\n")
 pf:write("键\tjki\t5\t2.000\t100\n")   -- commits=5 > uni=2

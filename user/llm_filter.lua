@@ -65,31 +65,100 @@ local function llm_dir_ensure(dir)
     return ok2 and made == true
 end
 
-local function llm_resolve(name, for_write)
+-- ── 按方案分文件夹（2026-11-22 用户定案：四件全分）──────────────────
+-- 目录 = <用户文件夹>\llm_rerank\<方案 ID>\，四个文件全部按方案隔离：
+--   rime_llm_corpus.tsv / rime_llm_debug.txt / user_ledger.tsv /
+--   llm_pairfix.tsv
+-- 迁移规则（"有状态资产"与"日志"区别对待）：
+--   · 账本/词码对 = 有状态资产 → 该方案**首次读写时从旧位置复制一份**
+--     （旧位置 = llm_rerank\<名> 或 用户文件夹根\<名>），旧文件保留不删；
+--     每个方案各得一份快照，此后独立演进（键 = 词+码，与方案绑定、天然
+--     不相交，历史条目跨方案共存无害）。
+--   · corpus/debug = 日志 → 不复制（否则每方案各背一份全量历史、违背
+--     分目录初衷）；该方案下从空文件开始写，旧混合日志留作历史。
+-- 方案 ID 不可得 → "unknown"（部署期等边缘场景，同样隔离不污染根）。
+local function schema_safe(sid)
+    if type(sid) ~= "string" or sid == "" then return "" end
+    sid = sid:gsub("[^%w_%.%-]", "_")
+    if #sid > 64 then sid = sid:sub(1, 64) end
+    return sid
+end
+
+local function rerank_root()
     local ud = llm_user_dir()
     if not ud or ud == "" then return nil end
-    local dir = ud .. "\\llm_rerank"
+    return ud .. "\\llm_rerank"
+end
+
+-- 当前方案记录目录（每键由 filter/processor 写入 _G.llm_schema_id）
+-- 方案不可得（部署期/冒烟桩）→ nil，调用方退回 llm_rerank 根（旧行为）
+local function rerank_dir()
+    local root = rerank_root()
+    if not root then return nil end
+    local sid = schema_safe(_G.llm_schema_id)
+    if sid == "" then return nil end
+    return root .. "\\" .. sid
+end
+
+local function file_copy(src, dst)
+    local fi = io.open(src, "rb")
+    if not fi then return false end
+    local fo = io.open(dst, "wb")
+    if not fo then fi:close() return false end
+    while true do
+        local chunk = fi:read(65536)
+        if not chunk then break end
+        fo:write(chunk)
+    end
+    fi:close()
+    fo:close()
+    return true
+end
+
+local function dir_ensure2(dir)
+    -- ensure_dir 只建单层：父目录 llm_rerank 先建，再建方案层
+    local root = rerank_root()
+    if root then llm_dir_ensure(root) end
+    return llm_dir_ensure(dir)
+end
+
+local function llm_resolve(name, for_write, migrate)
+    local root = rerank_root()
+    if not root then
+        -- 用户目录不可得：退回 %TEMP%（与旧行为一致，不进方案目录）
+        local tmp = os.getenv("TEMP") or "C:\\Windows\\Temp"
+        return tmp .. "\\" .. name
+    end
+    local sid = schema_safe(_G.llm_schema_id)
+    -- 方案不可得 → 直接用 llm_rerank 根（部署期/冒烟桩；旧行为）
+    local dir = sid ~= "" and (root .. "\\" .. sid) or root
     local new = dir .. "\\" .. name
     local f = io.open(new, "rb")
     if f then f:close() return new end
-    local old = ud .. "\\" .. name
-    local g = io.open(old, "rb")
-    if g then
-        g:close()
-        if for_write and llm_dir_ensure(dir) and os.rename(old, new) then
-            os.remove(old .. ".old")    -- 顺迁 .old 轮转副本（无则无操作）
-            os.rename(old .. ".old", new .. ".old")
-            return new
+    -- 旧位置 1 = llm_rerank 根（方案层还不存在时）；旧位置 2 = 用户文件夹根
+    local legacy = {}
+    if dir ~= root then legacy[#legacy + 1] = root .. "\\" .. name end
+    legacy[#legacy + 1] = (llm_user_dir() or "") .. "\\" .. name
+    if migrate then
+        for _, old in ipairs(legacy) do
+            local g = io.open(old, "rb")
+            if g then
+                g:close()
+                if dir_ensure2(dir) and file_copy(old, new) then
+                    return new
+                end
+                return old   -- 复制失败：暂读旧位置，下次再试
+            end
         end
-        return old                      -- 读场景 / 目录未就绪：暂用根目录
     end
-    if for_write and llm_dir_ensure(dir) then return new end
-    return for_write and old or nil
+    if for_write and dir_ensure2(dir) then return new end
+    return nil
 end
 
 -- 读参考表 → { ["词\t码"] = 有符号分数 }; 无文件返回 nil（机制休眠）
 local function pairfix_table()
-    local path = llm_resolve("llm_pairfix.tsv", false)
+    -- migrate=true：词码对属有状态资产，该方案首次读取时从旧位置复制
+    local path = llm_resolve("llm_pairfix.tsv", false, true)
     if not path then return nil end
     local f = io.open(path, "r")
     if not f then return nil end
@@ -544,10 +613,15 @@ local function load_llm(env)
         cpp.max_ctx    = cfg.max_tokens
         -- min_tokens 不设置：固定用 C++ 默认 1（用户配置面已移除，2026-09-30）
         if cfg.cpu_cores then cpp.n_threads = cfg.cpu_cores end
-        -- 日志目录: RIME 用户目录 llm_rerank 子目录（2026-11-21 记录文件
-        -- 收进子目录；dll 设置端顺手建目录，未设置时 C++ 回退 %TEMP%）
-        local okd, ud = pcall(llm_user_dir)
-        if okd and ud and ud ~= "" then cpp.log_dir = ud .. "\\llm_rerank" end
+        -- 日志目录: RIME 用户目录 llm_rerank\<方案> 子目录（2026-11-22 按
+        -- 方案分文件夹；dll 设置端建目录，未设置时 C++ 回退 %TEMP%）。
+        -- 方案不可得时退回 llm_rerank 根（旧行为）
+        local sdir = rerank_dir() or rerank_root()
+        if sdir then
+            dir_ensure2(sdir)
+            cpp.log_dir = sdir
+            _G.llm_log_dir = sdir
+        end
         llm = cpp
         llm_loaded_for = true
     end
@@ -555,6 +629,10 @@ end
 
 local function init_config(env)
     local sc = env.engine.schema.config
+    -- 当前方案 ID（2026-11-22 分目录）：每键刷新，供 llm_resolve 选子目录。
+    -- 不可得 → nil，schema_safe 兜底 "unknown"（不污染根目录）
+    local sid0 = env.engine.schema and env.engine.schema.schema_id
+    if sid0 and sid0 ~= "" then _G.llm_schema_id = sid0 end
     -- 编码匹配模式（2026-09-30 取代 min/max_code_len）：get_string 未配置返回
     -- nil，配置了空串则视为"总是匹配"（与源码版一致）
     local pat = sc:get_string("llm_rerank/code_pattern")
@@ -587,10 +665,12 @@ local function init_config(env)
     -- 覆盖（手改 yaml 也不生效）；off 时方案节值生效
     if cfg.sentence_mode then cfg.code_pattern = '.{2,}' end
     _G.llm_debug_enabled = cfg.debug_fusion
-    if not _G.llm_h_written then
-        _G.llm_h_written = true
-        local sid = (env.engine.schema and env.engine.schema.schema_id)
-                    or "unknown"
+    -- H 行（进程/方案配置起点）：按方案各写一次——分目录后每个方案的语料
+    -- 文件需要自己的 H 行，切方案时不得跳过（旧 one-shot 只写首方案）
+    local sid = (env.engine.schema and env.engine.schema.schema_id)
+                or "unknown"
+    if _G.llm_h_written ~= sid then
+        _G.llm_h_written = sid
         local mp = sc:get_string("llm_rerank/model_path") or ""
         _G.llm_write_h(sid, mp)
     end
@@ -649,6 +729,18 @@ return function(translation, env)
     -- 改每调用重读后与 enabled 同模式；配置树查询微秒级，无性能顾虑
     init_config(env)
 
+    -- DLL 日志目录跟随当前方案（2026-11-22 分目录）：g_log_dir 是进程级，
+    -- load_llm 只在首次加载时设一次 → 切方案后 X 行会继续写旧方案目录。
+    -- 这里按方案变化刷新（字符串比较级开销）
+    if llm then
+        local sdir = rerank_dir()
+        if sdir and _G.llm_log_dir ~= sdir then
+            dir_ensure2(sdir)
+            llm.log_dir = sdir
+            _G.llm_log_dir = sdir
+        end
+    end
+
     local input = env.engine.context.input or ""
     -- 整句模式取码（2026-11-22）：活动段切片。多段续打（前段已选定）时
     -- code_pattern 匹配/词频键/语料 W.code 都随切片；单段组合 = 全串
@@ -657,15 +749,19 @@ return function(translation, env)
     local code = input:sub(seg_start + 1, seg_end)
     local all = {}
     -- 限量收集（2026-11-22 卡死修复）：旧 while 全量收集强制引擎一次性
-    -- 完整翻译所有候选——朙月大词库歧义/部分码串的 completion 候选海量，
-    -- 单码秒级 CPU（enabled=false 对照实测 40 倍差）→ 每键卡死。截断后
-    -- 引擎惰性停在当前位置；层1 词频选窗在 256 内仍有效（用户提频词在
-    -- 候选前列）。break 即不再拉取，exhausted 不触发。
-    -- 双重限制（源码版同构）：256 上限 + 100ms 时间预算（大词库早停）
+    -- 完整翻译所有候选——朙月大词库的候选爆炸主要来自连续声母简拼
+    -- （全拼串的 completion 有限，简拼串海量），单码秒级 CPU
+    -- （enabled=false 对照实测 40 倍差）→ 每键卡死。截断后引擎惰性
+    -- 停在当前位置。break 即不再拉取，exhausted 不触发。
+    -- 双重限制（源码版同构）：32 上限 + 30ms 时间预算（个数闸管收多少、
+    -- 预算闸管贵不贵）。上限取 32（2026-11-22 用户定案）：全拼打字正确
+    -- 候选大部分本就在引擎前 10，且 Rime user_dict 自带用户调频——打过的
+    -- 词引擎自己会提前，层1 全量收集的边际价值可忽略（与 ledger 证据链
+    -- 重叠）；窗口 6 + 满覆盖组 + 翻页余量 = 32 足够。
     local collect_start = os.clock()
     for cand in translation:iter() do
         table.insert(all, cand)
-        if #all >= 256 then break end
+        if #all >= 32 then break end
         if (os.clock() - collect_start) > 0.03 then break end
     end
     local ctx_text, ctx_src = "", "rime"
