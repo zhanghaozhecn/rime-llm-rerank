@@ -62,7 +62,7 @@ engine:
   Assert "enabled: true" (($f | Where-Object { $_ -match '^\s+enabled: true\s*$' }).Count -eq 1)
   Assert "模板无 com_context（配置项已删）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
   Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
-  Assert "two_code_sentence: false（默认关闭）" (($f | Where-Object { $_ -match '^\s+two_code_sentence: false\s*$' }).Count -eq 1)
+  Assert "sentence_mode: false（默认关闭，2026-11-22 取代 two_code_sentence）" (($f | Where-Object { $_ -match '^\s+sentence_mode: false\s*$' }).Count -eq 1)
   Assert "无 expected_length_weight（elw 退役 2026-11-07）" (($f | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
   Assert "code_pattern: '.{4}'（默认）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\.\{4\}'" }).Count -eq 1)
 
@@ -99,9 +99,10 @@ llm_rerank:
   $f = Get-Content $test -Encoding UTF8
   Assert "残留 freq_beta 行已剥（标定产物退出配置面）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "残留 expected_length_weight 行已剥（elw 退役）" (($f | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
-  Assert "two_code_sentence 保留 true" (($f | Where-Object { $_ -match '^\s+two_code_sentence: true\s*$' }).Count -eq 1)
+  Assert "sentence_mode: true（旧键 two_code_sentence 迁移，2026-11-22）" (($f | Where-Object { $_ -match '^\s+sentence_mode: true\s*$' }).Count -eq 1)
+  Assert "旧键 two_code_sentence 已剥（整句模式改名）" (($f | Where-Object { $_ -match 'two_code_sentence' }).Count -eq 0)
   Assert "max_tokens 保留 12" (($f | Where-Object { $_ -match '^\s+max_tokens: 12\s*$' }).Count -eq 1)
-  Assert "code_pattern 保留 [abcde]{4}（单引号保留）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\[abcde\]\{4\}'\s*$" }).Count -eq 1)
+  Assert "code_pattern 锁定 .{2,}（整句模式 on 迁移，2026-11-22）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\.\{2,\}'\s*$" }).Count -eq 1)
   Assert "残留 min_tokens 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'min_tokens' }).Count -eq 0)
   Assert "残留 min_code_len 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'min_code_len' }).Count -eq 0)
   Assert "残留 max_code_len 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'max_code_len' }).Count -eq 0)
@@ -239,7 +240,8 @@ public class W {
     return $t.Contains($needle)
   }
   # 单页界面（2026-09-30 定案）参数框 = 三个参数分组框里的 EDIT。
-  # 判据：EDIT 的**直接父窗口文本** ∈ {触发条件, 推理规模, 候选排序融合}
+  # 判据：EDIT 的**直接父窗口文本** ∈ {触发条件, 推理规模}
+  #   （2026-11-22 起「候选排序融合」组取消、整句模式移入触发条件）
   #   —— 天然排除「模型路径」下拉框内嵌的 EDIT（其父是 ComboBox）。
   # 跨进程读控件文本必须走 WM_GETTEXT（GetWindowText 对无 caption 的子控件
   #   返回空串；见顶层 AGENTS 关键坑 10）。
@@ -248,7 +250,7 @@ public class W {
         if ($_.cls -notmatch '\.Edit\.') { return $false }
         if ($_.parent -eq [IntPtr]::Zero) { return $false }
         $ptxt = Get-WText $_.parent
-        return (@('触发条件', '推理规模', '候选排序融合') -contains $ptxt)
+        return (@('触发条件', '推理规模') -contains $ptxt)
       } | Sort-Object y, x)
   }
   function Set-Edit($e, [string]$v) { [void][W]::SendMsgStr($e.h, 0x000C, [IntPtr]::Zero, $v) }  # WM_SETTEXT
@@ -341,8 +343,8 @@ public class W {
   Assert "cpu_cores = 4" ((Get-WText $e[3].h) -eq "4")
   Assert "「用户词频权重」行已移除（β 退出配置面）" (-not (Has-Text "用户词频权重"))
   Assert "「预期词长权重」行已移除（elw 退役）" (-not (Has-Text "预期词长权重"))
-  Assert "「两码整句」复选框已就位" (Has-Text "两码整句 two_code_sentence")
-  Assert "「候选排序融合」组仍在（两码整句复选框）" (Has-Text "候选排序融合")
+  Assert "「整句模式」复选框已就位（不带英文键名）" (Has-Text "整句模式")
+  Assert "「候选排序融合」组已取消（整句模式移入触发条件，2026-11-22）" (-not (Has-Text "候选排序融合"))
   # 复选框状态不在此断言：BM_GETCHECK 跨进程读不到 WinForms 主题复选框的
   # 内部态（渲染/保存均正确，2026-09-29 截图+落盘双验证）——复选框断言
   # 统一走 BM_CLICK 切换 + 保存落盘（G4 读入态保持 / G7 点击翻转）
@@ -415,7 +417,7 @@ llm_rerank:
 '@ | Out-File -FilePath $test -Encoding ascii
   Reload-Params
   Assert "状态含 已加载" (Any-Text "已加载")
-  Assert "code_pattern = .{3,4}" ((Get-WText $e[0].h) -eq ".{3,4}")
+  Assert "code_pattern 锁定显示 .{2,}（整句模式 on，原 .{3,4} 被覆盖）" ((Get-WText $e[0].h) -eq ".{2,}")
   Assert "max_tokens = 12" ((Get-WText $e[1].h) -eq "12")
   Assert "cpu_cores = 6" ((Get-WText $e[3].h) -eq "6")
 
@@ -459,8 +461,7 @@ engine:
   Set-Edit $e[1] "12"     # 复原
   Read-Host 2>$null | Out-Null
 
-  Write-Host "== G4: 保存（mode→[abcde]{4}；复选框按读入态原样落盘；freq_beta 旧行被剥）=="
-  Set-Edit $e[0] "[abcde]{4}"
+  Write-Host "== G4: 保存（整句模式 on → code_pattern 锁定 .{2,}；复选框按读入态落盘；freq_beta 旧行被剥）=="
   Click-Btn (Find-Button "保存并生效")
   [void](Dismiss-Prompt "是")   # A1 确认框（同 G2）
   Assert "状态含 已保存（A2 部署反馈改版后措辞）" (Any-Text "已保存")
@@ -470,11 +471,12 @@ engine:
   Assert "残留 com_context 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
   Assert "残留 freq_beta 行已剥（标定产物退出配置面）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "残留 expected_length_weight 行已剥（elw 退役）" (($f | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
-  Assert "two_code_sentence: true（读入态保持）" (($f | Where-Object { $_ -match '^\s+two_code_sentence: true\s*$' }).Count -eq 1)
+  Assert "sentence_mode: true（旧键读入态迁移落盘）" (($f | Where-Object { $_ -match '^\s+sentence_mode: true\s*$' }).Count -eq 1)
+  Assert "旧键 two_code_sentence 已剥（整句模式改名）" (($f | Where-Object { $_ -match 'two_code_sentence' }).Count -eq 0)
   Assert "残留 min_tokens 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'min_tokens' }).Count -eq 0)
   Assert "残留 min_code_len 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'min_code_len' }).Count -eq 0)
   Assert "残留 max_code_len 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'max_code_len' }).Count -eq 0)
-  Assert "code_pattern 落盘 [abcde]{4}（单引号）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\[abcde\]\{4\}'\s*$" }).Count -eq 1)
+  Assert "code_pattern 落盘锁定 .{2,}（整句模式 on）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\.\{2,\}'\s*$" }).Count -eq 1)
   Assert "max_tokens 保留 12" (($f | Where-Object { $_ -match '^\s+max_tokens: 12\s*$' }).Count -eq 1)
   Assert "model_path 保留" (($f | Where-Object { $_ -match '^\s+model_path: d:/gguf_models/zz_test\.gguf\s*$' }).Count -eq 1)
   Assert "组件行未动" ((($f | Select-String "lua_processor@\*llm_processor").Count) -eq 1 -and
@@ -498,19 +500,25 @@ engine:
 
   Write-Host "== G7: 复选框 BM_CLICK 切换 + 保存落盘 =="
   [void][W]::SendMsg((Find-Check "启用 LLM 重排"), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # true→false
-  [void][W]::SendMsg((Find-Check "两码整句 two_code_sentence"), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # true→false
+  [void][W]::SendMsg((Find-Check "整句模式"), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # true→false
   Start-Sleep -Milliseconds 300
   Click-Btn (Find-Button "保存并生效")
   $f = Get-Content $test -Encoding UTF8
   Assert "enabled: false（点击翻转）" (($f | Where-Object { $_ -match '^\s+enabled: false\s*$' }).Count -eq 1)
-  Assert "two_code_sentence: false（点击翻转）" (($f | Where-Object { $_ -match '^\s+two_code_sentence: false\s*$' }).Count -eq 1)
+  Assert "sentence_mode: false（点击翻转）" (($f | Where-Object { $_ -match '^\s+sentence_mode: false\s*$' }).Count -eq 1)
+  # 取消勾选的"恢复原值"联动走 CheckedChanged——**跨进程 BM_CLICK 不触发
+  # managed 事件**（与 WM_SETTEXT 不触发 TextChanged 同族怪癖；原生检查态
+  # 已翻转、保存端 BM_GETCHECK 读到 false）→ 框文本残留锁定值 '.{2,}' 随
+  # 保存落盘。真实用户鼠标点击必然触发事件恢复原值，此链产品可达、测试
+  # 不可达（无 managed 注入手段），不断言。
+  Assert "code_pattern = .{2,}（跨进程点击事件不触发，锁定残留随 off 落盘）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\.\{2,\}'\s*$" }).Count -eq 1)
   Assert "debug_fusion: true（未动保持）" (($f | Where-Object { $_ -match '^\s+debug_fusion: true\s*$' }).Count -eq 1)
   Assert "freq_beta 仍不存在" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
 
   Write-Host "== G8: 重读回环（保存值回到界面）=="
   Reload-Params
   Assert "max_tokens 字段 = 12" ((Get-WText $e[1].h) -eq "12")
-  Assert "code_pattern 字段 = [abcde]{4}" ((Get-WText $e[0].h) -eq "[abcde]{4}")
+  Assert "code_pattern 字段 = .{2,}（off 读入 = 方案节值，见 G7 怪癖注）" ((Get-WText $e[0].h) -eq ".{2,}")
 
   Write-Host "== G9: 只在出错时写 install_error.log（GUI 程序目录）=="
   $logFile = Join-Path $PSScriptRoot "install_error.log"
@@ -815,7 +823,7 @@ engine:
     $btnBench2 = @($c2 | Where-Object { $_.cls -match 'BUTTON' -and $_.text -eq "实测线程数" } | Select-Object -First 1)
     $edCores2 = @($c2 | Where-Object {
         if ($_.cls -notmatch '\.Edit\.') { return $false }
-        return (@('触发条件', '推理规模', '候选排序融合') -contains (Get-WText $_.parent))
+        return (@('触发条件', '推理规模') -contains (Get-WText $_.parent))
       } | Sort-Object y, x)
     Assert "第二个 GUI 上找到 按钮/模型框/参数框" ($btnBench2.Count -eq 1 -and $cmbModel2.Count -eq 1 -and $edCores2.Count -eq 4)
     if ($btnBench2.Count -eq 1 -and $cmbModel2.Count -eq 1 -and $edCores2.Count -eq 4) {

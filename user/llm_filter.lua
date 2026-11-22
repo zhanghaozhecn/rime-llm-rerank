@@ -16,10 +16,11 @@ local FREQ_BETA = 14 -- 对数词频融合系数（2026-11-14 默认模型改
                      --   p1 = 用户累计 Unigram 平滑概率（llm_processor 维护,
                      --   _G.user_unigram_term 查询; 累计 Bigram 项已退役
                      --   2026-11-08, 见研究库 §三十七）
--- two_code_sentence 两码整句开关（2026-11-07 用户定案取代 elw）：
--- 两码一字整句方案下勾选后，词长==⌊码长/2⌋ 的候选作为一组直接优先
--- （组内融合分降序、同分稳定），其余候选按融合分降序在后——即原 elw
--- 的极限行为（elw·span 加成→∞），不再需要 span 间接量。默认 false。
+-- sentence_mode 整句模式（2026-11-22 用户定案，取代 two_code_sentence 两码整句）：
+-- 候选覆盖整个活动段（cand.start/_end == 段边界 = 音节数一致的满覆盖候选，
+-- 由引擎音节切分 lattice 决定，简拼/单韵母短码天然正确）进 LLM 评分窗，
+-- 部分覆盖候选保持引擎序排后。两码一字方案下与旧「词长==⌊码长/2⌋」
+-- 逐位等价（4 码 = 2 音节满覆盖 ⟺ 词长 2）。默认 false。
 
 -- 词码对扣分修正（2026-11-21 用户定案解耦：只承载负分 CE 偏差降噪）：
 -- 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>-分数`
@@ -144,9 +145,9 @@ local cfg = {
     max_candidates   = 6,   -- 2026-11-19：0.6B k*=6（候选段 100ms / 最优 3.65%）
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
     debug_fusion     = false, -- true = 逐候选融合明细写 rime_llm_debug.txt (诊断用)
-    two_code_sentence = false, -- 两码整句：词长==⌊码长/2⌋ 的候选一组优先
-                               -- （2026-11-07 取代 expected_length_weight；
-                               --  旧行读取端忽略，保存/重建节时剥除）
+    sentence_mode    = false, -- 整句模式：满覆盖候选进评分窗、部分覆盖排后
+                              -- （2026-11-22 取代 two_code_sentence 两码整句；
+                              --  旧键读取端兜底一次，保存/重建节时剥除）
     -- freq_beta 不再从 schema 读取（2026-11-05 用户配置面移除，标定产物退出配置面）
     -- → 内置常数 FREQ_BETA；方案里残留旧行读取端忽略，保存/重建节时剥除
 }
@@ -330,7 +331,7 @@ function _G.llm_write_h(schema, model)
         "H", id, rec_stamp(), "plugin", rec_esc(schema or "unknown"),
         rec_esc(rec_base(model)), rec_esc(cfg.code_pattern or ""),
         tostring(cfg.max_candidates or 5), tostring(cfg.max_tokens or 10),
-        cfg.two_code_sentence and "1" or "0", "14.00", "400"
+        cfg.sentence_mode and "1" or "0", "14.00", "400"
     }, "\t")
     _G.llm_corpus_write(line)
 end
@@ -454,7 +455,7 @@ local function init_config(env)
     -- nil，配置了空串则视为"总是匹配"（与源码版一致）
     local pat = sc:get_string("llm_rerank/code_pattern")
     if pat ~= nil then cfg.code_pattern = pat end
-    -- expected_length_weight 不再读取（2026-11-07 由 two_code_sentence 取代;
+    -- expected_length_weight 不再读取（2026-11-07 由布尔开关取代;
     -- 方案里残留旧行忽略, 保存时由安装器剥除）
     -- freq_beta 不再读取（2026-11-05 配置面移除; 方案里残留旧行忽略,
     -- 保存时由安装器剥除）
@@ -467,10 +468,20 @@ local function init_config(env)
     -- min_tokens 不再从 schema 读取（2026-09-30 用户配置面移除；固定 C++ 默认 1）
     local dbg = sc:get_bool("llm_rerank/debug_fusion")
     if dbg ~= nil then cfg.debug_fusion = dbg end
-    -- 两码整句开关（2026-11-16 补读——自 13ed97e 引入起从未读 schema，
-    -- 插件版该开关一直停默认 false；源码版正常，故真机未暴露）
-    local tcs = sc:get_bool("llm_rerank/two_code_sentence")
-    if tcs ~= nil then cfg.two_code_sentence = tcs end
+    -- 整句模式开关（2026-11-22 取代 two_code_sentence）：新键优先；旧键只在
+    -- 新键未配置时兜底一次（真机旧方案 two_code_sentence: true 直升整句模式，
+    -- 保存后自然换新键——避免硬忽略造成已启用整句的机器静默退化）
+    local sm = sc:get_bool("llm_rerank/sentence_mode")
+    if sm ~= nil then
+        cfg.sentence_mode = sm
+    else
+        local tcs = sc:get_bool("llm_rerank/two_code_sentence")
+        if tcs ~= nil then cfg.sentence_mode = tcs end
+    end
+    -- 整句模式锁定编码匹配（2026-11-22 用户定案）：sentence_mode on 时
+    -- code_pattern 恒 '.{2,}'（2 码起参与重排），上方读取的方案节该行被
+    -- 覆盖（手改 yaml 也不生效）；off 时方案节值生效
+    if cfg.sentence_mode then cfg.code_pattern = '.{2,}' end
     _G.llm_debug_enabled = cfg.debug_fusion
     if not _G.llm_h_written then
         _G.llm_h_written = true
@@ -487,6 +498,40 @@ local function texts_of(list, maxn)
     return out
 end
 
+-- ═══ 整句模式（2026-11-22 定案）：活动段切片取码 + 满覆盖（FM）判定 ═══
+-- 候选 start/_end 恰为活动段 [start,_end) = 覆盖全部音节（"音节数一致"）。
+-- 引擎 lattice 已把全部合法解析（歧义、简拼、单韵母短码）编码进候选集，
+-- filter 不复刻音节化。三级兜底（官方 weasel 内置 librime-lua 版本不可控）：
+--   ① composition 可用 → 活动段 = composition:back()（多段续打正确；
+--     librime 翻译只发生在未确认的最后一段）；
+--   ② composition 不可用 → 单段启发 [0, #input)（连续输入的常见形态，
+--     多段时该段满覆盖候选 start>0 不满足 → 视为 PM → 安全退化不重排）；
+--   ③ 候选无 start/_end（librime-lua 过旧）→ 回退旧长度规则
+--      词长==⌊码长/2⌋（两码方案保真；全拼下满覆盖组为空 → skip 透传）。
+local function resolve_segment(env, input)
+    local ok, seg = pcall(function()
+        local comp = env.engine.context.composition
+        if not comp or type(comp.back) ~= "function" then return nil end
+        return comp:back()
+    end)
+    if ok and seg and type(seg.start) == "number"
+            and type(seg._end) == "number"
+            and seg.start >= 0 and seg._end <= #input
+            and seg._end > seg.start then
+        return seg.start, seg._end
+    end
+    return 0, #input
+end
+
+-- 候选覆盖区间（不可用返回 nil）——librime-lua 候选属性 start / _end
+local function cand_span(c)
+    local ok, s = pcall(function() return c.start end)
+    if not ok or type(s) ~= "number" then return nil end
+    local ok2, e = pcall(function() return c._end end)
+    if not ok2 or type(e) ~= "number" then return nil end
+    return s, e
+end
+
 -- === Filter ===
 return function(translation, env)
     -- 每次调用都从 schema 读取 enabled，确保重新部署后立即生效
@@ -501,6 +546,11 @@ return function(translation, env)
     init_config(env)
 
     local input = env.engine.context.input or ""
+    -- 整句模式取码（2026-11-22）：活动段切片。多段续打（前段已选定）时
+    -- code_pattern 匹配/词频键/语料 W.code 都随切片；单段组合 = 全串
+    -- （双拼与既有行为逐位一致）。input 本身保留给 composition 兜底路径。
+    local seg_start, seg_end = resolve_segment(env, input)
+    local code = input:sub(seg_start + 1, seg_end)
     local all = {}
     for cand in translation:iter() do table.insert(all, cand) end
     local ctx_text, ctx_src = "", "rime"
@@ -516,7 +566,7 @@ return function(translation, env)
     if enabled and not llm_loaded_for then
         load_llm(env)
     end
-    local pattern_ok = enabled and match_code_pattern(input) or false
+    local pattern_ok = enabled and match_code_pattern(code) or false
     -- 常开语料 W：只在 enabled + pattern 匹配时尝试（部分输入码不落行）。
     local rec = enabled and pattern_ok
     local wid = rec and _G.llm_new_event("W", tick) or nil
@@ -526,9 +576,9 @@ return function(translation, env)
 
     if #all < 2 then
         live("S|" .. os.date("%H:%M:%S") .. "|few_candidates|" ..
-             live_esc(input) .. "|-")
+             live_esc(code) .. "|-")
         if wid then
-            _G.llm_write_w(wid, ctx_src, input, context, engine_top, {}, {},
+            _G.llm_write_w(wid, ctx_src, code, context, engine_top, {}, {},
                            tick, "skip", "few_candidates", false, "")
         end
         for _, c in ipairs(all) do yield(c) end
@@ -542,11 +592,11 @@ return function(translation, env)
 
     if not llm then
         if wid then
-            _G.llm_write_w(wid, ctx_src, input, context, engine_top, {}, {},
+            _G.llm_write_w(wid, ctx_src, code, context, engine_top, {}, {},
                            tick, "skip", "model_loading", false, "")
         end
         live("S|" .. os.date("%H:%M:%S") .. "|model_loading|" ..
-             live_esc(input) .. "|-")
+             live_esc(code) .. "|-")
         for _, c in ipairs(all) do yield(c) end; return
     end
 
@@ -555,7 +605,7 @@ return function(translation, env)
     -- （与源码版 boost::regex 同一套 ECMAScript 语法）；DLL 不提供该函数时
     -- 回退 Lua 模式——两种写法对 .{4} / .{4,} / .{3,4} / [abcde]{4} 等价。
     if not pattern_ok then
-        live("S|" .. os.date("%H:%M:%S") .. "|pattern|" .. live_esc(input)
+        live("S|" .. os.date("%H:%M:%S") .. "|pattern|" .. live_esc(code)
              .. "|-")
         for _, c in ipairs(all) do yield(c) end; return
     end
@@ -563,11 +613,11 @@ return function(translation, env)
     -- 空上文：与源码版一致跳过评分（W skip 记录）
     if context == "" then
         if wid then
-            _G.llm_write_w(wid, ctx_src, input, context, engine_top, {}, {},
+            _G.llm_write_w(wid, ctx_src, code, context, engine_top, {}, {},
                            tick, "skip", "ctx_empty", false, "")
         end
         live("S|" .. os.date("%H:%M:%S") .. "|ctx_empty|" ..
-             live_esc(input) .. "|" .. live_esc(ctx_src))
+             live_esc(code) .. "|" .. live_esc(ctx_src))
         for _, c in ipairs(all) do yield(c) end; return
     end
     -- ═══ 层1: 全体候选 用户词频打分重排（v3 两层重排, 2026-11-07 定案）═══
@@ -581,12 +631,13 @@ return function(translation, env)
     do
         -- 词码对记账（2026-11-13 用户定案）: eff/uni 查询键 = (候选, 当前
         -- 窗码)——多音词属不同词条, 每个码对只看自己的历史（wiki 59,681
-        -- 窗: 分键全面更优 −0.34~−0.73pp 随龄扩大）
+        -- 窗: 分键全面更优 −0.34~−0.73pp 随龄扩大）。2026-11-22 整句模式:
+        -- 窗码 = 活动段切片 code（多段续打正确；单段 == 全串不变）。
         local fe, bt = _G.user_freq_eff, _G.user_unigram_term
         for i, c in ipairs(all) do
-            local n = fe and fe(c.text, input) or 0
+            local n = fe and fe(c.text, code) or 0
             local s = FREQ_BETA * math.log(1 + n)
-            if bt then s = s + bt(c.text, input) end
+            if bt then s = s + bt(c.text, code) end
             layer1[i] = { c = c, s = s, idx = i }
             s1_of[c.text] = s
         end
@@ -610,15 +661,39 @@ return function(translation, env)
         cands[#cands + 1] = t
         l1win[#l1win + 1] = t
     end
-    -- two_code_sentence 准入优先（2026-11-16 用户定案，取代 2026-11-07 的
-    -- "词频前 k 全参评 + 最终排序满长组置顶"）：剩余名额里词长==⌊码长/2⌋
-    -- 的候选优先；不足就空着——不匹配词长的候选不进窗、不算 CE。
-    local tcs_elen = cfg.two_code_sentence and math.floor(#input / 2) or 0
-    if tcs_elen >= 1 then
-        for _, e in ipairs(layer1) do
-            if (utf8.len(e.c.text or "") or 0) == tcs_elen then
-                add_win(e)
+    -- 整句模式准入（2026-11-22 定案取代 two_code_sentence 满长规则）：候选
+    -- 覆盖整个活动段（FM）才进窗——"音节数一致"由引擎 lattice 保证；部分
+    -- 覆盖候选不进窗、不算 CE。FM 判定三级兜底（见 cand_span 注释）：候选
+    -- 无 start/_end 时回退旧长度规则 词长==⌊码长/2⌋（两码方案保真）。
+    local sent_on = cfg.sentence_mode
+    local fm_set = nil     -- 候选对象 → FM 布尔（sent_on 时有效）
+    if sent_on then
+        local span_ok = true
+        fm_set = {}
+        for _, c in ipairs(all) do
+            local s, e = cand_span(c)
+            if not s then span_ok = false; break end
+            fm_set[c] = (s == seg_start and e == seg_end)
+        end
+        if not span_ok then
+            local elen = math.floor(#code / 2)
+            fm_set = nil    -- span 不可用：回退旧长度规则（码 <2 = 不重排）
+            if elen >= 1 then
+                fm_set = {}
+                for _, c in ipairs(all) do
+                    fm_set[c] = (utf8.len(c.text or "") or 0) == elen
+                end
             end
+        end
+    end
+    local function is_fm(c)
+        if not sent_on then return true end   -- 关闭态：不区分（混合语义）
+        if fm_set then return fm_set[c] == true end
+        return false
+    end
+    if sent_on then
+        for _, e in ipairs(layer1) do
+            if is_fm(e.c) then add_win(e) end
         end
     else
         for _, e in ipairs(layer1) do
@@ -629,14 +704,14 @@ return function(translation, env)
     -- 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在
     -- 生产里命中率极低（每个新词的上文都变），却要维护一整套失效逻辑（编辑键清
     -- 缓存/候选集变化重放），删掉以简化。每次触发都是真实推理。
-    -- 满长准入后窗不足 2 个（不足即空着的极端形态）：无重排意义、整窗跳过
+    -- 满覆盖准入后窗不足 2 个（不足即空着的极端形态）：无重排意义、整窗跳过
     -- 评分（与源码版一致显式发 S 事件，避免静默零输出）——ok 保持 nil，
-    -- 下游走层1 序展示。
-    if tcs_elen >= 1 and #cands < 2 then
+    -- 下游走层1 序展示。skip 名沿用 full_len_lt2（语料解析兼容）。
+    if sent_on and #cands < 2 then
         live("S|" .. os.date("%H:%M:%S") .. "|full_len_lt2|" ..
-             live_esc(input) .. "|" .. live_esc(ctx_src))
+             live_esc(code) .. "|" .. live_esc(ctx_src))
         if wid then
-            _G.llm_write_w(wid, ctx_src, input, context, engine_top, l1win,
+            _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
                            {}, tick, "skip", "full_len_lt2", false, "")
             w_written = true
         end
@@ -714,7 +789,8 @@ return function(translation, env)
         --      项值 log(0.5·p1)——与原标定语义的未 fired 形态逐字一致;
         --      冷启动全等值自动无害退化; llm_processor 维护 _G.user_unigram_term;
         --   ③ expected_length_weight (elw) 已退役 (2026-11-07): 整句偏好改由
-        --      two_code_sentence 开关直接实现 (见下方满长组优先块)。
+        --      布尔开关直接实现（2026-11-22 起为 sentence_mode 整句模式——
+        --      满覆盖候选在窗口准入时结构性占满评分窗）。
         --   ④ 冷启动 eff≡0 且 uni 无计数时自动退化为 score 序, 成熟期三项叠加。
         --   ⑤ 词码对分数修正（2026-11-17 有符号表）: 正分 = 固定首选/次选
         --      （+200/+100，不受 fade）；负分 = pairfix 降噪（原 −λ，保留
@@ -764,10 +840,10 @@ return function(translation, env)
             for i, c in ipairs(ordered) do
                 local s = scores[c.text]
                 if is_valid_llm_score(s) then
-                    local n = freq_eff and freq_eff(c.text, input) or 0
+                    local n = freq_eff and freq_eff(c.text, code) or 0
                     local u1_term = _G.user_unigram_term
-                            and _G.user_unigram_term(c.text, input) or 0
-                    local delta = pairfix_delta(pftbl, c.text, input)
+                            and _G.user_unigram_term(c.text, code) or 0
+                    local delta = pairfix_delta(pftbl, c.text, code)
                     local t = s + FREQ_BETA * math.log(1 + n) + u1_term
                             + delta
                     fused_scores[c.text] = t
@@ -780,7 +856,7 @@ return function(translation, env)
                                         sdelta = delta ~= 0 and delta or nil,
                                         uni = _G.user_uni_count
                                               and _G.user_uni_count(c.text,
-                                                                    input) or 0,
+                                                                    code) or 0,
                                         ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = t, cerank = i }
                     end
@@ -799,7 +875,7 @@ return function(translation, env)
                                         sdelta = delta ~= 0 and delta or nil,
                                         uni = _G.user_uni_count
                                               and _G.user_uni_count(c.text,
-                                                                    input) or 0,
+                                                                    code) or 0,
                                         ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = t, cerank = i,
                                         invalid = true }
@@ -812,28 +888,13 @@ return function(translation, env)
             end)
             for i = 1, #arr do ordered[i] = arr[i].c end
         end
-        -- 两码整句 (two_code_sentence, 2026-11-07 用户定案取代 elw):
-        -- 词长==⌊码长/2⌋ 的候选一组直接优先 (组内融合分降序, 同分稳定),
-        -- 其余按融合分降序——即原 elw 的极限行为 (elw·span 加成→∞),
-        -- 不再需要 span 间接量。
-        if cfg.two_code_sentence and #ordered > 1 and fused_scores then
-            local expected_len = math.floor(#input / 2)
-            if expected_len >= 1 then
-                local arr = {}
-                for i, c in ipairs(ordered) do
-                    local len = utf8.len(c.text or "") or 0
-                    arr[i] = { c = c, s = fused_scores[c.text] or -math.huge,
-                               m = (len == expected_len), idx = i }
-                    if dbg and dbg[c.text] then
-                        dbg[c.text].full = arr[i].m
-                    end
-                end
-                table.sort(arr, function(a, b)
-                    if a.m ~= b.m then return a.m end
-                    if a.s ~= b.s then return a.s > b.s end
-                    return a.idx < b.idx  -- 同分保持融合序
-                end)
-                for i = 1, #arr do ordered[i] = arr[i].c end
+        -- 两码整句最终置顶块已删（2026-11-22 整句模式定案）：满覆盖候选已在
+        -- 窗口准入时结构性占满评分窗（窗内全 FM），融合序即满覆盖组内序——
+        -- 旧保险块对最终序恒 no-op，连同词长==⌊码长/2⌋ 判据一并退役。
+        -- 调试行 full 标志（协议字段，win=1 行 = FM=1）按整句模式 FM 判定补：
+        if sent_on and dbg then
+            for _, c in ipairs(ordered) do
+                if dbg[c.text] then dbg[c.text].full = is_fm(c) end
             end
         end
 
@@ -863,7 +924,7 @@ return function(translation, env)
             -- 一并取消）——查看器按字段数兼容旧行（>12 取第 13 字段，
             -- 否则第 12 字段）。
             live(string.format("L|%s|%s|%s|%s|%s|%s|%.0f|%s|%d|%s|%s",
-                os.date("%H:%M:%S"), live_esc(input), "-",
+                os.date("%H:%M:%S"), live_esc(code), "-",
                 live_esc(ctx_src), live_esc(context),
                 tostring(_G.user_freq_tick), ev_ms, live_ready, #cands, prep,
                 ctxused))
@@ -901,10 +962,19 @@ return function(translation, env)
             end
             for i, c in ipairs(ordered) do live_c(c, i) end
             local tail_pos = #ordered
+            -- 尾窗 fin 位置与实际输出序一致（整句模式 = FM 窗外层1序 + PM 引擎序）
             for _, e in ipairs(layer1) do
-                if not seen[e.c.text] then
+                if not seen[e.c.text] and (not sent_on or is_fm(e.c)) then
                     tail_pos = tail_pos + 1
                     live_c(e.c, tail_pos)
+                end
+            end
+            if sent_on then
+                for _, c in ipairs(all) do
+                    if not seen[c.text] and not is_fm(c) then
+                        tail_pos = tail_pos + 1
+                        live_c(c, tail_pos)
+                    end
                 end
             end
             -- debug P/D：只写语料没有的字段；词/候选序在语料 W，
@@ -922,7 +992,7 @@ return function(translation, env)
         end
         -- 常开语料 W ok（最终序 + 引擎前 10 + 层1 窗）
         if wid and not w_written then
-            _G.llm_write_w(wid, ctx_src, input, context, engine_top, l1win,
+            _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
                            texts_of(ordered, 20), tick, "ok", "",
                            prep_flag == "1", "")
             w_written = true
@@ -931,13 +1001,23 @@ return function(translation, env)
         -- 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment；
         -- 固定候选提示亦归拼读双拼 pin_filter.lua，2026-11-21 解耦）
         for _, c in ipairs(ordered) do yield(c) end
+        -- 整句模式（2026-11-22）：三块输出——FM 窗外按层1 序，PM 恒按引擎序
+        -- （保引擎"匹配在前、部分在后"不变量，层1 不再混合重排 PM）。
+        -- 关闭态保持旧行为：窗外全部按层1 序。
         for _, e in ipairs(layer1) do
-            if not seen[e.c.text] then yield(e.c) end
+            if not seen[e.c.text] and (not sent_on or is_fm(e.c)) then
+                yield(e.c)
+            end
+        end
+        if sent_on then
+            for _, c in ipairs(all) do
+                if not seen[c.text] and not is_fm(c) then yield(c) end
+            end
         end
     else
         -- 评分失败/缺分: 层1 已重排全体候选 → 按层1 序展示
         if wid and not w_written then
-            _G.llm_write_w(wid, ctx_src, input, context, engine_top, l1win,
+            _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
                            {}, tick, "skip", skip_reason or "score_failed",
                            prep_flag == "1", "")
             w_written = true
