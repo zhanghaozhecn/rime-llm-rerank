@@ -753,15 +753,14 @@ return function(translation, env)
     -- （全拼串的 completion 有限，简拼串海量），单码秒级 CPU
     -- （enabled=false 对照实测 40 倍差）→ 每键卡死。截断后引擎惰性
     -- 停在当前位置。break 即不再拉取，exhausted 不触发。
-    -- 双重限制（源码版同构）：32 上限 + 30ms 时间预算（个数闸管收多少、
-    -- 预算闸管贵不贵）。上限取 32（2026-11-22 用户定案）：全拼打字正确
-    -- 候选大部分本就在引擎前 10，且 Rime user_dict 自带用户调频——打过的
-    -- 词引擎自己会提前，层1 全量收集的边际价值可忽略（与 ledger 证据链
-    -- 重叠）；窗口 6 + 满覆盖组 + 翻页余量 = 32 足够。
+    -- 双重限制（源码版同构）：16 上限 + 30ms 时间预算（个数闸管收多少、
+    -- 预算闸管贵不贵）。上限取 16（2026-11-23 wiki 全拼实测：真实引擎候选
+    -- 序中正确候选位置 p95=2 / p99=7 / p99.9=20，16 覆盖 99.82% 词型、
+    -- 99.92% 词频加权；32 的边际覆盖仅 +0.16pp，性价比不足）。
     local collect_start = os.clock()
     for cand in translation:iter() do
         table.insert(all, cand)
-        if #all >= 32 then break end
+        if #all >= 16 then break end
         if (os.clock() - collect_start) > 0.03 then break end
     end
     local ctx_text, ctx_src = "", "rime"
