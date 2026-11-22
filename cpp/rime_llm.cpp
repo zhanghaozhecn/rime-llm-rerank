@@ -47,16 +47,20 @@ extern "C" {
 // 处，模型直接放根目录、不套子文件夹；8-27 曾误用 %USERPROFILE%\
 // gguf_models\。自定义位置用 schema model_path 显式指向。便携模式小狼毫
 // 的用户目录不在 %APPDATA%\Rime，此类部署需显式配置 model_path）
-// 默认模型 = qwen2.5-0.5b-instruct-q4_k_m（2026-11-16 用户定案 base→instruct
-// 切换：聚合效果与 base 无差异（2 万窗对照 +0.02pp）、下载源 ModelScope
-// 官方仓国内直连快；CPU 延迟与 base 无差异（三轮交替配对 ≈50.5ms，
-// 张量逐层同量化——首测 +9% 系小样本非交替测量误差）。
-// 前身 2026-11-14 的 Qwen2.5-0.5B-Q4_K_M（base），更旧 Qwen3.5-0.8B）
+// 默认模型 = Qwen3-0.6B-Base-Q4_K_M（2026-11-19 用户定案 0.6B base：
+// 研究帕累托最优 100ms/3.78%、预填充 79ms；2026-11-22 补齐此处内置默认
+// ——定案当时只改了真机方案节的显式 model_path，C++ 默认仍指
+// qwen2.5-0.5b-instruct，无 model_path 的方案（如 GUI 接入的朙月拼音，
+// 模板注释该行）会加载不存在的文件 → failed to load model 死循环，
+// 每键 skip=model_loading 无推理，真机排查发现）。
+// 前身 2026-11-16 的 qwen2.5-0.5b-instruct（base→instruct 切换：聚合
+// 与 base 无差异、下载直连快）；更旧 2026-11-14 Qwen2.5-0.5B（base）、
+// Qwen3.5-0.8B）
 static std::string default_model_path() {
   const char *ad = getenv("APPDATA");
   if (ad && *ad)
-    return std::string(ad) + "\\Rime\\qwen2.5-0.5b-instruct-q4_k_m.gguf";
-  return "qwen2.5-0.5b-instruct-q4_k_m.gguf";
+    return std::string(ad) + "\\Rime\\Qwen3-0.6B-Base-Q4_K_M.gguf";
+  return "Qwen3-0.6B-Base-Q4_K_M.gguf";
 }
 static std::string  g_model_path      = default_model_path();
 static int          g_min_tokens      = 1;

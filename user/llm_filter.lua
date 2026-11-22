@@ -656,7 +656,18 @@ return function(translation, env)
     local seg_start, seg_end = resolve_segment(env, input)
     local code = input:sub(seg_start + 1, seg_end)
     local all = {}
-    for cand in translation:iter() do table.insert(all, cand) end
+    -- 限量收集（2026-11-22 卡死修复）：旧 while 全量收集强制引擎一次性
+    -- 完整翻译所有候选——朙月大词库歧义/部分码串的 completion 候选海量，
+    -- 单码秒级 CPU（enabled=false 对照实测 40 倍差）→ 每键卡死。截断后
+    -- 引擎惰性停在当前位置；层1 词频选窗在 256 内仍有效（用户提频词在
+    -- 候选前列）。break 即不再拉取，exhausted 不触发。
+    -- 双重限制（源码版同构）：256 上限 + 100ms 时间预算（大词库早停）
+    local collect_start = os.clock()
+    for cand in translation:iter() do
+        table.insert(all, cand)
+        if #all >= 256 then break end
+        if (os.clock() - collect_start) > 0.03 then break end
+    end
     local ctx_text, ctx_src = "", "rime"
     if _G.llm_context_get then
         ctx_text, ctx_src = _G.llm_context_get()
