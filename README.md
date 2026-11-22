@@ -375,6 +375,10 @@ rime-llm-rerank\
 
 分层并行解码、预解码、KV 代次、CE 位置权重的完整原理见研究资料库 README「方法」节；实现层的坑（索引语义、代次连锁失配、`llama_memory_clear` 参数、`llama_tokenize` 负返回、lua 缓存误命中、编辑键重置根因、候选窗快照动机等）已写入代码注释，改代码前先读 `cpp/rime_llm.cpp` 的 `score_batch`/`prepare` 与两个 lua 文件顶部的注释。
 
+### 异步评分（2026-11-22 起，字词/整句两模式统一）
+
+评分移出按键路径：filter 每键投递异步任务（指纹 = 上文+候选，DLL 持久评分线程 + 40ms 去抖 + 可中断 decode），同步路径零 LLM。**字词模式** submit+wait（≤250ms，与旧同步评分等价，当前词重排零回归）；**整句模式**投递即走（层1 序先行），评分结果由收割点回填——filter 入口（翻页/候选窗重建命中缓存即 0 LLM）+ commit（上屏即落账）。同指纹重复 query 命中快照缓存（融合分现算，语义与同步版逐位一致）。语料 W 行新形态：整句挂账轮 `skip|async_pending` + 回填 `ok`（flags=`async`）双行；新 skip 名 `async_timeout`（wait 超时）。设计全文见研究库《全拼简拼整句重排-调研与设计》§七。
+
 ## 编译
 
 需要 Visual Studio 2022（含 Build Tools）+ CMake + llama.cpp 源码（本机镜像 `D:\llama.cpp-mirror\`）。

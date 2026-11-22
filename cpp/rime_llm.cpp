@@ -1224,20 +1224,34 @@ static double ce_target(const float * logits, int target_id, float m, double lse
 //       多 token 候选每个 seq 仅 1 个新 token，SSM 跨序列干扰可忽略
 //       ith = batch 数组索引（不是 logits 标记序号）
 // ============================================================
-static void score_batch(const std::vector<llama_token> & ctx_ids,
+// 返回 true = 评分完成（结果可发布）；false = 中途取消（异步评分器代次
+// 变化——新 submit 覆盖 / cancel，结果整体丢弃）。中断检查点 = 拿锁后 /
+// CE1 后(Step2 前) / Step2 后(Step3 前)：批 decode 单步 ~10-25ms，Step
+// 粒度中断足够（2026-11-22 异步基建，两版同构）。同步调用（lua_score/
+// 冒烟）传缺省 nullptr/0，恒走完。
+static bool score_batch(const std::vector<llama_token> & ctx_ids,
                          const std::vector<std::vector<llama_token>> & cands,
                          std::vector<double> & scores_out,
                          std::vector<std::array<double, 3>> * ce3_out = nullptr,
-                         bool * prep_hit_out = nullptr) {
+                         bool * prep_hit_out = nullptr,
+                         const std::atomic<long> * cancel_gen = nullptr,
+                         long my_gen = 0) {
     scores_out.assign(cands.size(), -1e10);
     if (ce3_out)  // 三分量初值 NaN（缺 token / 失败位 → 调试端显示空）
         ce3_out->assign(cands.size(), {NAN, NAN, NAN});
     if (prep_hit_out) *prep_hit_out = false;
     int n_cands = (int)cands.size();
-    if (n_cands == 0) return;
+    if (n_cands == 0) return true;
+
+    auto cancelled = [&]() {
+        return cancel_gen &&
+               cancel_gen->load(std::memory_order_relaxed) != my_gen;
+    };
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::unique_lock<std::mutex> lock(g_mutex);
+    // 拿锁后先查一次：等待锁期间任务可能已被覆盖（白跑整段 Step1）
+    if (cancelled()) return false;
     auto t1 = std::chrono::high_resolution_clock::now();
     double wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -1285,7 +1299,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
         }
         llama_batch_free(ctx_batch);
 
-        if (!decoded_ok) return;  // decode failed（prep 存储只在成功时覆写）
+        if (!decoded_ok) return true;  // decode failed（prep 存储只在成功时覆写；结果全哨兵照常发布）
         // 完整流程自我刷新 prep: 刚 decode 完 seq0 (代次已递增), KV/logits 一致,
         // 保存后同 ctx 的后续 score (翻页/候选窗重建) 全部命中——
         // 否则一次未命中导致代次失配, 后续 score 连锁全部 prep=0 直到下次 commit
@@ -1317,6 +1331,9 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     auto ts_ce1_1 = std::chrono::high_resolution_clock::now();
     double ms_ce1 =
         std::chrono::duration<double, std::milli>(ts_ce1_1 - ts_ce1_0).count();
+
+    // 中断检查（Step2 前）：此时未分配 worker seq，无 KV 泄漏
+    if (cancelled()) return false;
 
     // ---- Step 2/3: 前缀去重批量 decode（2026-11-07，两版同步）----
     // 行按"已解码前缀"分组：step2 行 = 候选首 token（去重）；step3 行 =
@@ -1406,6 +1423,13 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
     // ---- Step 3: 前缀 (c0,c1) 去重 decode ----
     const int V = (int)rows3.size();
     if (V > 0 && step2_ok) {
+        // 中断检查（Step3 前）：step2 worker seq 已分配，先释放再退出
+        if (cancelled()) {
+            auto *mem0 = llama_get_memory(g_ctx);
+            for (int s = 1; s <= seq_top; s++)
+                llama_memory_seq_rm(mem0, s, 0, -1);
+            return false;
+        }
         auto ts3_0 = std::chrono::high_resolution_clock::now();
         // seq 分配：每个首 token 的第一个对复用 step2 seq；后续对
         // seq_cp(step2 seq → 新 seq)——拷贝发生在 step3 decode 的 update
@@ -1508,6 +1532,7 @@ static void score_batch(const std::vector<llama_token> & ctx_ids,
                 "r2=%d r3=%d",
                 wait_ms, ms1, ms_ce1, ms2a, ms2b, ms3, ms_score, total_ms,
                 use_prep ? 1 : 0, ctx_len, n_cands, U, V);
+    return true;
 }
 
 // ============================================================
@@ -1605,6 +1630,279 @@ static void retry_pending_prepare() {
     if (seq != g_prep_seq.load()) return;      // 已有更新的请求
     std::thread([ids, seq]() { prepare(ids, seq); }).detach();
     log_msg("prepare: retry deferred ctx_tok=%d seq=%d", (int)ids.size(), seq);
+}
+
+// ============================================================
+// 异步评分器（2026-11-22 异步基建，两版同构）
+// 同步路径零 LLM：filter 每键 async_submit 投递，评分在持久工作线程执行；
+// 字词模式 async_submit(immediate) + async_wait = 与既有同步评分等价的
+// 行为（当前词重排零回归），整句模式 submit 不等待（0 LLM 打字流畅），
+// 评分结果经 async_poll 在后续 query 收割回填。
+// 任务槽覆盖式 + 代次中断（submit/cancel 递增 g_async_gen，score_batch
+// 每 Step 边界检查）+ 40ms 去抖（非 immediate 任务，等编码稳定才开跑）。
+// 指纹 = 上文 \x1f 候选 \x1e 拼接原串（lua 缓存键与 DLL 同构，无哈希冲突面；
+// 上文/候选变化自然失效，无需维护失效链）。结果槽只存最近完成一份。
+// ============================================================
+static std::atomic<long> g_async_gen{1};
+static std::mutex              g_async_mu;
+static std::condition_variable g_async_cv;
+static std::thread             g_async_thread;
+static std::atomic<bool>       g_async_started{false};
+
+static constexpr int kAsyncDebounceMs = 40;
+
+struct AsyncTask {
+    bool valid = false;
+    long gen = 0;                 // 提交时的代次（中断判定基准）
+    bool immediate = false;       // wait 模式：跳过去抖立即开跑
+    std::string fingerprint;
+    std::string context;          // 上文原串（worker 内 token 化 + ctx_used）
+    std::vector<std::string> cand_texts;
+    std::chrono::steady_clock::time_point enq_at;
+};
+static AsyncTask g_async_task;
+
+struct AsyncRes {
+    bool valid = false;
+    std::string fingerprint;
+    std::vector<std::string> cand_texts;            // 原顺序
+    std::vector<double> scores;
+    std::vector<std::array<double, 3>> ce3;
+    std::vector<std::string> segs;
+    bool prep_hit = false;
+    std::string ctx_used;
+    double ev_ms = 0;
+};
+static AsyncRes g_async_result;
+
+static std::string async_fingerprint(const char * context,
+                                     const std::vector<std::string> & cands) {
+    std::string fp = context ? context : "";
+    fp.push_back('\x1f');
+    for (size_t i = 0; i < cands.size(); i++) {
+        if (i) fp.push_back('\x1e');
+        fp += cands[i];
+    }
+    return fp;
+}
+
+static void pack_async_result(lua_State * L, const AsyncRes & r) {
+    lua_newtable(L);
+    lua_pushstring(L, r.fingerprint.c_str());
+    lua_setfield(L, -2, "fp");
+    lua_createtable(L, (int)r.cand_texts.size(), 0);
+    for (size_t i = 0; i < r.cand_texts.size(); i++) {
+        lua_pushstring(L, r.cand_texts[i].c_str());
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    lua_setfield(L, -2, "cands");
+    lua_createtable(L, 0, (int)r.cand_texts.size());
+    for (size_t i = 0; i < r.cand_texts.size(); i++) {
+        lua_pushnumber(L, r.scores[i]);
+        lua_setfield(L, -2, r.cand_texts[i].c_str());
+    }
+    lua_setfield(L, -2, "scores");
+    // CE 三分量（NaN / 哨兵位不设 = nil，与 get_ce3 语义一致）
+    lua_createtable(L, 0, (int)r.cand_texts.size());
+    for (size_t i = 0; i < r.cand_texts.size(); i++) {
+        lua_createtable(L, 3, 0);
+        for (int k = 0; k < 3; k++) {
+            double v = r.ce3[i][k];
+            if (v == v && v > -1e9) {
+                lua_pushnumber(L, v);
+                lua_rawseti(L, -2, k + 1);
+            }
+        }
+        lua_setfield(L, -2, r.cand_texts[i].c_str());
+    }
+    lua_setfield(L, -2, "ce3");
+    lua_createtable(L, 0, (int)r.cand_texts.size());
+    for (size_t i = 0; i < r.cand_texts.size(); i++) {
+        lua_pushstring(L, r.segs[i].c_str());
+        lua_setfield(L, -2, r.cand_texts[i].c_str());
+    }
+    lua_setfield(L, -2, "segs");
+    lua_pushboolean(L, r.prep_hit ? 1 : 0);
+    lua_setfield(L, -2, "prep");
+    lua_pushstring(L, r.ctx_used.c_str());
+    lua_setfield(L, -2, "ctx_used");
+    lua_pushnumber(L, r.ev_ms);
+    lua_setfield(L, -2, "ev_ms");
+}
+
+static void async_worker_loop() {
+    for (;;) {
+        AsyncTask task;
+        {
+            std::unique_lock<std::mutex> lk(g_async_mu);
+            g_async_cv.wait(lk, [] { return g_async_task.valid; });
+            task = g_async_task;
+            g_async_task.valid = false;          // 领走
+            // 去抖：非 immediate 任务等 40ms 无更新才开跑；期间新任务到达
+            //（notify 唤醒）则换新任务重新等。immediate（字词 wait 路径）跳过。
+            if (!task.immediate) {
+                for (;;) {
+                    auto deadline = task.enq_at +
+                        std::chrono::milliseconds(kAsyncDebounceMs);
+                    bool updated = g_async_cv.wait_until(lk, deadline, [&] {
+                        return g_async_task.valid &&
+                               g_async_task.enq_at > task.enq_at;
+                    });
+                    if (!updated) break;
+                    task = g_async_task;
+                    g_async_task.valid = false;
+                }
+            }
+        }
+        // 领取后已被覆盖/取消（gen 前进）：丢弃，回到等待
+        if (task.gen != g_async_gen.load(std::memory_order_relaxed)) continue;
+
+        // 模型懒加载触发（与 lua_score 同语义：不在此等待加载——加载中任务
+        // 直接发布失败结果，wait 路径上层 skip not_ready；processor 每键
+        // prepare 与本触发点都会启动加载，就绪后后续任务正常评分）
+        if (!g_loaded.load()) {
+            if (!g_loading.load()) load_model_async();
+            std::lock_guard<std::mutex> lk(g_async_mu);
+            g_async_result = AsyncRes{};
+            g_async_cv.notify_all();
+            continue;
+        }
+
+        AsyncRes res;
+        res.fingerprint = task.fingerprint;
+        res.cand_texts = task.cand_texts;
+        // token 化（模型已就绪）：候选 + 上文
+        std::vector<std::vector<llama_token>> cand_ids;
+        cand_ids.reserve(task.cand_texts.size());
+        res.segs.reserve(task.cand_texts.size());
+        for (auto & s : task.cand_texts) {
+            auto ids = tokenize(s.c_str());
+            if (ids.empty()) ids.push_back(0);
+            res.segs.push_back(token_seg_display(ids));
+            cand_ids.push_back(std::move(ids));
+        }
+        std::vector<llama_token> ctx_ids = ctx_token_ids(task.context.c_str());
+        if ((int)ctx_ids.size() < g_min_tokens) ctx_ids.clear();
+        // g_last_ctx_used 已由 ctx_token_ids 写（调试 getter 兼容；跨线程
+        // 写与既有 prepare 线程同风险面，字段仅调试显示用）
+        res.ctx_used = g_last_ctx_used;
+
+        if (ctx_ids.empty() || (int)cand_ids.size() < 2) {
+            std::lock_guard<std::mutex> lk(g_async_mu);
+            g_async_result = AsyncRes{};         // 失败发布（valid=false）
+            g_async_cv.notify_all();
+            continue;
+        }
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::vector<double> scores;
+        bool done = false;
+        try {
+            done = score_batch(ctx_ids, cand_ids, res.scores, &res.ce3,
+                               &res.prep_hit, &g_async_gen, task.gen);
+        } catch (...) {
+            log_msg("ERROR: exception in async score_batch");
+        }
+        // 评分线程锁已释放：补跑被延迟的 prepare（原 lua_score 收尾动作）
+        retry_pending_prepare();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        res.ev_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (done) {
+            res.valid = true;
+            std::lock_guard<std::mutex> lk(g_async_mu);
+            g_async_result = std::move(res);
+            // "最近一次评分"快照（get_scores/get_ce3/get_seg/get_ctx_used
+            // getter 兼容——假服务端/冒烟/研究路径仍可用）
+            g_last_scores = g_async_result.scores;
+            g_last_cands  = g_async_result.cand_texts;
+            g_last_ce3    = g_async_result.ce3;
+            g_last_seg    = g_async_result.segs;
+            g_last_prep_hit = g_async_result.prep_hit;
+            g_async_cv.notify_all();
+        }
+        // 中断（done=false）：不发布，结果槽留给新任务
+    }
+}
+
+static int lua_async_submit(lua_State * L) {
+    const char * context = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    int immediate = lua_toboolean(L, 3);
+    int n = (int)luaL_len(L, 2);
+    if (n > g_n_seq_max) n = g_n_seq_max;
+    std::vector<std::string> cands;
+    for (int i = 1; i <= n; i++) {
+        lua_rawgeti(L, 2, i);
+        const char * s = lua_tostring(L, -1);
+        if (s && *s) cands.push_back(s);
+        lua_pop(L, 1);
+    }
+    if ((int)cands.size() < 2 || !context || !*context) {
+        lua_pushnil(L);   // 任务不成立（调用方走层1 序）
+        return 1;
+    }
+    if (!g_async_started.load()) {
+        std::lock_guard<std::mutex> lk(g_async_mu);
+        if (!g_async_started.load()) {
+            g_async_thread = std::thread(async_worker_loop);
+            g_async_thread.detach();     // 进程内常驻，随进程退出
+            g_async_started.store(true);
+        }
+    }
+    std::string fp;
+    {
+        std::lock_guard<std::mutex> lk(g_async_mu);
+        long gen = g_async_gen.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_async_task = AsyncTask{};
+        g_async_task.valid = true;
+        g_async_task.gen = gen;
+        g_async_task.immediate = immediate != 0;
+        g_async_task.fingerprint = fp = async_fingerprint(context, cands);
+        g_async_task.context = context;
+        g_async_task.cand_texts = std::move(cands);
+        g_async_task.enq_at = std::chrono::steady_clock::now();
+    }
+    g_async_cv.notify_all();
+    lua_pushstring(L, fp.c_str());
+    return 1;
+}
+
+// 字词模式：阻塞等待指纹匹配的评分结果（与既有同步评分等价的延迟面）。
+// 超时返回 nil（模型加载中 / 评分未完成——上层 skip not_ready，评分线程
+// 继续跑完发布，后续 query 可经 poll 收割）。
+static int lua_async_wait(lua_State * L) {
+    const char * fp = luaL_checkstring(L, 1);
+    int timeout_ms = (int)luaL_optinteger(L, 2, 250);
+    std::unique_lock<std::mutex> lk(g_async_mu);
+    bool got = g_async_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                                   [&] {
+        return g_async_result.valid && g_async_result.fingerprint == fp;
+    });
+    if (!got) { lua_pushnil(L); return 1; }
+    pack_async_result(L, g_async_result);
+    g_async_result.valid = false;                // 取走即清（lua 侧有缓存）
+    return 1;
+}
+
+// 整句模式：非阻塞收割最近完成的评分结果（连同其指纹——收割方按指纹回填
+// 缓存与语料挂账）。无就绪结果返回 nil。
+static int lua_async_poll(lua_State * L) {
+    std::lock_guard<std::mutex> lk(g_async_mu);
+    if (!g_async_result.valid) { lua_pushnil(L); return 1; }
+    pack_async_result(L, g_async_result);
+    g_async_result.valid = false;
+    return 1;
+}
+
+// 代次递增 + 清任务槽：提交/上下文变化后中断在跑的评分（省 CPU 与锁占用）。
+// 结果槽保留——完成的评分成果仍可被后续 poll 收割回填。
+static int lua_async_cancel(lua_State * L) {
+    g_async_gen.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(g_async_mu);
+        g_async_task = AsyncTask{};
+    }
+    return 0;
 }
 
 // ============================================================
@@ -1938,6 +2236,10 @@ static int lua_index(lua_State * L) {
     else if (strcmp(key, "fg_changed") == 0)     lua_pushcfunction(L, lua_fg_changed);
     else if (strcmp(key, "click_happened") == 0) lua_pushcfunction(L, lua_click_happened);
     else if (strcmp(key, "live_write") == 0)     lua_pushcfunction(L, lua_live_write);
+    else if (strcmp(key, "async_submit") == 0)   lua_pushcfunction(L, lua_async_submit);
+    else if (strcmp(key, "async_wait") == 0)     lua_pushcfunction(L, lua_async_wait);
+    else if (strcmp(key, "async_poll") == 0)     lua_pushcfunction(L, lua_async_poll);
+    else if (strcmp(key, "async_cancel") == 0)   lua_pushcfunction(L, lua_async_cancel);
     else if (strcmp(key, "model_path") == 0) lua_pushstring(L, g_model_path.c_str());
     else if (strcmp(key, "max_ctx") == 0)   lua_pushinteger(L, g_max_ctx_tokens);
     else if (strcmp(key, "min_tokens") == 0) lua_pushinteger(L, g_min_tokens);
@@ -2010,6 +2312,16 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
     // 不走 __newindex 属性语义——可写属性预填充禁令不适用于函数）
     lua_pushcfunction(L, lua_live_write);
     lua_setfield(L, -2, "live_write");
+
+    // 异步评分器（2026-11-22 异步基建）：submit/wait/poll/cancel 直挂
+    lua_pushcfunction(L, lua_async_submit);
+    lua_setfield(L, -2, "async_submit");
+    lua_pushcfunction(L, lua_async_wait);
+    lua_setfield(L, -2, "async_wait");
+    lua_pushcfunction(L, lua_async_poll);
+    lua_setfield(L, -2, "async_poll");
+    lua_pushcfunction(L, lua_async_cancel);
+    lua_setfield(L, -2, "async_cancel");
 
     // 目录确保（2026-11-21）：llm_rerank 子目录收纳记录文件，lua 侧
     // 迁移/首写前调用（rime-lua 无 mkdir）

@@ -1,6 +1,12 @@
 -- llm_filter.lua — LLM candidate rerank filter
 -- 由 schema llm_rerank.enabled 控制：true | false
 -- false 时不加载 DLL，不推理，候选原样透传
+--
+-- 异步基建（2026-11-22，两版同构）：评分移出按键路径——DLL 持久评分线程
+-- （覆盖式任务槽 + 代次中断 + 40ms 去抖），同步路径零 LLM。字词模式
+-- submit+wait（等价既有同步评分，当前词重排零回归）；整句模式纯异步投递
+-- （打字流畅优先，评分结果由后续 query 收割回填——当前轮层1 序、翻页/重
+-- 重建命中缓存即融合序）。快照缓存指纹 = 上文\x1f候选\x1e拼接串。
 
 local llm = nil
 local llm_loaded_for = nil  -- enabled value when llm was loaded
@@ -383,6 +389,104 @@ local function is_valid_llm_score(v)
     return is_finite_number(v) and v > -1e9
 end
 
+-- 挂账回填（2026-11-22 异步基建）：整句模式异步评分结果收割时补写语料。
+-- final 序 = 窗内候选按融合分重排（文本域现算：eff/uni/pairfix 为微秒级
+-- 内存查询；账本 tick 与提交时刻的漂移 ≤1 词提交，v1 接受——回填只写
+-- W ok（flags=async）+ debug P 行，D/L/C 明细行省略）。
+local function write_pending_result(pend, snap)
+    local win = pend.l1win or {}
+    local scores = snap.scores or {}
+    local pftbl = pairfix_table()
+    local min_valid = nil
+    for _, t in ipairs(win) do
+        local s = scores[t]
+        if is_valid_llm_score(s) and (not min_valid or s < min_valid) then
+            min_valid = s
+        end
+    end
+    local arr = {}
+    for i, t in ipairs(win) do
+        local s = scores[t]
+        local n = _G.user_freq_eff and _G.user_freq_eff(t, pend.code) or 0
+        local u1 = _G.user_unigram_term
+                and _G.user_unigram_term(t, pend.code) or 0
+        local delta = pairfix_delta(pftbl, t, pend.code)
+        local v
+        if is_valid_llm_score(s) then
+            v = s + FREQ_BETA * math.log(1 + n) + u1 + delta
+        else
+            -- 无 CE 分（哨兵/缺失）：层1 分 + 窗内最低 LLM 分（压制窗底，
+            -- 与同步版同语义）
+            v = (FREQ_BETA * math.log(1 + n) + u1)
+                    + (min_valid and min_valid or 0) + delta
+        end
+        arr[i] = { t = t, v = v, i = i }
+    end
+    table.sort(arr, function(a, b)
+        if a.v ~= b.v then return a.v > b.v end
+        return a.i < b.i    -- 同分稳定保提交序（层1 序）
+    end)
+    local final = {}
+    for i, e in ipairs(arr) do final[i] = e.t end
+    if pend.wid then
+        _G.llm_write_w(pend.wid, pend.ctx_src, pend.code, pend.context,
+                       pend.engine_top, pend.l1win, final, pend.tick,
+                       "ok", "", snap.prep and true or false, "async")
+        _G.llm_debug_p(pend.wid, snap.ev_ms or 0, snap.prep and true or false)
+    end
+end
+
+-- ═══ 异步基建（2026-11-22，两版同构）═══
+-- 评分结果缓存（指纹 → 评分快照）：指纹 = 上文\x1f候选\x1e拼接串（与 DLL
+-- 任务槽同构，上文/候选变化自然失效，无需失效链）。命中场景 = 同指纹重复
+-- query（翻页/候选窗重建/收割回填）——同步路径零 LLM。快照结构
+-- {cands, scores, ce3, segs, prep, ctx_used, ev_ms} 与 DLL async_wait/poll
+-- 返回一致；融合分（eff/pairfix 叠加）每次命中现算，不缓存融合结果。
+-- pending：指纹 → 语料挂账——整句模式异步投递时登记，评分结果收割时补写
+-- W ok/P 行；任务被覆盖/取消则条目随容量清理丢弃（快速连打的中间键不落
+-- 语料 = "只有完成的评分才落 W"的异步语义）。
+local res_cache, pending = {}, {}
+local function cache_trim()
+    local n = 0
+    for _ in pairs(res_cache) do n = n + 1 end
+    if n > 16 then res_cache = {} end
+    n = 0
+    for _ in pairs(pending) do n = n + 1 end
+    if n > 32 then pending = {} end
+end
+local function make_fp(context, cands)
+    return context .. "\x1f" .. table.concat(cands, "\x1e")
+end
+
+-- 收割点（2026-11-22）：回收最近完成的评分成果——回填缓存 + 补写挂账。
+-- 两个调用点：① filter 入口（每次 query，翻页/候选窗重建命中缓存即
+-- 0 LLM）；② llm_async_cancel（上屏时本词评分多半已完成——先收割落账
+-- 再取消在跑的，场景内最后一词也有 ok 行）。
+function _G.llm_async_harvest()
+    if not (llm and llm.async_poll) then return end
+    local okp, old = pcall(function() return llm.async_poll() end)
+    if okp and type(old) == "table" and old.fp and old.scores then
+        res_cache[old.fp] = old
+        local pend = pending[old.fp]
+        if pend then
+            write_pending_result(pend, old)
+            pending[old.fp] = nil
+        end
+        cache_trim()
+    end
+end
+
+-- 提交/上下文变化后由 llm_processor 的 commit 通知调用：先收割（上屏时
+-- 本词评分多半已完成，立即落账），再中断在跑的评分（DLL 代次递增 + 清
+-- 任务槽），挂账条目随代次废弃（下次容量清理丢弃）。
+function _G.llm_async_cancel()
+    _G.llm_async_harvest()
+    if llm and llm.async_cancel then
+        pcall(llm.async_cancel)
+        pending = {}
+    end
+end
+
 -- 编码模式匹配（2026-09-30）：全串匹配，语义同 Rime speller/auto_select_pattern。
 -- 优先 DLL 的 std::regex（ECMAScript，与源码版 boost::regex 同套语法）；
 -- 老版本 DLL 无 match_code 时回退 Lua 模式（用 find 的全串匹配 + 首尾锚定）。
@@ -566,6 +670,10 @@ return function(translation, env)
     if enabled and not llm_loaded_for then
         load_llm(env)
     end
+    -- 异步基建收割点（2026-11-22）：query 开头先收割最近完成的异步评分
+    --（回填缓存 + 挂账补写）——同指纹重复 query（翻页/候选窗重建）即命中
+    -- 0 LLM。收割与当前 query 的指纹无关（收割的是历史任务成果）。
+    _G.llm_async_harvest()
     local pattern_ok = enabled and match_code_pattern(code) or false
     -- 常开语料 W：只在 enabled + pattern 匹配时尝试（部分输入码不落行）。
     local rec = enabled and pattern_ok
@@ -717,27 +825,81 @@ return function(translation, env)
         end
         cands = {}
     end
+    -- ═══ 评分（2026-11-22 异步基建重构：snap 快照中心）═══
+    -- snap = 评分快照 {cands, scores, ce3, segs, prep, ctx_used, ev_ms}，四路
+    -- 来源：①缓存命中（同指纹重复 query，0 LLM）②整句模式异步投递（不等待
+    -- → 层1 序 + 挂账，评分结果由后续 query 收割回填）③字词模式 submit+wait
+    -- （immediate 跳过去抖 + 250ms 上限——与既有同步评分等价的延迟面，当前
+    -- 词重排零回归）④旧 DLL 回退（无 async_* 接口时同步 llm.score 原路径）。
+    -- 融合块统一从 snap 读 CE 三分量/段显/ctx_used/prep。
     local ok, result, scores
-    local ev_ms = 0   -- 本轮推理耗时（实时调试 L 行用）
+    local snap = nil
+    local ev_ms = 0   -- 本轮评分耗时（实时调试 L 行用；异步路径 = 纯评分耗时）
+    local sent_pending = false   -- 整句模式已投递挂账（本轮层1 序输出）
+    local prep_flag = "0"
     if #cands >= 2 then
-        do
-        local t0 = os.clock()
-        ok, result = pcall(function() return llm.score(context, cands) end)
-        local elapsed_ms = (os.clock() - t0) * 1000
-        ev_ms = elapsed_ms
-        if ok and type(result) == "table" then
-            scores = get_scores(cands)
+        local fp = make_fp(context, cands)
+        snap = res_cache[fp]
+        if snap and not snap.scores then snap = nil end
+        if not snap and llm.async_submit then
+            local okp, fp_r = pcall(llm.async_submit, context, cands,
+                                    not sent_on)
+            if okp and fp_r then
+                if sent_on then
+                    -- 整句模式：0 LLM 投递即走（打字流畅优先——40ms 去抖 +
+                    -- 可中断 decode，快速连打自动作废重投）。当前轮层1 序，
+                    -- 评分结果由后续 query 的收割点补写语料（挂账 pending）。
+                    pending[fp_r] = { wid = wid, code = code,
+                                      ctx_src = ctx_src, context = context,
+                                      engine_top = engine_top,
+                                      l1win = l1win, tick = tick }
+                    cache_trim()
+                    sent_pending = true
+                else
+                    -- 字词模式：同步等待评分完成（等价既有同步评分——当前
+                    -- 词重排零回归；wait 超时 = skip，评分线程继续跑完，
+                    -- 后续 query 可收割）
+                    local okw, res = pcall(llm.async_wait, fp_r, 250)
+                    if okw and type(res) == "table" and res.scores then
+                        res_cache[fp_r] = res
+                        snap = res
+                        cache_trim()
+                    end
+                end
+            end
         end
+        if not snap and not sent_pending and not llm.async_submit then
+            -- 旧 DLL 回退：同步评分（既有路径原样）
+            do
+            local t0 = os.clock()
+            ok, result = pcall(function() return llm.score(context, cands) end)
+            local elapsed_ms = (os.clock() - t0) * 1000
+            ev_ms = elapsed_ms
+            if ok and type(result) == "table" then
+                scores = get_scores(cands)
+            end
 
-        lat_count = lat_count + 1
-        if elapsed_ms > lat_max then lat_max = elapsed_ms end
-        end   -- if #cands >= 2（满长准入窗 <2 跳过评分）
+            lat_count = lat_count + 1
+            if elapsed_ms > lat_max then lat_max = elapsed_ms end
+            end   -- if #cands >= 2（满长准入窗 <2 跳过评分）
+        end
     end
 
-    -- 失败原因（用于 W skip）；ok/result 成功时为空
+    if snap then
+        ev_ms = snap.ev_ms or 0
+        prep_flag = snap.prep and "1" or "0"
+    end
+
+    -- 失败原因（用于 W skip）；snap 成功时为空
     local skip_reason = nil
-    if #cands >= 2 then
-        if not ok then
+    if #cands >= 2 and not snap then
+        if sent_pending then
+            skip_reason = "async_pending"    -- 已投递待收割（本轮层1 序）
+        elseif llm.async_submit then
+            -- 异步路径未拿到结果（wait 超时 / 任务不成立）
+            local okr, ready = pcall(function() return llm.is_ready() end)
+            skip_reason = (okr and ready) and "async_timeout" or "not_ready"
+        elseif not ok then
             skip_reason = "score_failed"
         elseif type(result) ~= "table" then
             local okr, ready = pcall(function() return llm.is_ready() end)
@@ -749,19 +911,27 @@ return function(translation, env)
 
     local live_ready = "n/a"
     local dbg = cfg.debug_fusion and {} or nil
-    local prep_flag = "0"
     if dbg then
         local okr, r = pcall(function() return llm.is_ready() end)
         if okr then live_ready = r and "1" or "0" end
-        local okp, ph = pcall(function() return llm.prep_hit end)
-        prep_flag = (okp and ph) and "1" or "0"
+        if not snap then
+            local okp, ph = pcall(function() return llm.prep_hit end)
+            prep_flag = (okp and ph) and "1" or "0"
+        end
         if skip_reason then
             live("S|" .. os.date("%H:%M:%S") .. "|" .. skip_reason .. "|" ..
                  live_esc(input) .. "|" .. live_esc(ctx_src))
         end
     end
 
-    if ok and result then
+    if snap or (ok and result) then
+        if snap and not result then
+            -- 快照路径（缓存命中 / 字词 wait）：cands = 提交序文本数组。
+            -- 融合块对 ordered 全量重排，初序仅影响浮点精确同分的打破序
+            --（旧 DLL = CE 降序，快照路径 = 层1 提交序——同分罕见，v1 接受）
+            result = snap.cands
+            scores = snap.scores
+        end
         local seen = {}
         local ordered = {}
         for i = 1, #result do
@@ -800,18 +970,23 @@ return function(translation, env)
         local fused_scores = nil
         if #ordered > 1 and scores then
             local freq_eff = _G.user_freq_eff
-            -- CE 三分量（2026-11-11 协议 v2）：get_ce3 = text → {c1,c2,c3}
-            -- 原始分量（未乘权重）；旧 DLL 无此函数时静默缺省
+            -- CE 三分量（2026-11-11 协议 v2）：text → {c1,c2,c3} 原始分量
+            --（未乘权重）。异步基建（2026-11-22）：快照路径从 snap 读（避免
+            -- 与评分线程的"最近一次评分"竞争）；旧 DLL 同步路径走 getter
             local ce3map = nil
-            if llm.get_ce3 then
+            if snap then
+                ce3map = snap.ce3
+            elseif llm.get_ce3 then
                 local okc, m = pcall(llm.get_ce3)
                 if okc and type(m) == "table" then ce3map = m end
             end
-            -- token 边界段显（2026-11-21 协议 v7）：get_seg = text → "cm/ak"
-            -- ——段只落在 token 边界 ∩ 字符边界（单 token 多字不劈，字内
-            -- 多 token 合并不劈字）；旧 DLL 无此函数时静默缺省（"词"列显示原词）
+            -- token 边界段显（2026-11-21 协议 v7）：text → "cm/ak"——段只落
+            -- 在 token 边界 ∩ 字符边界（单 token 多字不劈，字内多 token
+            -- 合并不劈字）；旧 DLL 无此函数时静默缺省（"词"列显示原词）
             local segmap = nil
-            if llm.get_seg then
+            if snap then
+                segmap = snap.segs
+            elseif llm.get_seg then
                 local oks, ms = pcall(llm.get_seg)
                 if oks and type(ms) == "table" then segmap = ms end
             end
@@ -915,8 +1090,12 @@ return function(translation, env)
             -- 协议 v4（2026-11-12）：L 尾追加 ctx_used = 推理实际使用的
             -- 上文尾部文本（去空白上文中末 ≤max_ctx token 的原文段，
             -- get_ctx_used 容错旧 DLL；查看器据此灰显未用前缀）
-            local okcu, cu = pcall(function() return llm.get_ctx_used() end)
-            local ctxused = (okcu and type(cu) == "string") and live_esc(cu) or ""
+            local cu = snap and snap.ctx_used
+            if cu == nil then
+                local okcu, cu2 = pcall(function() return llm.get_ctx_used() end)
+                cu = (okcu and type(cu2) == "string") and cu2 or ""
+            end
+            local ctxused = live_esc(cu)
             -- L 第 3 字段原为评分缓存 HIT/MISS——缓存已删（2026-11-11），
             -- 保留位置发 "-"（旧查看器显示"评缓 -"，字段数不变免错位）
             -- 尾两字段: prep=预解码命中, ctx_used=推理用尾部。
@@ -1015,13 +1194,24 @@ return function(translation, env)
             end
         end
     else
-        -- 评分失败/缺分: 层1 已重排全体候选 → 按层1 序展示
+        -- 评分未就绪/失败: 按层1 序展示。整句模式保持三块不变量
+        -- （FM 窗外层1 序 + PM 引擎序——"匹配在前、部分在后"不因异步化
+        -- 改变；async_pending 常态路径走这里），关闭态保持全层1 序。
         if wid and not w_written then
             _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
                            {}, tick, "skip", skip_reason or "score_failed",
                            prep_flag == "1", "")
             w_written = true
         end
-        for _, e in ipairs(layer1) do yield(e.c) end
+        if sent_on then
+            for _, e in ipairs(layer1) do
+                if is_fm(e.c) then yield(e.c) end
+            end
+            for _, c in ipairs(all) do
+                if not is_fm(c) then yield(c) end
+            end
+        else
+            for _, e in ipairs(layer1) do yield(e.c) end
+        end
     end
 end

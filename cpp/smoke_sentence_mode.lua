@@ -7,6 +7,10 @@
 --      pattern/词频键/调试行随切片
 --   D  sentence_mode 关闭：混合语义不变（PM 可进窗，窗外层1 序）
 --   E  span 不可用兜底：回退旧长度规则 词长==⌊码长/2⌋（两码方案保真）
+--   F  two_code_sentence 旧键迁移（原 smoke_tcs 合并，2026-11-22 测试
+--      精简）：旧键直升整句模式 + code_pattern 锁定（.{4} 旧值被覆盖，
+--      2 码即触发）+ 长度规则路径的 full_len_lt2 skip + 层1 序输出
+--      （smoke_tcs 场景 B 与本文件 E 同代码路径同断言，不再单测）
 -- 真 DLL + 真模型（Qwen3-0.6B base）；live_write 打桩截获管道行。
 -- C 行 1 基下标：C=1 eng=2 word=3 s1=4 ce=5 … full=9 cerank=10 fin=11 win=12
 package.cpath = [[build/Release/?.dll]]
@@ -79,6 +83,22 @@ end
 local filter = dofile("../user/llm_filter.lua")
 assert(type(filter) == "function", "filter not loaded")
 
+-- 异步基建（2026-11-22）适配：整句模式首轮异步挂账不评分（层1 序输出 +
+-- S|async_pending），同输入二次 query 经收割回填后缓存命中走融合路径。
+-- 本 helper 先跑挂账轮、等评分完成、再跑收割轮，使场景断言仍落在融合
+-- 路径（FM 窗融合序 + L/C 行——语义与同步版等价）。
+local function msleep(ms)
+  local t = os.clock()
+  while (os.clock() - t) * 1000 < ms do end
+end
+local function sent_run(cands, input, seg, wait_ms)
+  OUT = {}; LIVE = {}
+  filter(mktrans(cands), mkenv(true, input, seg))
+  msleep(wait_ms or 250)
+  OUT = {}; LIVE = {}
+  filter(mktrans(cands), mkenv(true, input, seg))
+end
+
 local function lrows()
   local rows = {}
   for _, l in ipairs(LIVE) do
@@ -109,11 +129,9 @@ local function saw_skip(reason)
 end
 
 -- ═══ 场景 A：简拼 "nm"——FM(你们/尼玛) 进窗，PM(你/那) 尾窗引擎序 ═══
-OUT = {}
-LIVE = {}
-filter(mktrans({
+sent_run({
     mkc("你们", 0, 2), mkc("尼玛", 0, 2), mkc("你", 0, 1), mkc("那", 0, 1),
-  }), mkenv(true, "nm", { start = 0, _end = 2 }))
+  }, "nm", { start = 0, _end = 2 })
 assert(#OUT == 4, "A: yield count=" .. #OUT)
 local top2 = OUT[1].text .. "," .. OUT[2].text
 assert(top2 == "你们,尼玛" or top2 == "尼玛,你们",
@@ -147,12 +165,10 @@ assert(#crows() == 0, "B: 不应有 C 行（整窗跳过）")
 print("[smoke] B 满覆盖不足跳过 + 引擎序透传 OK")
 
 -- ═══ 场景 C：多段续打——活动段切片 shijie，PM 尾窗引擎序 ═══
-OUT = {}
-LIVE = {}
-filter(mktrans({
+sent_run({
     mkc("世界", 5, 11), mkc("世纪", 5, 11),
     mkc("时", 5, 7), mkc("季", 9, 11), mkc("接", 10, 11),
-  }), mkenv(true, "nihaoshijie", { start = 5, _end = 11 }))
+  }, "nihaoshijie", { start = 5, _end = 11 })
 assert(#OUT == 5, "C: yield count=" .. #OUT)
 local topc = OUT[1].text .. "," .. OUT[2].text
 assert(topc == "世界,世纪" or topc == "世纪,世界",
@@ -181,10 +197,8 @@ assert(pm_in_win >= 1, "D: 关闭态 PM 应可进窗（层1 前 k）")
 print("[smoke] D 关闭态混合语义（PM 可进窗）OK")
 
 -- ═══ 场景 E：span 不可用兜底——回退旧长度规则（两码方案保真）═══
-OUT = {}
-LIVE = {}
-filter(mktrans({ mkc("一次"), mkc("一点点"), mkc("一起") }),
-       mkenv(true, "iock", { start = 0, _end = 4 }))
+sent_run({ mkc("一次"), mkc("一点点"), mkc("一起") },
+         "iock", { start = 0, _end = 4 })
 assert(#OUT == 3, "E: yield count=" .. #OUT)
 local f2 = OUT[1].text .. "," .. OUT[2].text
 assert(f2 == "一次,一起" or f2 == "一起,一次",
@@ -199,5 +213,62 @@ for _, f in ipairs(win1) do
   assert(f[9] == "1", "E: 窗内候选 full 应=1")
 end
 print("[smoke] E span 不可用回退旧长度规则 OK")
+
+-- ═══ 场景 F：two_code_sentence 旧键迁移（原 smoke_tcs 合并）═══
+-- 旧键读取兜底：sentence_mode 新键缺席时沿用旧键值；开启后 code_pattern
+-- 锁定 '.{2,}'（方案节 '.{4}' 旧值被运行期覆盖——2 码即触发重排）。
+-- F1 = 迁移配置下跑 2 码 nm：.{4} 旧值会让 pattern 不匹配（无 W 行），
+--      W 行出现即证明锁定 + 迁移双生效；
+-- F2 = 长度规则路径（候选无 span）的 skip：全非满长（3 字词）→
+--      full_len_lt2 + 层1 序输出 + 无 C 行（原 smoke_tcs 场景 A）。
+local function mkenv_tcs(input, seg)
+  return {
+    engine = {
+      schema = { config = {
+        get_bool = function(_, k)
+          if k == "llm_rerank/enabled" then return true end
+          if k == "llm_rerank/debug_fusion" then return true end
+          if k == "llm_rerank/two_code_sentence" then return true end
+          return nil   -- sentence_mode 新键缺席（旧方案形态）
+        end,
+        get_int = function(_, k)
+          if k == "llm_rerank/max_candidates" then return 5 end
+          return nil
+        end,
+        get_string = function(_, k)
+          if k == "llm_rerank/code_pattern" then return ".{4}" end
+          if k == "llm_rerank/model_path" then return MODEL end
+          return nil
+        end,
+      } },
+      context = {
+        input = input,
+        composition = seg and
+            { back = function() return seg end } or nil,
+      },
+    },
+  }
+end
+-- F1：迁移 + 锁定（2 码触发即证锁定 '.{2,}' 生效）。候选文本换新词——
+-- 指纹 = 上文+候选文本，同候选会命中前面场景的缓存（缓存命中不再挂账
+-- 是正确生产语义，场景隔离靠换候选）
+OUT = {}
+LIVE = {}
+filter(mktrans({
+    mkc("生产", 0, 2), mkc("生活", 0, 2), mkc("生", 0, 1), mkc("活", 0, 1),
+  }), mkenv_tcs("ns", { start = 0, _end = 2 }))
+assert(#OUT == 4, "F1: yield count=" .. #OUT)
+assert(saw_skip("async_pending"), "F1: 迁移配置未触发整句模式（无挂账）")
+-- F2：长度规则 skip（原 smoke_tcs 场景 A 断言原样）
+OUT = {}
+LIVE = {}
+filter(mktrans({ mkc("一点点"), mkc("一下子") }),
+       mkenv_tcs("iock", { start = 0, _end = 4 }))
+assert(#OUT == 2, "F2: yield count=" .. #OUT)
+assert(OUT[1].text == "一点点" and OUT[2].text == "一下子",
+    "F2: 层1序输出错: " .. OUT[1].text .. "," .. OUT[2].text)
+assert(saw_skip("full_len_lt2"), "F2: 未发 S|full_len_lt2")
+assert(#crows() == 0, "F2: 不应有 C 行（整窗跳过）")
+print("[smoke] F 旧键迁移 + 锁定 + 长度规则 skip OK")
 
 print("[smoke] SMOKE-SENTENCE-MODE OK")

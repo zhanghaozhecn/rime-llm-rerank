@@ -382,6 +382,11 @@ local function processor(key, env)
                 if #_G.llm_commit_inputs > 16 then
                     table.remove(_G.llm_commit_inputs, 1)
                 end
+                -- 异步基建（2026-11-22）：提交后上文变化，中断在跑的评分
+                -- （DLL 代次递增 + 清任务槽，score_batch Step 边界生效）；
+                -- lua 侧挂账条目随代次废弃。评分结果槽保留——已完成的成果
+                -- 仍可被后续 query 收割回填。
+                if _G.llm_async_cancel then pcall(_G.llm_async_cancel) end
             end)
         end)
     end
