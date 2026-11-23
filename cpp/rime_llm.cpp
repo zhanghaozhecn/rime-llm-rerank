@@ -90,6 +90,7 @@ static constexpr double kCeW1 = 1.0, kCeW2 = 1.10, kCeW3 = 0.60;
 // ============================================================
 static llama_model        * g_model   = nullptr;
 static llama_context      * g_ctx     = nullptr;
+static llama_context      * g_full_ctx = nullptr;  // 整句 CE 专用（与生产 3-token 上下文隔离）
 static const llama_vocab  * g_vocab   = nullptr;
 static std::mutex           g_mutex;
 static std::atomic<bool>    g_loaded{false};
@@ -1064,7 +1065,8 @@ static void unload_model() {
     while (g_loading.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_loaded.load() || g_model || g_ctx) {
+    if (g_loaded.load() || g_model || g_ctx || g_full_ctx) {
+        if (g_full_ctx) { llama_free(g_full_ctx); g_full_ctx = nullptr; }
         if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
         if (g_model) { llama_model_free(g_model); g_model = nullptr; }
         g_vocab = nullptr;
@@ -1536,6 +1538,132 @@ static bool score_batch(const std::vector<llama_token> & ctx_ids,
                 "r2=%d r3=%d",
                 wait_ms, ms1, ms_ce1, ms2a, ms2b, ms3, ms_score, total_ms,
                 use_prep ? 1 : 0, ctx_len, n_cands, U, V);
+    return true;
+}
+
+// ============================================================
+// 整句 CE 打分（2026-11-23，研究→生产第一版）
+//
+// 5 个**句子候选**从 N-gram 组句器来（max_sentences=1 的 poet 不出多句），
+// 生产 3-token 路径只看到句首，不能用于整句重排。本函数用**独立上下文**
+// g_full_ctx 算完整候选 token 的条件 CE 和：
+//   Step 1: ctx 一次 decode（seq 0）→ 共享 logits 算各候选首 token CE
+//   Step 2..N: 每个候选一条 worker seq（ctx KV copy），逐 token 并行 decode
+// 与 score_batch 的 3-token 路径完全隔离（不碰 prep/seq0），互不影响。
+// 返回 sum（负 CE 和，越大越好）与 ntok；max_tokens 上限 48。
+// ============================================================
+static bool ensure_full_ctx() {
+    // 调用方持 g_mutex（创建/释放与 unload 串行）
+    if (g_full_ctx) return true;
+    if (!g_loaded.load() || !g_model) return false;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 512;          // 6 seq × (ctx ≤10 + 候选 ≤48) ≈ 350
+    cp.n_threads = g_n_threads;
+    cp.n_threads_batch = g_n_threads;
+    cp.n_seq_max = 6;        // seq 0 = ctx，1..5 = 5 个句子候选
+    g_full_ctx = llama_init_from_model(g_model, cp);
+    if (!g_full_ctx) {
+        log_msg("ERROR: failed to create full-sentence context");
+        return false;
+    }
+    log_msg("full-sentence ctx ready (n_ctx=512 seq=6)");
+    return true;
+}
+
+static bool score_full_batch(const std::vector<llama_token> & ctx_ids,
+                             const std::vector<std::vector<llama_token>> & cands,
+                             std::vector<double> & sum_out,
+                             std::vector<int> & ntok_out,
+                             int max_tokens = 48) {
+    int n = (int)cands.size();
+    sum_out.assign(n, 0.0);
+    ntok_out.assign(n, 0);
+    if (n == 0 || n > 5 || ctx_ids.empty()) return false;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!ensure_full_ctx()) return false;
+    const int ctx_len = (int)ctx_ids.size();
+    const int vs = llama_vocab_n_tokens(g_vocab);
+    int max_len = 0;
+    for (const auto & c : cands) max_len = (std::max)(max_len, (int)c.size());
+    // 每 seq 预算：n_ctx / (n+1) - ctx - 1（共享 KV 总容量）
+    int budget = 512 / (n + 1) - ctx_len - 1;
+    max_len = (std::min)(max_len, (std::min)(max_tokens, budget));
+    if (max_len <= 0) return false;
+
+    llama_memory_clear(llama_get_memory(g_full_ctx), false);
+    // ---- ctx decode（seq 0）----
+    {
+        llama_batch b = llama_batch_init(ctx_len, 0, 1);
+        for (int j = 0; j < ctx_len; j++) {
+            b.token[j] = ctx_ids[j]; b.pos[j] = j;
+            b.n_seq_id[j] = 1; b.seq_id[j][0] = 0;
+        }
+        b.logits[ctx_len - 1] = 1;
+        b.n_tokens = ctx_len;
+        bool ok = llama_decode(g_full_ctx, b) == 0;
+        llama_batch_free(b);
+        if (!ok) return false;
+    }
+    const float * cl = llama_get_logits_ith(g_full_ctx, ctx_len - 1);
+    if (!cl) return false;
+    float m0; double lse0;
+    logits_normalizer(cl, vs, m0, lse0);
+    for (int i = 0; i < n; i++) {
+        if (!cands[i].empty()) {
+            sum_out[i] = ce_target(cl, cands[i][0], m0, lse0);
+            ntok_out[i] = 1;
+        }
+    }
+    // ctx KV → 每个候选 seq（一次性 copy）
+    for (int i = 0; i < n; i++)
+        llama_memory_seq_cp(llama_get_memory(g_full_ctx), 0, i + 1, 0, -1);
+
+    // ---- 一次性 decode 全部候选 token（每候选一条 seq，ctx KV 已 copy）----
+    // 逐步 decode（每 token 一次 forward）在 0.6B 上每步约 20ms，15 步 ≈ 300ms；
+    // 这里把所有候选 token 放进**同一个 batch**、一次 forward 取全位置 logits，
+    // CE 只做查表/归一化——同一数学，forward 次数从 N 降到 1。
+    std::vector<int> base(n, -1);
+    std::vector<int> lens(n, 0);
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        lens[i] = (std::min)((int)cands[i].size(), max_len);
+        total += lens[i];
+    }
+    if (total <= 0) return true;
+    llama_batch b = llama_batch_init(total, 0, n);
+    int row = 0;
+    for (int i = 0; i < n; i++) {
+        base[i] = row;
+        int len = lens[i];
+        for (int j = 0; j < len; j++, row++) {
+            b.token[row] = cands[i][j];
+            b.pos[row] = ctx_len + j;
+            b.n_seq_id[row] = 1;
+            b.seq_id[row][0] = i + 1;
+            // 该 token 的 logits 预测下一个 token；最后一个不用
+            b.logits[row] = (j + 1 < len) ? 1 : 0;
+        }
+    }
+    b.n_tokens = row;
+    bool ok = llama_decode(g_full_ctx, b) == 0;
+    if (ok) {
+        for (int i = 0; i < n; i++) {
+            int len = lens[i];
+            for (int j = 1; j < len; j++) {
+                float * l = llama_get_logits_ith(g_full_ctx, base[i] + j - 1);
+                if (!l) { sum_out[i] = 1e10; break; }
+                float m; double lse;
+                logits_normalizer(l, vs, m, lse);
+                sum_out[i] += ce_target(l, cands[i][j], m, lse);
+                ntok_out[i] = j + 1;
+            }
+        }
+    }
+    llama_batch_free(b);
+    // worker seq 清理（共享 KV cell 归属释放；seq0 与生产上下文无关）
+    auto * mem = llama_get_memory(g_full_ctx);
+    for (int i = 0; i < n; i++)
+        llama_memory_seq_rm(mem, i + 1, 0, -1);
     return true;
 }
 
@@ -2090,6 +2218,65 @@ static int lua_score(lua_State * L) {
     return 1;
 }
 
+// llm.score_full(ctx, cands) → {{sum_ce=.., mean_ce=.., ntok=..}, ...}
+// 整句 CE（完整候选 token），输入顺序对应输出；失败返回 nil。
+static int lua_score_full(lua_State * L) {
+    if (!g_loaded.load()) {
+        if (!g_loading.load()) load_model_async();
+        lua_pushnil(L);
+        return 1;
+    }
+    const char * context = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    int n = (int)luaL_len(L, 2);
+    if (n < 1) { lua_pushnil(L); return 1; }
+    if (n > 5) n = 5;  // g_full_ctx: seq0 + 5 候选
+    std::vector<std::string> texts;
+    for (int i = 1; i <= n; i++) {
+        lua_rawgeti(L, 2, i);
+        const char * s = lua_tostring(L, -1);
+        if (s) texts.push_back(s);
+        lua_pop(L, 1);
+    }
+    if (texts.empty()) { lua_pushnil(L); return 1; }
+    auto ctx_ids = ctx_token_ids(context);
+    if (ctx_ids.empty()) { lua_pushnil(L); return 1; }
+    std::vector<std::vector<llama_token>> cand_ids;
+    for (auto & s : texts) {
+        auto ids = tokenize(s.c_str());
+        if (ids.empty()) ids.push_back(0);
+        cand_ids.push_back(std::move(ids));
+    }
+    std::vector<double> sums;
+    std::vector<int> ntok;
+    bool ok = false;
+    try {
+        ok = score_full_batch(ctx_ids, cand_ids, sums, ntok, 48);
+    } catch (...) {
+        log_msg("ERROR: exception in score_full_batch");
+    }
+    if (!ok) { lua_pushnil(L); return 1; }
+    lua_newtable(L);
+    for (int i = 0; i < (int)sums.size(); i++) {
+        lua_newtable(L);
+        lua_pushnumber(L, sums[i]);
+        lua_setfield(L, -2, "sum_ce");
+        lua_pushnumber(L, ntok[i] > 0 ? sums[i] / ntok[i] : 0.0);
+        lua_setfield(L, -2, "mean_ce");
+        lua_pushinteger(L, ntok[i]);
+        lua_setfield(L, -2, "ntok");
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+// 墙钟毫秒（研究/基准用；steady_clock 单调，差值有效）
+static int lua_now_ms(lua_State * L) {
+    auto t = std::chrono::steady_clock::now().time_since_epoch();
+    lua_pushnumber(L, std::chrono::duration<double, std::milli>(t).count());
+    return 1;
+}
+
 static int lua_get_scores(lua_State * L) {
     std::lock_guard<std::mutex> lock(g_mutex);
     lua_newtable(L);
@@ -2368,6 +2555,12 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
 
     lua_pushcfunction(L, lua_score);
     lua_setfield(L, -2, "score");
+
+    lua_pushcfunction(L, lua_score_full);
+    lua_setfield(L, -2, "score_full");
+
+    lua_pushcfunction(L, lua_now_ms);
+    lua_setfield(L, -2, "now_ms");
 
     lua_pushcfunction(L, lua_prepare);
     lua_setfield(L, -2, "prepare");
