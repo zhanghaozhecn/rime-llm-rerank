@@ -66,10 +66,12 @@ static std::string  g_model_path      = default_model_path();
 static int          g_min_tokens      = 1;
 static int          g_max_ctx_tokens  = 10; // tok=10 准确率 93.4%，10→17 收益仅 +1.1pp 但延迟翻倍
 static int          g_n_threads       = 4;  // 默认=GGML 默认; 可用 bench_threads 实测后配置
-static int          g_n_ctx           = 128; // KV: 11 seqs × (ctx 10 + cand 2) = 132, 64 溢出
-                                              //（2026-09-11 对齐源码版 llm_filter.cc 同款修正：
-                                              //  64 时 score 的 S2 恒 ~100ms vs 128 的 ~40ms，
-                                              //  真机 DLL 日志实证）
+static int          g_n_ctx           = 512; // 3-token 与整句 CE 共用同一 context（2026-11-23 合并）：
+                                              //   短路径 11 seq × (ctx10+cand2) = 132；
+                                              //   整句 1 ctx + 5 × (ctx10+cand48) ≈ 300
+                                              //   512 两者都够，且整句可直接复用 seq0 的 prep
+                                              // 历史：128 为 3-token 单独口径（64 时 S2 恒 ~100ms
+                                              //   vs 128 的 ~40ms，真机日志实证）
 static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker seq
 
 // CE 位置权重（2026-09-16 采纳，首项归一规范形；与 (1.15,1.30,0.70) 排序等价、
@@ -89,8 +91,7 @@ static constexpr double kCeW1 = 1.0, kCeW2 = 1.10, kCeW3 = 0.60;
 // 模型状态
 // ============================================================
 static llama_model        * g_model   = nullptr;
-static llama_context      * g_ctx     = nullptr;
-static llama_context      * g_full_ctx = nullptr;  // 整句 CE 专用（与生产 3-token 上下文隔离）
+static llama_context      * g_ctx     = nullptr;  // 3-token 与整句 CE 共用（2026-11-23 合并）
 static const llama_vocab  * g_vocab   = nullptr;
 static std::mutex           g_mutex;
 static std::atomic<bool>    g_loaded{false};
@@ -1065,8 +1066,7 @@ static void unload_model() {
     while (g_loading.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_loaded.load() || g_model || g_ctx || g_full_ctx) {
-        if (g_full_ctx) { llama_free(g_full_ctx); g_full_ctx = nullptr; }
+    if (g_loaded.load() || g_model || g_ctx) {
         if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
         if (g_model) { llama_model_free(g_model); g_model = nullptr; }
         g_vocab = nullptr;
@@ -1542,34 +1542,20 @@ static bool score_batch(const std::vector<llama_token> & ctx_ids,
 }
 
 // ============================================================
-// 整句 CE 打分（2026-11-23，研究→生产第一版）
+// 整句 CE 打分（2026-11-23 研究→生产；同日与 3-token 路径合并）
 //
 // 5 个**句子候选**从 N-gram 组句器来（max_sentences=1 的 poet 不出多句），
-// 生产 3-token 路径只看到句首，不能用于整句重排。本函数用**独立上下文**
-// g_full_ctx 算完整候选 token 的条件 CE 和：
-//   Step 1: ctx 一次 decode（seq 0）→ 共享 logits 算各候选首 token CE
-//   Step 2..N: 每个候选一条 worker seq（ctx KV copy），逐 token 并行 decode
-// 与 score_batch 的 3-token 路径完全隔离（不碰 prep/seq0），互不影响。
-// 返回 sum（负 CE 和，越大越好）与 ntok；max_tokens 上限 48。
+// 生产 3-token 路径只看到句首，不能用于整句重排。本函数算完整候选 token
+// 的条件 CE 和，与 3-token 路径**共用 g_ctx / seq0 / prep**：
+//   Step 1: ctx 就绪——prep 命中（同 ctx，seq0 的 KV+logits 已在）则零成本；
+//           否则 decode 到 seq0 并刷新 prep（判据与 score_batch Step 1 一致）
+//   Step 2: seq_cp(0→i+1) 后把 5 个候选的全部 token 放进**一个 batch**
+//           一次 forward，CE 只做查表/归一化
+// 整句跑完只清 worker seq（1..n），seq0 与 prep 状态保持有效——下一次
+// score_batch 仍命中 prep（合并原独立 g_full_ctx 的收益：省掉每次一条
+// 重复的 ctx forward + O(vocab) 归一化）。
+// 返回 sum（正 CE 和，越小越可能）与 ntok；max_tokens 上限 48。
 // ============================================================
-static bool ensure_full_ctx() {
-    // 调用方持 g_mutex（创建/释放与 unload 串行）
-    if (g_full_ctx) return true;
-    if (!g_loaded.load() || !g_model) return false;
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 512;          // 6 seq × (ctx ≤10 + 候选 ≤48) ≈ 350
-    cp.n_threads = g_n_threads;
-    cp.n_threads_batch = g_n_threads;
-    cp.n_seq_max = 6;        // seq 0 = ctx，1..5 = 5 个句子候选
-    g_full_ctx = llama_init_from_model(g_model, cp);
-    if (!g_full_ctx) {
-        log_msg("ERROR: failed to create full-sentence context");
-        return false;
-    }
-    log_msg("full-sentence ctx ready (n_ctx=512 seq=6)");
-    return true;
-}
-
 static bool score_full_batch(const std::vector<llama_token> & ctx_ids,
                              const std::vector<std::vector<llama_token>> & cands,
                              std::vector<double> & sum_out,
@@ -1580,43 +1566,67 @@ static bool score_full_batch(const std::vector<llama_token> & ctx_ids,
     ntok_out.assign(n, 0);
     if (n == 0 || n > 5 || ctx_ids.empty()) return false;
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!ensure_full_ctx()) return false;
+    if (!g_loaded.load() || !g_ctx) return false;
     const int ctx_len = (int)ctx_ids.size();
     const int vs = llama_vocab_n_tokens(g_vocab);
     int max_len = 0;
     for (const auto & c : cands) max_len = (std::max)(max_len, (int)c.size());
-    // 每 seq 预算：n_ctx / (n+1) - ctx - 1（共享 KV 总容量）
-    int budget = 512 / (n + 1) - ctx_len - 1;
+    // 每 seq 预算：总 KV 扣掉 ctx 后 n 条 worker 均分（每条需 ctx_len+候选长度）
+    int budget = (g_n_ctx - ctx_len) / n - ctx_len - 1;
     max_len = (std::min)(max_len, (std::min)(max_tokens, budget));
     if (max_len <= 0) return false;
 
-    llama_memory_clear(llama_get_memory(g_full_ctx), false);
-    // ---- ctx decode（seq 0）----
-    {
-        llama_batch b = llama_batch_init(ctx_len, 0, 1);
+    // ---- ctx：prep 命中则零成本；否则清空并重建 seq0（同 score_batch Step 1）----
+    const float * cl = nullptr;
+    float m0 = 0;
+    double lse0 = 0;
+    bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen;
+    if (use_prep) {
+        cl = g_prep_logits.data();
+        m0 = g_prep_m;
+        lse0 = g_prep_lse;
+    } else {
+        llama_memory_clear(llama_get_memory(g_ctx), false);
+        llama_batch b0 = llama_batch_init(ctx_len, 0, 1);
         for (int j = 0; j < ctx_len; j++) {
-            b.token[j] = ctx_ids[j]; b.pos[j] = j;
-            b.n_seq_id[j] = 1; b.seq_id[j][0] = 0;
+            b0.token[j] = ctx_ids[j]; b0.pos[j] = j;
+            b0.n_seq_id[j] = 1; b0.seq_id[j][0] = 0;
         }
-        b.logits[ctx_len - 1] = 1;
-        b.n_tokens = ctx_len;
-        bool ok = llama_decode(g_full_ctx, b) == 0;
-        llama_batch_free(b);
-        if (!ok) return false;
+        b0.logits[ctx_len - 1] = 1;
+        b0.n_tokens = ctx_len;
+        bool ok = llama_decode(g_ctx, b0) == 0;
+        if (ok) {
+            const float * cl0 = llama_get_logits_ith(g_ctx, ctx_len - 1);
+            if (cl0) {  // 立即拷出：候选 decode 会覆盖 logits buffer
+                g_seq0_gen++;
+                g_prep_logits.assign(cl0, cl0 + vs);
+                g_prep_gen = g_seq0_gen;
+                g_prep_ctx = ctx_ids;
+                logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);
+                g_prep_ready = true;
+                cl = g_prep_logits.data();
+                m0 = g_prep_m;
+                lse0 = g_prep_lse;
+            }
+        }
+        llama_batch_free(b0);
+        if (!cl) return false;  // ctx decode 失败：本轮回 nil，下次全流程兜底
     }
-    const float * cl = llama_get_logits_ith(g_full_ctx, ctx_len - 1);
-    if (!cl) return false;
-    float m0; double lse0;
-    logits_normalizer(cl, vs, m0, lse0);
+
+    // 首 token CE（共享 ctx 末位 logits，须在候选 decode 之前算完）
     for (int i = 0; i < n; i++) {
         if (!cands[i].empty()) {
             sum_out[i] = ce_target(cl, cands[i][0], m0, lse0);
             ntok_out[i] = 1;
         }
     }
-    // ctx KV → 每个候选 seq（一次性 copy）
-    for (int i = 0; i < n; i++)
-        llama_memory_seq_cp(llama_get_memory(g_full_ctx), 0, i + 1, 0, -1);
+    // ctx KV → 每个候选 seq（先清目的 seq：prep 命中路径不清整个 KV，
+    // 上一轮残留会让 seq_cp 叠加出脏 KV）
+    auto * mem0 = llama_get_memory(g_ctx);
+    for (int i = 0; i < n; i++) {
+        llama_memory_seq_rm(mem0, i + 1, 0, -1);
+        llama_memory_seq_cp(mem0, 0, i + 1, 0, -1);
+    }
 
     // ---- 一次性 decode 全部候选 token（每候选一条 seq，ctx KV 已 copy）----
     // 逐步 decode（每 token 一次 forward）在 0.6B 上每步约 20ms，15 步 ≈ 300ms；
@@ -1629,7 +1639,11 @@ static bool score_full_batch(const std::vector<llama_token> & ctx_ids,
         lens[i] = (std::min)((int)cands[i].size(), max_len);
         total += lens[i];
     }
-    if (total <= 0) return true;
+    if (total <= 0) {
+        for (int i = 0; i < n; i++)
+            llama_memory_seq_rm(mem0, i + 1, 0, -1);
+        return true;
+    }
     llama_batch b = llama_batch_init(total, 0, n);
     int row = 0;
     for (int i = 0; i < n; i++) {
@@ -1645,12 +1659,12 @@ static bool score_full_batch(const std::vector<llama_token> & ctx_ids,
         }
     }
     b.n_tokens = row;
-    bool ok = llama_decode(g_full_ctx, b) == 0;
+    bool ok = llama_decode(g_ctx, b) == 0;
     if (ok) {
         for (int i = 0; i < n; i++) {
             int len = lens[i];
             for (int j = 1; j < len; j++) {
-                float * l = llama_get_logits_ith(g_full_ctx, base[i] + j - 1);
+                float * l = llama_get_logits_ith(g_ctx, base[i] + j - 1);
                 if (!l) { sum_out[i] = 1e10; break; }
                 float m; double lse;
                 logits_normalizer(l, vs, m, lse);
@@ -1658,12 +1672,15 @@ static bool score_full_batch(const std::vector<llama_token> & ctx_ids,
                 ntok_out[i] = j + 1;
             }
         }
+    } else {
+        // 失败自愈：prep 命中路径不清 KV，decode 失败可能是 KV 耗尽——
+        // 置无效强制下一次走全流程重建（同 score_batch Step2/3）
+        g_prep_ready = false;
     }
     llama_batch_free(b);
-    // worker seq 清理（共享 KV cell 归属释放；seq0 与生产上下文无关）
-    auto * mem = llama_get_memory(g_full_ctx);
+    // worker seq 清理（seq0 与 prep 保留，3-token 路径仍可命中）
     for (int i = 0; i < n; i++)
-        llama_memory_seq_rm(mem, i + 1, 0, -1);
+        llama_memory_seq_rm(mem0, i + 1, 0, -1);
     return true;
 }
 
@@ -2230,7 +2247,7 @@ static int lua_score_full(lua_State * L) {
     luaL_checktype(L, 2, LUA_TTABLE);
     int n = (int)luaL_len(L, 2);
     if (n < 1) { lua_pushnil(L); return 1; }
-    if (n > 5) n = 5;  // g_full_ctx: seq0 + 5 候选
+    if (n > 5) n = 5;  // g_ctx: seq0（共享 prep）+ 5 条候选 seq
     std::vector<std::string> texts;
     for (int i = 1; i <= n; i++) {
         lua_rawgeti(L, 2, i);
