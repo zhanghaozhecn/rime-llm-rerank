@@ -13,6 +13,12 @@ local llm_loaded_for = nil  -- enabled value when llm was loaded
 
 -- 融合系数 β 为内置常数（2026-11-05 用户定案：标定产物退出用户配置面——用户没有
 -- 标定能力；与 FREQ_TAU=400 同待遇。调整 = 改代码随下次发版生效）：
+-- 前缀软确认（2026-11-23 实验，默认关闭；设计见研究库 §十/§11.8）：
+-- PM 块里 margin（首选与次选的加权负 CE 和之差，同一 ctx 下两个候选词）≥ θ、
+-- 首选是多字词且只覆盖前缀（_end < 段末）时，挂起 {input, text}；下一次按键
+-- 由 llm_processor 执行 ctx:select → Segment::Close 截段 → Forward + Compose
+-- 只重译剩余码（组合区内预确认，不上屏）。开关 = _G.llm_prefix_confirm。
+local PREFIX_CONFIRM_THETA = 1.0
 local FREQ_BETA = 14 -- 对数词频融合系数（2026-11-14 默认模型改
                      -- Qwen2.5-0.5B 后重标定: 用户域 34k + wiki 池化
                      -- 180k 网格, kCeW (1.0,1.10,0.60)+β14 偶半选→奇半
@@ -527,8 +533,14 @@ end
 -- （整句模式才有，\x1d 分隔）——子词复用分与候选集属同一快照，指纹必须
 -- 绑定，否则同 FM 不同 PM 的 query 会错命中缓存（与 DLL async_fingerprint
 -- 同构；字词模式 pm 为空 → 指纹格式保持不变）。
-local function make_fp(context, cands, pm)
-    local fp = context .. "\x1f" .. table.concat(cands, "\x1e")
+local function make_fp(context, cands, pm, prefix)
+    local fp = context
+    -- 已确认前缀（2026-11-23）：拼在上文后、候选前（\x1c 分隔），与 DLL
+    -- async_fingerprint 同构——确认前后上文相同但前缀不同，必须区分
+    if prefix and prefix ~= "" then
+        fp = fp .. "\x1c" .. prefix
+    end
+    fp = fp .. "\x1f" .. table.concat(cands, "\x1e")
     if pm and #pm > 0 then
         fp = fp .. "\x1d" .. table.concat(pm, "\x1e")
     end
@@ -779,6 +791,13 @@ return function(translation, env)
     -- 不需过滤尾部 ASCII: Rime 编码显示在候选窗, 不写入编辑器,
     -- 外挂读到的光标前文本不会包含编码字母 (微软拼音式 inline composition 才会)
     local context = (ctx_text or ""):gsub('%s+', '')
+    -- 组合区已确认前缀（2026-11-23）：前缀软确认后这些词是确定 token，
+    -- LLM 的 ctx 必须包含它们（§11.8 协同：CE(整句) = CE(P|C) + CE(R|C+P)）
+    local prefix_text = ""
+    if _G.llm_confirmed_prefix then
+        local okp, pt = pcall(_G.llm_confirmed_prefix, env)
+        if okp and type(pt) == "string" then prefix_text = pt end
+    end
     local tick = _G.user_freq_tick or 0
     -- DLL 需先加载：match_code 用 std::regex；Lua 回退不支持 .{4} 量词。
     if enabled and not llm_loaded_for then
@@ -965,12 +984,12 @@ return function(translation, env)
     local sent_pending = false   -- 整句模式已投递挂账（本轮层1 序输出）
     local prep_flag = "0"
     if #cands >= 2 then
-        local fp = make_fp(context, cands, pm_texts)
+        local fp = make_fp(context, cands, pm_texts, prefix_text)
         snap = res_cache[fp]
         if snap and not snap.scores then snap = nil end
         if not snap and llm.async_submit then
             local okp, fp_r = pcall(llm.async_submit, context, cands,
-                                    not sent_on, pm_texts)
+                                    not sent_on, pm_texts, prefix_text)
             if okp and fp_r then
                 if sent_on then
                     -- 整句模式：0 LLM 投递即走（打字流畅优先——40ms 去抖 +
@@ -999,7 +1018,9 @@ return function(translation, env)
             -- 旧 DLL 回退：同步评分（既有路径原样）
             do
             local t0 = os.clock()
-            ok, result = pcall(function() return llm.score(context, cands) end)
+            ok, result = pcall(function()
+                return llm.score(context, cands, prefix_text)
+            end)
             local elapsed_ms = (os.clock() - t0) * 1000
             ev_ms = elapsed_ms
             if ok and type(result) == "table" then
@@ -1233,6 +1254,23 @@ return function(translation, env)
                 pm_order = {}
                 for _, e in ipairs(scored) do pm_order[#pm_order + 1] = e.c end
                 for _, c in ipairs(unscored) do pm_order[#pm_order + 1] = c end
+                -- 前缀软确认判定（2026-11-23 实验）：开关 = _G.llm_prefix_confirm
+                -- （缺省关闭；真机实验时置 true）。首选多字词、只覆盖前缀
+                -- （_end < 段末）、与次选 margin ≥ θ → 挂起，下一次按键由
+                -- processor 执行 ctx:select
+                if _G.llm_prefix_confirm and #scored >= 2 then
+                    local b1, b2 = scored[1], scored[2]
+                    local _s, be = cand_span(b1.c)
+                    local nchar = utf8 and utf8.len(b1.c.text) or 0
+                    local theta = tonumber(_G.llm_prefix_confirm_theta)
+                                  or PREFIX_CONFIRM_THETA
+                    if nchar >= 2 and be and be < seg_end
+                       and (b1.t - b2.t) >= theta then
+                        _G.llm_pending_confirm = {
+                            input = input, text = b1.c.text, endp = be,
+                        }
+                    end
+                end
             end
         end
         -- 两码整句最终置顶块已删（2026-11-22 整句模式定案）：满覆盖候选已在

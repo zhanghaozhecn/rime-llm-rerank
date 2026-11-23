@@ -68,14 +68,22 @@ end
 -- ctx 归一化与 llm_filter 一致 (去空白): C++ prep 命中 = token 序列比较,
 -- 不一致会导致 prep 永远不命中 → 每次 score 完整解码 (~50ms)。
 -- 中文无空白两者相同; 含英文/空格 (如 "Hello world 你好") 时保证一致。
-local function trigger_prepare()
+local function trigger_prepare(env)
     local cur_ctx = (_G.llm_context_get() or ""):gsub('%s+', '')
-    if llm_prep and llm_prep.prepare and cur_ctx ~= last_prep_ctx then
+    -- 组合区已确认前缀（2026-11-23）：与 filter 的 ctx 口径一致，prep 才能
+    -- 命中；prefix 变化也视为 ctx 变化（去重键含 prefix）
+    local cur_pf = ""
+    if _G.llm_confirmed_prefix and env then
+        local okc, pf = pcall(_G.llm_confirmed_prefix, env)
+        if okc and type(pf) == "string" then cur_pf = pf end
+    end
+    local key = cur_pf ~= "" and (cur_ctx .. "\x1c" .. cur_pf) or cur_ctx
+    if llm_prep and llm_prep.prepare and key ~= last_prep_ctx then
         -- 2026-11-18：只有 DLL 真正受理（返回 true）才记账。此前先记账后调用，
         -- 一旦 prepare 因"模型加载中 / 推理持锁被跳过"被丢弃就再也不会重试，
         -- 满码评分只能走完整 S1（真机 4 连 prep=0 的成因之一）。
-        local okp, acc = pcall(llm_prep.prepare, cur_ctx)
-        if okp and acc then last_prep_ctx = cur_ctx end
+        local okp, acc = pcall(llm_prep.prepare, cur_ctx, cur_pf)
+        if okp and acc then last_prep_ctx = key end
     end
 end
 
@@ -431,8 +439,65 @@ local function find_overlap(prev, curr)
     return 0
 end
 
+-- 组合区已确认段文本（2026-11-23，§11.8 协同）：前缀软确认后，这些词是
+-- 确定的 token，LLM 的 ctx 必须包含它们（CE(整句) = CE(P|C) + CE(R|C+P)）。
+-- 取 composition 里 status ≥ kSelected 的段的选中候选文本按顺序拼接。
+-- Composition 的 lua 绑定没有 to_table，走 toSegmentation():to_table()（深拷贝段列表）。
+local function confirmed_prefix_text(env)
+    local ctx = env and env.engine and env.engine.context
+    local comp = ctx and ctx.composition
+    if not comp then return "" end
+    local ok, segs = pcall(function()
+        return comp:toSegmentation():to_table()
+    end)
+    if not ok or type(segs) ~= "table" then return "" end
+    local parts = {}
+    for _, seg in ipairs(segs) do
+        local st = seg.status
+        if st == "kSelected" or st == "kConfirmed" then
+            local ok2, cand = pcall(function()
+                return seg:get_selected_candidate()
+            end)
+            if ok2 and cand and cand.text and cand.text ~= "" then
+                parts[#parts + 1] = cand.text
+            end
+        end
+    end
+    return table.concat(parts)
+end
+_G.llm_confirmed_prefix = confirmed_prefix_text
+
+-- 前缀软确认执行（2026-11-23 实验，配合 llm_filter.lua 的 PREFIX_CONFIRM）：
+-- 上一轮 filter 挂起的 {input, text, endp}，在本键进入 input 之前执行
+-- ctx:select(idx) → Segment::Close 截段（partial tag）→ Forward + Compose
+-- 只重译剩余码（组合区内预确认，不上屏）。只认输入前缀未变；执行/丢弃后
+-- 清挂起（一次性）。menu 下标 = filter 后的候选序（ctx:select 作用同一 menu）。
+local function run_pending_confirm(env)
+    local pc = _G.llm_pending_confirm
+    if not pc then return end
+    _G.llm_pending_confirm = nil
+    local ctx = env.engine.context
+    local inp = ctx.input or ""
+    if inp == "" or inp:sub(1, #pc.input) ~= pc.input then return end
+    local comp = ctx.composition
+    local seg = comp and comp:back()
+    local menu = seg and seg.menu
+    if not menu then return end
+    local okn, n = pcall(function() return menu:prepare(16) end)
+    if not okn or type(n) ~= "number" or n <= 0 then return end
+    for i = 0, n - 1 do
+        local c = menu:get_candidate_at(i)
+        if c and c.text == pc.text then
+            pcall(function() ctx:select(i) end)
+            break
+        end
+    end
+end
+_G.llm_run_pending_confirm = run_pending_confirm   -- 冒烟/排障入口
+
 local function processor(key, env)
     if key:release() then return 2 end
+    run_pending_confirm(env)   -- 新键进入前执行上一轮挂起的软确认
 
     -- 当前方案 ID（2026-11-22 按方案分文件夹）：每键刷新，账本/日志按方案
     -- 选子目录；切方案时 stats_ensure_schema 落盘旧账本并载入新账本
@@ -522,7 +587,7 @@ local function processor(key, env)
     end
 
     -- 上文检查 + 预解码 (每次按键): commit_history 变化 → 立即异步预解码
-    trigger_prepare()
+    trigger_prepare(env)
 
     local ctx = env.engine.context
     local ch = ctx.commit_history
@@ -653,7 +718,7 @@ local function processor(key, env)
                  .. live_esc(key:repr()) .. ")→上文重置+缓存清空")
         end
         -- 上文已重置 → 立即异步预解码 (空上文)
-        trigger_prepare()
+        trigger_prepare(env)
         return 0
     end
 
@@ -763,7 +828,7 @@ local function processor(key, env)
     -- 2026-11-18：history 已在上面同步完毕，此刻再触发一次预解码。
     -- 键首那次 trigger_prepare 早于 history 追加（拿不到刚上屏的词），
     -- 这条补的是"历史兜底路径"的 ctx；ctx 未变时被去重挡住，零额外开销。
-    trigger_prepare()
+    trigger_prepare(env)
 
     return 2
 end

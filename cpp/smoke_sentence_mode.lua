@@ -299,4 +299,30 @@ end
 assert(sawc, "G: 缺 PM 行")
 print("[smoke] G 子词复用排序 OK")
 
+-- ═══ 场景 H：前缀软确认判定（2026-11-23 实验，_G.llm_prefix_confirm）═══
+-- 候选：FM = 我们德文 / 我们的文（满覆盖），PM = 我们 / 我们的（首 token
+-- 与 FM 相同 → 有复用分）。θ 设 0.01 保证触发；断言挂起项为多字词、
+-- endp < 段末、input 与当前一致。关闭开关后同候选不再挂起。
+_G.llm_prefix_confirm = true
+_G.llm_prefix_confirm_theta = 0.01
+_G.llm_pending_confirm = nil
+sent_run({
+    mkc("我们德文", 0, 10), mkc("我们的文", 0, 10),
+    mkc("我们", 0, 6), mkc("我们的", 0, 8),
+  }, "womendewen", { start = 0, _end = 10 })
+local hpc = _G.llm_pending_confirm
+assert(type(hpc) == "table", "H: 未挂起确认")
+assert(type(hpc.text) == "string" and #hpc.text > 0, "H: text 空")
+assert(hpc.endp and hpc.endp < 10, "H: endp 应 < 段末: " .. tostring(hpc.endp))
+assert(hpc.input == "womendewen", "H: input 不符")
+_G.llm_prefix_confirm = nil
+_G.llm_prefix_confirm_theta = nil
+_G.llm_pending_confirm = nil
+sent_run({
+    mkc("我们德文", 0, 10), mkc("我们的文", 0, 10),
+    mkc("我们", 0, 6), mkc("我们的", 0, 8),
+  }, "womendewen", { start = 0, _end = 10 })
+assert(_G.llm_pending_confirm == nil, "H: 关闭后不应挂起")
+print("[smoke] H 前缀软确认判定 OK")
+
 print("[smoke] SMOKE-SENTENCE-MODE OK")

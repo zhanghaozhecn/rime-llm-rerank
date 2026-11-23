@@ -1215,6 +1215,83 @@ static double ce_target(const float * logits, int target_id, float m, double lse
     return -((double)(logits[target_id] - m) - lse);
 }
 
+// 上文 + 组合区已确认前缀（2026-11-23）：上文按 max_ctx 截断，前缀完整追加。
+// 语义 = "当前词的完整上下文"——已确认词是确定 token，不能像旧上文一样被
+// 截断挤掉；g_last_ctx_used 也带上前缀（调试端"推理实际使用"口径）。
+static std::vector<llama_token> ctx_ids_with_prefix(const char * context,
+                                                    const char * prefix) {
+    auto ids = ctx_token_ids(context);
+    if (prefix && *prefix) {
+        auto pids = tokenize(prefix);
+        if (!pids.empty()) {
+            ids.insert(ids.end(), pids.begin(), pids.end());
+            g_last_ctx_used += prefix;
+        }
+    }
+    return ids;
+}
+
+// ctx KV 就绪（调用方持 g_mutex）：返回 ctx 末位 logits（指向 g_prep_logits）
+// 与归一化量；失败返回 nullptr。三条路径（2026-11-23）：
+//   ① prep 完全命中（ctx 相同）→ 零成本
+//   ② 前缀延伸（新 ctx = 旧 prep ctx + 新增 token）→ 只 decode 增量：
+//      确认前缀 P 后 ctx = 上文 + P，上文部分的 KV 原样保留（§11.8 协同）
+//   ③ 否则全量重建（memory_clear + decode）
+static const float * ensure_ctx_kv(const std::vector<llama_token> & ctx_ids,
+                                   int vs, float & m, double & lse) {
+    if (g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen) {
+        m = g_prep_m;
+        lse = g_prep_lse;
+        return g_prep_logits.data();
+    }
+    int from = 0;
+    bool extend = g_prep_ready && g_seq0_gen == g_prep_gen
+                  && ctx_ids.size() > g_prep_ctx.size()
+                  && std::equal(g_prep_ctx.begin(), g_prep_ctx.end(),
+                                ctx_ids.begin());
+    if (extend) {
+        from = (int)g_prep_ctx.size();
+    } else {
+        llama_memory_clear(llama_get_memory(g_ctx), false);
+    }
+    const int ctx_len = (int)ctx_ids.size();
+    // 增量是稀有路径（确认前缀后才发生），只在这里留痕（全量不打，免日志膨胀）
+    if (extend)
+        log_msg("ctx_kv: extend from=%d ctx=%d prep=%d gen=%ld",
+                from, ctx_len, (int)g_prep_ctx.size(), g_seq0_gen);
+    llama_batch b = llama_batch_init(ctx_len - from, 0, 1);
+    int row = 0;
+    for (int j = from; j < ctx_len; j++, row++) {
+        b.token[row] = ctx_ids[j];
+        b.pos[row] = j;
+        b.n_seq_id[row] = 1;
+        b.seq_id[row][0] = 0;
+        b.logits[row] = (j + 1 == ctx_len) ? 1 : 0;
+    }
+    b.n_tokens = row;
+    bool ok = llama_decode(g_ctx, b) == 0;
+    llama_batch_free(b);
+    if (!ok) {
+        if (extend) {
+            // 增量失败（KV 耗尽等）：置无效并回退全量重建一次（递归深度 1）
+            g_prep_ready = false;
+            return ensure_ctx_kv(ctx_ids, vs, m, lse);
+        }
+        return nullptr;
+    }
+    g_seq0_gen++;
+    const float * cl = llama_get_logits_ith(g_ctx, ctx_len - from - 1);
+    if (!cl) return nullptr;
+    g_prep_logits.assign(cl, cl + vs);
+    g_prep_gen = g_seq0_gen;
+    g_prep_ctx = ctx_ids;
+    logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);
+    g_prep_ready = true;
+    m = g_prep_m;
+    lse = g_prep_lse;
+    return g_prep_logits.data();
+}
+
 // ============================================================
 // 核心评分：ctx 仅 1 次 decode + KV copy + 多序列分层并行候选 decode
 //
@@ -1278,52 +1355,18 @@ static bool score_batch(const std::vector<llama_token> & ctx_ids,
     // 代次匹配防止: 完整流程 score 覆盖 seq0 后, 旧 prep 状态被误用 (KV 与 logits 不一致)
     bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen;
     if (prep_hit_out) *prep_hit_out = use_prep;
-    const float * ctx_logits = nullptr;  // 直接指向 prep 存储，免全量 vector 拷贝
     float m0 = 0;
     double lse0 = 0;
     double ms1 = 0;
-
-    if (!use_prep) {
-        // ---- 完整流程：Step 1 ctx decode ----
-        auto ts1_0 = std::chrono::high_resolution_clock::now();
-        // memory_clear 第 2 参：true=零化整个 KV cache（40 万次 decode 的
-        // benchmark 会拖慢吞吐）；false=仅重置元数据。新序列的因果注意力
-        // 掩码天然隔离旧 KV，无需显式归零。
-        llama_memory_clear(llama_get_memory(g_ctx), false);
-        llama_batch ctx_batch = llama_batch_init(ctx_len, 0, 1);
-        for (int j = 0; j < ctx_len; j++) {
-            ctx_batch.token[j] = ctx_ids[j]; ctx_batch.pos[j] = j;
-            ctx_batch.n_seq_id[j] = 1; ctx_batch.seq_id[j][0] = 0;
-        }
-        ctx_batch.logits[ctx_len - 1] = 1;
-        ctx_batch.n_tokens = ctx_len;
-        bool decoded_ok = false;
-        if (llama_decode(g_ctx, ctx_batch) == 0) {
-            g_seq0_gen++;  // seq0 KV 已更新
-            float* cl = llama_get_logits_ith(g_ctx, ctx_len - 1);
-            if (cl) { g_prep_logits.assign(cl, cl + vs); decoded_ok = true; }
-        }
-        llama_batch_free(ctx_batch);
-
-        if (!decoded_ok) return true;  // decode failed（prep 存储只在成功时覆写；结果全哨兵照常发布）
-        // 完整流程自我刷新 prep: 刚 decode 完 seq0 (代次已递增), KV/logits 一致,
-        // 保存后同 ctx 的后续 score (翻页/候选窗重建) 全部命中——
-        // 否则一次未命中导致代次失配, 后续 score 连锁全部 prep=0 直到下次 commit
-        g_prep_gen = g_seq0_gen;
-        g_prep_ctx = ctx_ids;
-        logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);  // 归一化量随 prep 缓存
-        g_prep_ready = true;
-        ctx_logits = g_prep_logits.data();
-        m0 = g_prep_m;
-        lse0 = g_prep_lse;
-        auto ts1_1 = std::chrono::high_resolution_clock::now();
-        ms1 = std::chrono::duration<double, std::milli>(ts1_1 - ts1_0).count();
-    } else {
-        // 预解码命中：直接使用已保存的 logits 与归一化量（免 O(vocab) 重扫）
-        ctx_logits = g_prep_logits.data();
-        m0 = g_prep_m;
-        lse0 = g_prep_lse;
-    }
+    // ---- Step 1 ctx KV：prep 命中零成本 / 前缀延伸只 decode 增量 / 否则全量 ----
+    // memory_clear 第 2 参：true=零化整个 KV cache（40 万次 decode 的
+    // benchmark 会拖慢吞吐）；false=仅重置元数据。新序列的因果注意力
+    // 掩码天然隔离旧 KV，无需显式归零。
+    auto ts1_0 = std::chrono::high_resolution_clock::now();
+    const float * ctx_logits = ensure_ctx_kv(ctx_ids, vs, m0, lse0);
+    auto ts1_1 = std::chrono::high_resolution_clock::now();
+    ms1 = std::chrono::duration<double, std::milli>(ts1_1 - ts1_0).count();
+    if (!ctx_logits) return true;  // decode failed（结果全哨兵照常发布）
 
     // 所有候选的第 1 个 token CE (共享同一 ctx logits -> 归一化只算一次;
     // 2026-11-06 归一化量随 prep 缓存, 命中路径连扫描也免)
@@ -1576,42 +1619,12 @@ static bool score_full_batch(const std::vector<llama_token> & ctx_ids,
     max_len = (std::min)(max_len, (std::min)(max_tokens, budget));
     if (max_len <= 0) return false;
 
-    // ---- ctx：prep 命中则零成本；否则清空并重建 seq0（同 score_batch Step 1）----
-    const float * cl = nullptr;
+    // ---- ctx KV：prep 命中零成本 / 前缀延伸只 decode 增量 / 否则全量 ----
+    // （与 score_batch Step 1 同一套 ensure_ctx_kv，2026-11-23 合并）
     float m0 = 0;
     double lse0 = 0;
-    bool use_prep = g_prep_ready && ctx_ids == g_prep_ctx && g_seq0_gen == g_prep_gen;
-    if (use_prep) {
-        cl = g_prep_logits.data();
-        m0 = g_prep_m;
-        lse0 = g_prep_lse;
-    } else {
-        llama_memory_clear(llama_get_memory(g_ctx), false);
-        llama_batch b0 = llama_batch_init(ctx_len, 0, 1);
-        for (int j = 0; j < ctx_len; j++) {
-            b0.token[j] = ctx_ids[j]; b0.pos[j] = j;
-            b0.n_seq_id[j] = 1; b0.seq_id[j][0] = 0;
-        }
-        b0.logits[ctx_len - 1] = 1;
-        b0.n_tokens = ctx_len;
-        bool ok = llama_decode(g_ctx, b0) == 0;
-        if (ok) {
-            const float * cl0 = llama_get_logits_ith(g_ctx, ctx_len - 1);
-            if (cl0) {  // 立即拷出：候选 decode 会覆盖 logits buffer
-                g_seq0_gen++;
-                g_prep_logits.assign(cl0, cl0 + vs);
-                g_prep_gen = g_seq0_gen;
-                g_prep_ctx = ctx_ids;
-                logits_normalizer(g_prep_logits.data(), vs, g_prep_m, g_prep_lse);
-                g_prep_ready = true;
-                cl = g_prep_logits.data();
-                m0 = g_prep_m;
-                lse0 = g_prep_lse;
-            }
-        }
-        llama_batch_free(b0);
-        if (!cl) return false;  // ctx decode 失败：本轮回 nil，下次全流程兜底
-    }
+    const float * cl = ensure_ctx_kv(ctx_ids, vs, m0, lse0);
+    if (!cl) return false;  // ctx decode 失败：本轮回 nil，下次全流程兜底
 
     // 首 token CE（共享 ctx 末位 logits，须在候选 decode 之前算完）
     for (int i = 0; i < n; i++) {
@@ -1806,6 +1819,9 @@ struct AsyncTask {
     bool immediate = false;       // wait 模式：跳过去抖立即开跑
     std::string fingerprint;
     std::string context;          // 上文原串（worker 内 token 化 + ctx_used）
+    // 组合区已确认前缀（2026-11-23）：前缀软确认后追加在上文之后（完整不截断），
+    // 上文部分 KV 可增量复用（§11.8 协同）
+    std::string prefix;
     std::vector<std::string> cand_texts;
     // 子词（PM，部分覆盖候选）清单（2026-11-23）：整句模式才有；只做 token
     // 前缀复用评分（零 decode）与指纹绑定，不进评分窗
@@ -1831,8 +1847,15 @@ static AsyncRes g_async_result;
 
 static std::string async_fingerprint(const char * context,
                                      const std::vector<std::string> & cands,
-                                     const std::vector<std::string> & pm) {
+                                     const std::vector<std::string> & pm,
+                                     const char * prefix = nullptr) {
     std::string fp = context ? context : "";
+    // 已确认前缀（2026-11-23）：拼在上文后、候选前——确认前后上文相同但前缀
+    // 不同，指纹必须区分（与 lua make_fp 同构，分隔符 \x1c）
+    if (prefix && *prefix) {
+        fp.push_back('\x1c');
+        fp += prefix;
+    }
     fp.push_back('\x1f');
     for (size_t i = 0; i < cands.size(); i++) {
         if (i) fp.push_back('\x1e');
@@ -1989,7 +2012,8 @@ static void async_worker_loop() {
             res.segs.push_back(token_seg_display(ids));
             cand_ids.push_back(std::move(ids));
         }
-        std::vector<llama_token> ctx_ids = ctx_token_ids(task.context.c_str());
+        std::vector<llama_token> ctx_ids =
+            ctx_ids_with_prefix(task.context.c_str(), task.prefix.c_str());
         if ((int)ctx_ids.size() < g_min_tokens) ctx_ids.clear();
         // g_last_ctx_used 已由 ctx_token_ids 写（调试 getter 兼容；跨线程
         // 写与既有 prepare 线程同风险面，字段仅调试显示用）
@@ -2065,6 +2089,8 @@ static int lua_async_submit(lua_State * L) {
             lua_pop(L, 1);
         }
     }
+    // 第 5 参（可选，2026-11-23）：组合区已确认前缀（完整追加，不参与上文截断）
+    const char * prefix = luaL_optstring(L, 5, "");
     if ((int)cands.size() < 2 || !context || !*context) {
         lua_pushnil(L);   // 任务不成立（调用方走层1 序）
         return 1;
@@ -2085,8 +2111,9 @@ static int lua_async_submit(lua_State * L) {
         g_async_task.valid = true;
         g_async_task.gen = gen;
         g_async_task.immediate = immediate != 0;
-        g_async_task.fingerprint = fp = async_fingerprint(context, cands, pm);
+        g_async_task.fingerprint = fp = async_fingerprint(context, cands, pm, prefix);
         g_async_task.context = context;
+        g_async_task.prefix = prefix ? prefix : "";
         g_async_task.cand_texts = std::move(cands);
         g_async_task.pm_texts = std::move(pm);
         g_async_task.enq_at = std::chrono::steady_clock::now();
@@ -2149,7 +2176,7 @@ static int lua_prepare(lua_State * L) {
     }
     const char * context = luaL_checkstring(L, 1);
     // 上文 token 数 < min_tokens → 不预解码（空 ctx 无推理是配置语义）
-    auto ctx_ids = ctx_token_ids(context);
+    auto ctx_ids = ctx_ids_with_prefix(context, luaL_optstring(L, 2, ""));
     if (ctx_ids.empty()) {
         lua_pushboolean(L, 0);
         return 1;
@@ -2189,7 +2216,8 @@ static int lua_score(lua_State * L) {
     }
     if (cand_texts.size() < 2) { lua_pushnil(L); return 1; }
 
-    std::vector<llama_token> ctx_ids = ctx_token_ids(context);
+    std::vector<llama_token> ctx_ids =
+        ctx_ids_with_prefix(context, luaL_optstring(L, 3, ""));
     if (ctx_ids.empty()) { lua_pushnil(L); return 1; }
 
     std::vector<std::vector<llama_token>> cand_ids;
@@ -2256,7 +2284,7 @@ static int lua_score_full(lua_State * L) {
         lua_pop(L, 1);
     }
     if (texts.empty()) { lua_pushnil(L); return 1; }
-    auto ctx_ids = ctx_token_ids(context);
+    auto ctx_ids = ctx_ids_with_prefix(context, luaL_optstring(L, 3, ""));
     if (ctx_ids.empty()) { lua_pushnil(L); return 1; }
     std::vector<std::vector<llama_token>> cand_ids;
     for (auto & s : texts) {
