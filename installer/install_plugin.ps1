@@ -258,10 +258,11 @@ $PARAM_DEFAULTS = [ordered]@{
   #   候选段 100ms / 最优 3.65%；旧 10/5 为 0.5B 时代值）
   sentence_mode = $false; debug_fusion = $false
   prefix_confirm = $false
+  ngram_group = $false   # 2026-11-23 第②段：N-gram 组句候选（无勾选框，键位透传）
 }
 $PARAM_INT_KEYS  = @("max_tokens","max_candidates","cpu_cores")
 $PARAM_DBL_KEYS  = @()
-$PARAM_BOOL_KEYS = @("sentence_mode","debug_fusion","prefix_confirm")
+$PARAM_BOOL_KEYS = @("sentence_mode","debug_fusion","prefix_confirm","ngram_group")
 # 字符串型参数（不做数值解析，原样写回；空串合法 = 总是匹配）
 $PARAM_STR_KEYS  = @("code_pattern")
 
@@ -321,6 +322,7 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
     "  cpu_cores: $($p.cpu_cores)",
     "  sentence_mode: $(if ($p.sentence_mode) { 'true' } else { 'false' })",
     "  prefix_confirm: $(if ($p.sentence_mode -and $p.prefix_confirm) { 'true' } else { 'false' })",
+    "  ngram_group: $(if ($p.sentence_mode -and $p.ngram_group) { 'true' } else { 'false' })",
     "  debug_fusion: $(if ($p.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $sec += "  model_path: " + (Convert-ToYamlPath $modelPath) }
@@ -381,6 +383,7 @@ function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
     "  cpu_cores: $($d.cpu_cores)",
     "  sentence_mode: $(if ($d.sentence_mode) { 'true' } else { 'false' })",
     "  prefix_confirm: $(if ($d.sentence_mode -and $d.prefix_confirm) { 'true' } else { 'false' })",
+    "  ngram_group: $(if ($d.sentence_mode -and $d.ngram_group) { 'true' } else { 'false' })",
     "  debug_fusion: $(if ($d.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
