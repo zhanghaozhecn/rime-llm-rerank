@@ -39,6 +39,10 @@ extern "C" {
 #include <algorithm>
 #include <regex>
 
+// N-gram 组句器（2026-11-23 整句模式第②段；算法 = 研究库
+// eval/tools/sentence_gen_gram.py 的生产移植）
+#include "ngram.h"
+
 // ============================================================
 // 配置默认值
 // ============================================================
@@ -2593,6 +2597,138 @@ static int lua_newindex(lua_State * L) {
 }
 
 // ============================================================
+// N-gram 组句器（2026-11-23 整句模式第②段）
+// ============================================================
+// 词表 = 方案词典（码）+ essay.txt（词频），模型 = 万象 LTS `.gram`。
+// lua 侧负责路径解析（rime_api.get_shared_data_dir / get_user_data_dir），
+// DLL 只加载一次（路径组合不变则跳过），生成走内部互斥。
+namespace {
+std::mutex g_ngram_mu;
+rime_llm::ngram::Engine *g_ngram = nullptr;
+std::string g_ngram_sig;
+
+double ngram_opt_num(lua_State *L, int idx, const char *key, double def) {
+  lua_getfield(L, idx, key);
+  const double v = lua_isnumber(L, -1) ? lua_tonumber(L, -1) : def;
+  lua_pop(L, 1);
+  return v;
+}
+
+int lua_ngram_load(lua_State *L) {
+  const char *gram = luaL_optstring(L, 1, "");
+  const char *dict_dir = luaL_checkstring(L, 2);
+  const char *essay = luaL_optstring(L, 4, "");
+  const char *cache = luaL_optstring(L, 5, "");
+  std::vector<std::string> files;
+  if (lua_istable(L, 3)) {
+    const int n = (int)luaL_len(L, 3);
+    for (int i = 1; i <= n; ++i) {
+      lua_geti(L, 3, i);
+      const char *s = lua_tostring(L, -1);
+      if (s && *s) files.push_back(s);
+      lua_pop(L, 1);
+    }
+  }
+  if (files.empty()) {
+    lua_pushboolean(L, 0);
+    lua_pushliteral(L, "dict_files empty");
+    return 2;
+  }
+  std::string sig = gram;
+  sig += '\x1f';
+  sig += dict_dir;
+  sig += '\x1f';
+  sig += essay;
+  sig += '\x1f';
+  sig += cache;
+  for (size_t i = 0; i < files.size(); ++i) {
+    sig += '\x1e';
+    sig += files[i];
+  }
+  std::lock_guard<std::mutex> lk(g_ngram_mu);
+  if (g_ngram && sig == g_ngram_sig) {
+    lua_pushboolean(L, 1);
+    return 1;
+  }
+  if (!g_ngram) g_ngram = new rime_llm::ngram::Engine();
+  if (!g_ngram->Load(gram, dict_dir, files, essay, cache)) {
+    g_ngram_sig.clear();
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, g_ngram->error().c_str());
+    return 2;
+  }
+  g_ngram_sig = sig;
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int lua_ngram_status(lua_State *L) {
+  std::lock_guard<std::mutex> lk(g_ngram_mu);
+  lua_pushstring(L, g_ngram ? g_ngram->status().c_str() : "");
+  return 1;
+}
+
+int lua_ngram_sentences(lua_State *L) {
+  const char *code = luaL_checkstring(L, 1);
+  const char *ctx = luaL_optstring(L, 2, "");
+  rime_llm::ngram::Params p;
+  if (lua_istable(L, 3)) {
+    p.topk = (int)ngram_opt_num(L, 3, "topk", p.topk);
+    p.beam = (int)ngram_opt_num(L, 3, "beam", p.beam);
+    p.ctx_tail = (int)ngram_opt_num(L, 3, "ctx_tail", p.ctx_tail);
+    p.max_len = (int)ngram_opt_num(L, 3, "max_len", p.max_len);
+    p.min_len = (int)ngram_opt_num(L, 3, "min_len", p.min_len);
+    p.collocation_penalty =
+        ngram_opt_num(L, 3, "collocation_penalty", p.collocation_penalty);
+    p.non_collocation_penalty = ngram_opt_num(
+        L, 3, "non_collocation_penalty", p.non_collocation_penalty);
+    p.weak_collocation_penalty = ngram_opt_num(
+        L, 3, "weak_collocation_penalty", p.weak_collocation_penalty);
+    p.rear_penalty = ngram_opt_num(L, 3, "rear_penalty", p.rear_penalty);
+    p.min_weight = ngram_opt_num(L, 3, "min_weight", p.min_weight);
+    p.max_edges = (int)ngram_opt_num(L, 3, "max_edges", p.max_edges);
+  }
+  std::vector<rime_llm::ngram::Sentence> out;
+  {
+    std::lock_guard<std::mutex> lk(g_ngram_mu);
+    if (!g_ngram) {
+      lua_pushnil(L);
+      return 1;
+    }
+    out = g_ngram->Generate(code, ctx, p);
+  }
+  lua_newtable(L);
+  int n = 0;
+  for (size_t i = 0; i < out.size(); ++i) {
+    const rime_llm::ngram::Sentence &s = out[i];
+    lua_newtable(L);
+    lua_pushlstring(L, s.text.c_str(), s.text.size());
+    lua_setfield(L, -2, "text");
+    lua_pushnumber(L, s.score);
+    lua_setfield(L, -2, "score");
+    lua_newtable(L);
+    for (size_t w = 0; w < s.words.size(); ++w) {
+      lua_newtable(L);
+      lua_pushlstring(L, s.words[w].word.c_str(), s.words[w].word.size());
+      lua_setfield(L, -2, "w");
+      lua_pushinteger(L, s.words[w].code_end);
+      lua_setfield(L, -2, "e");
+      lua_seti(L, -2, (lua_Integer)w + 1);
+    }
+    lua_setfield(L, -2, "words");
+    if (!s.words.empty()) {
+      lua_pushlstring(L, s.words[0].word.c_str(), s.words[0].word.size());
+      lua_setfield(L, -2, "lead");
+      lua_pushinteger(L, s.words[0].code_end);
+      lua_setfield(L, -2, "lead_end");
+    }
+    lua_seti(L, -2, (lua_Integer)(++n));
+  }
+  return 1;
+}
+}  // namespace
+
+// ============================================================
 // 模块入口
 // ============================================================
 extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
@@ -2644,6 +2780,14 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
     lua_setfield(L, -2, "async_poll");
     lua_pushcfunction(L, lua_async_cancel);
     lua_setfield(L, -2, "async_cancel");
+
+    // N-gram 组句器（2026-11-23 整句模式第②段）：load/sentences/status
+    lua_pushcfunction(L, lua_ngram_load);
+    lua_setfield(L, -2, "ngram_load");
+    lua_pushcfunction(L, lua_ngram_sentences);
+    lua_setfield(L, -2, "ngram_sentences");
+    lua_pushcfunction(L, lua_ngram_status);
+    lua_setfield(L, -2, "ngram_status");
 
     // 目录确保（2026-11-21）：llm_rerank 子目录收纳记录文件，lua 侧
     // 迁移/首写前调用（rime-lua 无 mkdir）

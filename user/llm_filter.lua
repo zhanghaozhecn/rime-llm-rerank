@@ -24,6 +24,12 @@ local llm_loaded_for = nil  -- enabled value when llm was loaded
 -- 生效条件 = prefix_confirm **且** sentence_mode（配置页在整句模式外不写
 -- true，运行期再兜一层）。θ 仍为内置常数（与 β 同待遇，调整随发版）。
 local PREFIX_CONFIRM_THETA = 1.0
+-- 单字前导词的 θ 倍数（2026-11-23 第②段实测修正：2.0 → 1.0，与源码版同值）。
+-- 「今天的天气」detianqi 场景：整句 CE 首选 的天气(-21.41)、最佳异前导词竞争者
+-- 地天气(-22.58)，margin = 1.17 nat（≈3.2× 似然比）——×2.0 会让「的/地/得」
+-- 这类同音单字前缀永远确认不了（用户报的缺陷）。设 1.0 = 与多字同门槛，
+-- 仍保留真实 margin 闸；确认只发生在组合区内（不上屏），误确认可见可撤。
+local PREFIX_CONFIRM_SINGLE_SCALE = 1.0
 -- 整句模式同步等待预算（2026-11-23 修）：原先整句模式"投递即走"，当前键
 -- 只能显示层 1 序，LLM 评分只在同指纹重查时才用上（真机实测连续打字从未
 -- 上屏）。改为每键最多等这么久——真机 100ms/键实测 6 个长词候选的
@@ -250,6 +256,11 @@ local cfg = {
                               -- 词且只覆盖前缀时，下一键自动选入组合区。
                               -- **只在 sentence_mode 开启时生效**（GUI 也只在
                               -- 整句模式勾选时显示该复选框）
+    ngram_group      = false, -- N-gram 组句候选（2026-11-23 整句模式第②段）：
+                              -- 用万象 LTS `.gram` + 万象词库做词级 beam，生成
+                              -- top-5 整句候选前置注入候选流（LLM 从 5 句里选
+                              -- 首选）。**只在 sentence_mode 且方案输出简体时
+                              -- 生效**；资产缺失（用户目录 llm_ngram\）自动关闭
     -- freq_beta 不再从 schema 读取（2026-11-05 用户配置面移除，标定产物退出配置面）
     -- → 内置常数 FREQ_BETA；方案里残留旧行读取端忽略，保存/重建节时剥除
 }
@@ -711,6 +722,15 @@ local function init_config(env)
     local pfc = sc:get_bool("llm_rerank/prefix_confirm")
     if pfc ~= nil then cfg.prefix_confirm = pfc end
     _G.llm_prefix_confirm = cfg.prefix_confirm and cfg.sentence_mode
+    -- N-gram 组句候选（2026-11-23 整句模式第②段）：开关 + 只需在整句模式。
+    -- 组句词表 = 万象（简体）词库，方案输出字形由 compositor 的 simplifier
+    -- 保证——无 simplifier 的方案（纯繁体输出）不启用，避免吐简体候选。
+    local ngg = sc:get_bool("llm_rerank/ngram_group")
+    if ngg ~= nil then cfg.ngram_group = ngg end
+    local simp = sc:get_string("simplifier/option_name")
+    _G.llm_simplified_scheme = (simp ~= nil and simp ~= "")
+    _G.llm_ngram_group = cfg.ngram_group and cfg.sentence_mode
+                             and _G.llm_simplified_scheme
     _G.llm_debug_enabled = cfg.debug_fusion
     -- H 行（进程/方案配置起点）：按方案各写一次——分目录后每个方案的语料
     -- 文件需要自己的 H 行，切方案时不得跳过（旧 one-shot 只写首方案）
@@ -761,6 +781,78 @@ local function cand_span(c)
     local ok2, e = pcall(function() return c._end end)
     if not ok2 or type(e) ~= "number" then return nil end
     return s, e
+end
+
+-- ═══ N-gram 组句候选（2026-11-23 整句模式第②段）═══
+-- 组句器在 rime_llm.dll（万象 LTS `.gram` + 万象词库词级 beam，算法与
+-- 研究库 eval/tools/sentence_gen_gram.py 同构；生产参数 beam=32 /
+-- max_edges=8 实测 15ms 每句、hit@5 73%/61%，见研究库 §11.10）。
+-- 本文件只负责：资产路径解析、进程内一次加载、候选构造、前置注入。
+-- 资产在用户目录 llm_ngram\（安装器可选下载），缺失时整块功能自动关闭，
+-- 每 60 秒最多重试一次（避免每键反复打开大文件）。
+local NGRAM_FILES = { "zi", "jichu", "duoyin", "diming", "mingren", "yiren" }
+local NGRAM_PARAMS = {
+    topk = 5, beam = 32, min_weight = 10, max_edges = 8, ctx_tail = 10,
+}
+local ngram_ready = false
+local ngram_retry_at = 0
+
+local function ngram_ensure(env)
+    if ngram_ready then return true end
+    if not (llm and llm.ngram_load) then return false end
+    local now = os.time()
+    if now < ngram_retry_at then return false end
+    local user = llm_user_dir()
+    if not user or user == "" then return false end
+    local function envp(name, def)
+        local v = os.getenv(name)
+        if v and v ~= "" then return v end
+        return def
+    end
+    local gram = envp("RIME_LLM_NGRAM_PATH",
+                      user .. "\\llm_ngram\\wanxiang-lts-zh-hans.gram")
+    local dict = envp("RIME_LLM_NGRAM_DICT", user .. "\\llm_ngram\\dicts")
+    local sid = schema_safe((env.engine.schema and env.engine.schema.schema_id)
+                            or "unknown")
+    local cache_dir = user .. "\\llm_rerank\\ngram_lex"
+    dir_ensure2(cache_dir)
+    local cache = cache_dir .. "\\" .. sid .. ".bin"
+    local okc, r1, r2 = pcall(llm.ngram_load, gram, dict, NGRAM_FILES, "", cache)
+    if okc and r1 then
+        ngram_ready = true
+        return true
+    end
+    ngram_retry_at = now + 60
+    if llm.live_write then
+        pcall(llm.live_write, "G|ngram_load_failed|" ..
+              live_esc(tostring(okc and r2 or r1)))
+    end
+    return false
+end
+
+-- 生成并把候选构造好（text/lead/lead_end 供前缀判定）；ctx = 上文 + 已确认前缀
+local function ngram_make(env, code, context, prefix_text, seg_start, seg_end)
+    if not ngram_ensure(env) then return nil end
+    local ctor = _G.Candidate
+    if not ctor then return nil end
+    local ctx = context or ""
+    if prefix_text and prefix_text ~= "" then ctx = ctx .. prefix_text end
+    local ok, items = pcall(llm.ngram_sentences, code, ctx, NGRAM_PARAMS)
+    if not ok or type(items) ~= "table" then return nil end
+    local out = {}
+    for _, it in ipairs(items) do
+        local text = it.text
+        if type(text) == "string" and text ~= "" then
+            out[#out + 1] = {
+                text = text,
+                lead = it.lead,
+                lead_end = it.lead_end,
+                score = it.score,
+                cand = ctor("ngram_group", seg_start, seg_end, text, ""),
+            }
+        end
+    end
+    return (#out > 0) and out or nil
 end
 
 -- === Filter ===
@@ -839,6 +931,27 @@ return function(translation, env)
     local rec = enabled and pattern_ok
     local wid = rec and _G.llm_new_event("W", tick) or nil
     local engine_top = texts_of(all, 10)
+    -- ═══ N-gram 组句候选前置注入（2026-11-23 第②段）═══
+    -- 生成 5 条整句候选放在候选流最前（同文本去重），后面层1/满覆盖/子词/
+    -- 评分/前缀判定全部沿用既有逻辑：它们 span == 活动段 → FM，同分保序 →
+    -- ngram 序即注入序；LLM 3-token 融合再把 5 句重排（源码版为整句 CE）。
+    -- 只对 ≥4 码（≈2 音节）且方案输出简体时启用；engine_top 保持引擎原序。
+    local gen = nil
+    if cfg.sentence_mode and _G.llm_ngram_group and pattern_ok
+            and context ~= "" and #code >= 4 then
+        gen = ngram_make(env, code, context, prefix_text, seg_start, seg_end)
+        if gen then
+            local merged, seen_t = {}, {}
+            for _, it in ipairs(gen) do
+                seen_t[it.text] = true
+                merged[#merged + 1] = it.cand
+            end
+            for _, c in ipairs(all) do
+                if not seen_t[c.text] then merged[#merged + 1] = c end
+            end
+            all = merged
+        end
+    end
     -- 清掉上一轮快照，避免未重排/失败路径的陈旧窗口被 C 误引用。
     _G.llm_last_window = nil
 
@@ -1310,6 +1423,73 @@ return function(translation, env)
                         _G.llm_pending_confirm = {
                             input = input, text = b1.c.text, endp = be,
                         }
+                    end
+                end
+            end
+        end
+        -- ═══ 句级前缀判定（2026-11-23 第②段）═══
+        -- 与上面 PM 复用 margin 路径互补：整句模式下有组句候选时，改用
+        -- **前导词**证据——按融合序前 5 条（全是组句候选时）前导词一致，或
+        -- 最优与"前导词不同"的最佳竞争者融合分 margin ≥ θ（单字 ×2）→ 挂起
+        -- 确认。旧路径要求 PM 有复用分且 ≥2 字，单字前缀（的/地/得）结构上
+        -- 永远无法确认；句级路径正是"的 + 天气"这类确定场景的入口。
+        if sent_on and _G.llm_prefix_confirm and gen and scores then
+            local leadmap = {}
+            for _, it in ipairs(gen) do
+                leadmap[it.text] = { lead = it.lead, lead_end = it.lead_end }
+            end
+            local top = ordered[1]
+            local li1 = top and leadmap[top.text] or nil
+            if li1 and li1.lead and li1.lead_end
+                    and seg_start + li1.lead_end < seg_end then
+                local lim = math.min(#ordered, 5)
+                local all_gen, same_lead = true, true
+                local competitor = nil
+                for i = 2, lim do
+                    local li = leadmap[ordered[i].text]
+                    if not li or not li.lead then
+                        all_gen = false
+                    elseif li.lead ~= li1.lead then
+                        same_lead = false
+                        if not competitor then competitor = ordered[i] end
+                    end
+                end
+                local okc = all_gen and same_lead
+                if not okc and competitor and fused_scores then
+                    local t1 = fused_scores[top.text]
+                    local t2 = fused_scores[competitor.text]
+                    if t1 and t2 then
+                        local nchar = utf8 and utf8.len(li1.lead) or #li1.lead
+                        local theta = tonumber(_G.llm_prefix_confirm_theta)
+                                      or PREFIX_CONFIRM_THETA
+                        if nchar < 2 then
+                            theta = theta * PREFIX_CONFIRM_SINGLE_SCALE
+                        end
+                        okc = (t1 - t2) >= theta
+                    end
+                end
+                if okc then
+                    -- 在候选流里找该前缀词（简化字形 + 码位对齐；子词块）
+                    local want_end = seg_start + li1.lead_end
+                    local nchar = utf8 and utf8.len(li1.lead) or #li1.lead
+                    for _, c in ipairs(all) do
+                        if not is_fm(c) then
+                            local s, e = cand_span(c)
+                            local n = utf8 and utf8.len(c.text) or #c.text
+                            if s == seg_start and e == want_end
+                                    and n == nchar then
+                                _G.llm_pending_confirm = {
+                                    input = input, text = c.text, endp = e,
+                                }
+                                if dbg then
+                                    live("G|" .. os.date("%H:%M:%S") .. "|" ..
+                                         live_esc(code) .. "|" ..
+                                         live_esc(li1.lead) .. "|" ..
+                                         live_esc(c.text))
+                                end
+                                break
+                            end
+                        end
                     end
                 end
             end

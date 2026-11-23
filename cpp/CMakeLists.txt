@@ -8,7 +8,7 @@ file(GLOB LUA_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/lua/l*.c")
 list(FILTER LUA_SRCS EXCLUDE REGEX "lua\\.c$")
 list(FILTER LUA_SRCS EXCLUDE REGEX "luac\\.c$")
 
-add_library(rime_llm SHARED rime_llm.cpp ${LUA_SRCS})
+add_library(rime_llm SHARED rime_llm.cpp ngram.cpp ${LUA_SRCS})
 
 target_include_directories(rime_llm PRIVATE
     "${LLAMA_ROOT}/include"
