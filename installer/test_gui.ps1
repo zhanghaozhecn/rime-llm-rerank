@@ -63,6 +63,7 @@ engine:
   Assert "模板无 com_context（配置项已删）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
   Assert "无 freq_beta（标定产物退出配置面 2026-11-05）" (($f | Where-Object { $_ -match 'freq_beta' }).Count -eq 0)
   Assert "sentence_mode: false（默认关闭，2026-11-22 取代 two_code_sentence）" (($f | Where-Object { $_ -match '^\s+sentence_mode: false\s*$' }).Count -eq 1)
+  Assert "prefix_confirm: false（前缀自动确认默认关闭，仅整句模式生效）" (($f | Where-Object { $_ -match '^\s+prefix_confirm: false\s*$' }).Count -eq 1)
   Assert "无 expected_length_weight（elw 退役 2026-11-07）" (($f | Where-Object { $_ -match 'expected_length_weight' }).Count -eq 0)
   Assert "code_pattern: '.{4}'（默认）" (($f | Where-Object { $_ -match "^\s+code_pattern: '\.\{4\}'" }).Count -eq 1)
 
@@ -109,6 +110,7 @@ llm_rerank:
   Assert "cpu_cores 保留 6" (($f | Where-Object { $_ -match '^\s+cpu_cores: 6\s*$' }).Count -eq 1)
   Assert "残留 com_context 行已剥（死键收敛）" (($f | Where-Object { $_ -match 'com_context' }).Count -eq 0)
   Assert "debug_fusion 保留 true" (($f | Where-Object { $_ -match '^\s+debug_fusion: true\s*$' }).Count -eq 1)
+  Assert "prefix_confirm: false（节里原无该键 → 默认并入）" (($f | Where-Object { $_ -match '^\s+prefix_confirm: false\s*$' }).Count -eq 1)
   Assert "model_path 保留" (($f | Where-Object { $_ -match '^\s+model_path: d:/gguf_models/zz_test\.gguf\s*$' }).Count -eq 1)
   Assert "llm_rerank 节仍恰 1" ((($f | Where-Object { $_ -match '^llm_rerank:' }).Count) -eq 1)
   Assert "组件行仍恰各 1" ((($f | Select-String "lua_processor@\*llm_processor").Count) -eq 1 -and
@@ -228,6 +230,12 @@ public class W {
   }
   function Find-Check([string]$needle) {
     (Get-Ctls | Where-Object { $_.vis -and $_.cls -match "BUTTON" -and $_.text -like ("*" + $needle + "*") } | Select-Object -First 1).h
+  }
+  # 按钮类控件是否可见（按文本；用于「前缀自动确认」只在整句模式显示的断言）
+  function Check-Visible([string]$needle) {
+    $c = Get-Ctls | Where-Object { $_.cls -match "BUTTON" -and $_.text -like ("*" + $needle + "*") } | Select-Object -First 1
+    if (-not $c) { return $false }
+    return [bool]$c.vis
   }
   function Click-Btn([IntPtr]$h) {
     [void][W]::PostMsg($h, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)   # BM_CLICK(Post!)
@@ -482,7 +490,18 @@ engine:
   Assert "组件行未动" ((($f | Select-String "lua_processor@\*llm_processor").Count) -eq 1 -and
                       (($f | Select-String "lua_filter@\*llm_filter").Count) -eq 1)
   Assert "llm_rerank 节恰 1" ((($f | Where-Object { $_ -match '^llm_rerank:' }).Count) -eq 1)
+  Assert "prefix_confirm: false（默认关闭，整句模式 on 但未勾选）" (($f | Where-Object { $_ -match '^\s+prefix_confirm: false\s*$' }).Count -eq 1)
+  Assert "「前缀自动确认」可见（整句模式 on 才显示）" (Check-Visible "前缀自动确认")
   Show-File
+
+  Write-Host "== G4b: 前缀自动确认勾选 → 落盘 true =="
+  [void][W]::SendMsg((Find-Check "前缀自动确认"), 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # 勾选
+  Start-Sleep -Milliseconds 300
+  Click-Btn (Find-Button "保存并生效")
+  [void](Dismiss-Prompt "是")   # A1 确认框（同 G4）
+  $f = Get-Content $test -Encoding UTF8
+  Assert "prefix_confirm: true（勾选后落盘）" (($f | Where-Object { $_ -match '^\s+prefix_confirm: true\s*$' }).Count -eq 1)
+  Assert "sentence_mode: true（未动保持）" (($f | Where-Object { $_ -match '^\s+sentence_mode: true\s*$' }).Count -eq 1)
 
   Write-Host "== G5: 幂等重存（逐字节一致）=="
   $h1 = (Get-FileHash $test -Algorithm MD5).Hash
@@ -506,6 +525,7 @@ engine:
   $f = Get-Content $test -Encoding UTF8
   Assert "enabled: false（点击翻转）" (($f | Where-Object { $_ -match '^\s+enabled: false\s*$' }).Count -eq 1)
   Assert "sentence_mode: false（点击翻转）" (($f | Where-Object { $_ -match '^\s+sentence_mode: false\s*$' }).Count -eq 1)
+  Assert "prefix_confirm: false（整句模式关 → 恒落 false，即使框内仍是勾选态）" (($f | Where-Object { $_ -match '^\s+prefix_confirm: false\s*$' }).Count -eq 1)
   # 取消勾选的"恢复原值"联动走 CheckedChanged——**跨进程 BM_CLICK 不触发
   # managed 事件**（与 WM_SETTEXT 不触发 TextChanged 同族怪癖；原生检查态
   # 已翻转、保存端 BM_GETCHECK 读到 false）→ 框文本残留锁定值 '.{2,}' 随
@@ -519,6 +539,7 @@ engine:
   Reload-Params
   Assert "max_tokens 字段 = 12" ((Get-WText $e[1].h) -eq "12")
   Assert "code_pattern 字段 = .{2,}（off 读入 = 方案节值，见 G7 怪癖注）" ((Get-WText $e[0].h) -eq ".{2,}")
+  Assert "「前缀自动确认」隐藏（读入 sentence_mode off）" (-not (Check-Visible "前缀自动确认"))
 
   Write-Host "== G9: 只在出错时写 install_error.log（GUI 程序目录）=="
   $logFile = Join-Path $PSScriptRoot "install_error.log"

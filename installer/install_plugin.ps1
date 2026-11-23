@@ -248,6 +248,8 @@ function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $
 # 模式——候选覆盖整个活动段（音节数一致）才进 LLM 评分窗，span 判定，
 # 简拼/单韵母短码天然正确；两码方案下与旧"词长==⌊码长/2⌋"逐位等价。
 # 旧键读取端兜底一次，保存/重建节时剥除。
+# prefix_confirm（2026-11-23 用户定案）：前缀自动确认——实验功能，只在整句
+# 模式开启时显示/生效（PM 首选多字词且只覆盖前缀 → 下一键自动选入组合区）。
 $PARAM_DEFAULTS = [ordered]@{
   enabled = $false
   code_pattern = '.{4}'   # 仅 4 码；4 码以上 .{4,} / 3-4 码 .{3,4} / 指定字母 [abcde]{4}
@@ -255,10 +257,11 @@ $PARAM_DEFAULTS = [ordered]@{
   # ↑ 2026-11-19 随生产模型切 Qwen3-0.6B base 同步定案（研究 ctx\*=20、0.6B k\*=6：
   #   候选段 100ms / 最优 3.65%；旧 10/5 为 0.5B 时代值）
   sentence_mode = $false; debug_fusion = $false
+  prefix_confirm = $false
 }
 $PARAM_INT_KEYS  = @("max_tokens","max_candidates","cpu_cores")
 $PARAM_DBL_KEYS  = @()
-$PARAM_BOOL_KEYS = @("sentence_mode","debug_fusion")
+$PARAM_BOOL_KEYS = @("sentence_mode","debug_fusion","prefix_confirm")
 # 字符串型参数（不做数值解析，原样写回；空串合法 = 总是匹配）
 $PARAM_STR_KEYS  = @("code_pattern")
 
@@ -317,6 +320,7 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
     "  max_candidates: $($p.max_candidates)",
     "  cpu_cores: $($p.cpu_cores)",
     "  sentence_mode: $(if ($p.sentence_mode) { 'true' } else { 'false' })",
+    "  prefix_confirm: $(if ($p.sentence_mode -and $p.prefix_confirm) { 'true' } else { 'false' })",
     "  debug_fusion: $(if ($p.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $sec += "  model_path: " + (Convert-ToYamlPath $modelPath) }
@@ -376,6 +380,7 @@ function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
     "  max_candidates: $($d.max_candidates)",
     "  cpu_cores: $($d.cpu_cores)",
     "  sentence_mode: $(if ($d.sentence_mode) { 'true' } else { 'false' })",
+    "  prefix_confirm: $(if ($d.sentence_mode -and $d.prefix_confirm) { 'true' } else { 'false' })",
     "  debug_fusion: $(if ($d.debug_fusion) { 'true' } else { 'false' })"
   )
   if ($modelPath) { $l += "  model_path: " + (Convert-ToYamlPath $modelPath) }
@@ -894,7 +899,7 @@ function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$mode
 function Run-InstallerGui {
   $form = New-Object System.Windows.Forms.Form
   $form.Text = "LLM 重排安装器 — 插件版"
-  $form.ClientSize = New-Object System.Drawing.Size(700, 656)
+  $form.ClientSize = New-Object System.Drawing.Size(700, 686)
   $form.StartPosition = "CenterScreen"
   $form.FormBorderStyle = "FixedDialog"
   $form.MaximizeBox = $false
@@ -945,6 +950,7 @@ function Run-InstallerGui {
   $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
   $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（t_cand = 当前「候选数」个 3-token 候选的候选段延迟，预填充不计；`n取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
   $tipTcs = "整句模式 sentence_mode（默认关闭）。`n开启后：只有覆盖整个活动段（音节数与编码一致）的候选进`nLLM 评分窗——全拼/简拼整句的满覆盖候选优先，部分编码对应的`n候选保持引擎序排后；两码一字方案（双拼/五笔/郑码）下与旧`n「词长==⌊码长/2⌋」效果一致。`n开启后编码匹配固定为 .{2,}（2 码起参与重排，输入框锁定）。`n取代 two_code_sentence 两码整句（2026-11-22）。"
+  $tipPrefix = "前缀自动确认 prefix_confirm（实验，默认关闭；只在整句模式开启时显示）。`n开启后：子词首选满足「多字词 + 只覆盖编码前缀 + 与次选分差 ≥ 1.0」`n时，下一次按键自动把它选入组合区（截段重译剩余码，不上屏），`n用户只需选择没把握的词；误确认按退格即可回退。"
   $tipDebug = "诊断日志：开启后每次重排都往用户文件夹的 llm_rerank\<方案> 子目录写`nrime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/词码对同目录，按方案隔离）。排障用，平时关闭。`n实时调试窗口：插件版随『复制文件』装到 Rime 用户文件夹`nllm_rerank\viewer\open_debug_window.bat；源码版走托盘「LLM 设置+调试」。"
   $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n随后自动重新部署生效。`n方案还没接入（缺配置节 / 缺组件行 / 残留另一版组件行）时，`n本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。"
   $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；`n**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
@@ -1097,7 +1103,7 @@ function Run-InstallerGui {
   # ── 触发条件（两行：编码匹配 + 整句模式）──
   # 整句模式归入触发条件组（2026-11-22 用户定案：取消「候选排序融合」组——
   # 满覆盖准入本质是触发/准入条件；复选框不再带英文键名）
-  $g2 = Add-Group $form "触发条件" $GX 222 $GW 98
+  $g2 = Add-Group $form "触发条件" $GX 222 $GW 128
   [void](Add-Ctl "Label" "编码匹配:" $g2 14 24 76 20)
   $txtCodePat = Add-Ctl "TextBox" "" $g2 92 21 240 22
   $script:tip.SetToolTip($txtCodePat, $tipCodePat)
@@ -1105,6 +1111,12 @@ function Run-InstallerGui {
   $chkTcs = Add-Ctl "CheckBox" "整句模式" $g2 14 54 260 22
   $script:tip.SetToolTip($chkTcs, $tipTcs)
   Add-Help $g2 $tipTcs (Help-X $g2) 55 | Out-Null
+  # 前缀自动确认（2026-11-23 用户定案）：**只在整句模式勾选时显示**
+  # （实验功能，整句模式外无意义；隐藏时行位保留，不重排后续控件）
+  $chkPrefix = Add-Ctl "CheckBox" "前缀自动确认" $g2 14 84 220 22
+  $script:tip.SetToolTip($chkPrefix, $tipPrefix)
+  Add-Help $g2 $tipPrefix (Help-X $g2) 85 | Out-Null
+  $chkPrefix.Visible = $false
   # 整句模式锁定编码匹配（2026-11-22 用户定案）：勾选 → 框固定 '.{2,}' 并
   # 禁用；取消 → 恢复勾选前的值可编辑。$script:sentSuppress 抑制程序化赋值
   # （读入路径）触发的本事件；真点击（含测试 BM_CLICK）才联动。
@@ -1118,10 +1130,14 @@ function Run-InstallerGui {
       }
       $txtCodePat.Text = ".{2,}"
       $txtCodePat.Enabled = $false
+      $chkPrefix.Visible = $true
     } else {
       $txtCodePat.Enabled = $true
       if ($script:patBeforeSent) { $txtCodePat.Text = $script:patBeforeSent }
       $script:patBeforeSent = $null
+      # 关整句模式 → 隐藏并取消勾选（落盘恒 false，界面与文件一致）
+      $chkPrefix.Visible = $false
+      $chkPrefix.Checked = $false
     }
   })
 
@@ -1131,7 +1147,7 @@ function Run-InstallerGui {
     $w = ([System.Windows.Forms.TextRenderer]::MeasureText($t, $form.Font)).Width + 8
     if ($w -gt $lwP) { $lwP = $w }
   }
-  $g3 = Add-Group $form "推理规模" $GX 328 $GW 122
+  $g3 = Add-Group $form "推理规模" $GX 358 $GW 122
   $rowY = 22
   [void](Add-Ctl "Label" "上文 token 上限:" $g3 14 $rowY ($lwP + 4) 20)
   $txtMaxTok = Add-Ctl "TextBox" "" $g3 (14 + $lwP + 10) ($rowY - 3) 64 22
@@ -1153,13 +1169,13 @@ function Run-InstallerGui {
   $script:tip.SetToolTip($btnBench, $tipBench)
 
   # ── 诊断日志（与源码版同位置：参数组之后、按钮之前；不带英文键名）──
-  $chkDebug = Add-Ctl "CheckBox" "诊断日志" $form 16 458 260 22
+  $chkDebug = Add-Ctl "CheckBox" "诊断日志" $form 16 488 260 22
   $script:tip.SetToolTip($chkDebug, $tipDebug)
-  Add-Help $form $tipDebug 664 460 | Out-Null
+  Add-Help $form $tipDebug 664 490 | Out-Null
 
   # ── 安装（插件版特有：二进制；源码版由 setup.exe 完成）──
   #    模型下载归「总控」的模型路径行（2026-10-01 用户定案：下载 = 配置动作，两版一致）
-  $g5 = Add-Group $form "安装" $GX 486 $GW 76
+  $g5 = Add-Group $form "安装" $GX 516 $GW 76
   $btnFiles = Add-Ctl "Button" "复制文件" $g5 14 24 152 30
   Style-Btn $btnFiles $false
   $script:tip.SetToolTip($btnFiles, $tipFiles)
@@ -1177,9 +1193,9 @@ function Run-InstallerGui {
     if ($w -gt $btnRowW) { $btnRowW = $w }
   }
   $btnRowGap = 8
-  $btnParamSave = Add-Ctl "Button" "保存并生效" $form 16 570 $btnRowW 32
-  $btnStrip = Add-Ctl "Button" "剥离" $form (16 + $btnRowW + $btnRowGap) 570 $btnRowW 32
-  $btnClose = Add-Ctl "Button" "关闭" $form (16 + 2 * ($btnRowW + $btnRowGap)) 570 $btnRowW 32
+  $btnParamSave = Add-Ctl "Button" "保存并生效" $form 16 600 $btnRowW 32
+  $btnStrip = Add-Ctl "Button" "剥离" $form (16 + $btnRowW + $btnRowGap) 600 $btnRowW 32
+  $btnClose = Add-Ctl "Button" "关闭" $form (16 + 2 * ($btnRowW + $btnRowGap)) 600 $btnRowW 32
   Style-Btn $btnParamSave $true
   Style-Btn $btnStrip $false
   Style-Btn $btnClose $false
@@ -1187,9 +1203,9 @@ function Run-InstallerGui {
   $form.AcceptButton = $btnParamSave
   $script:tip.SetToolTip($btnParamSave, $tipSave)
   $script:tip.SetToolTip($btnStrip, $tipStrip)
-  $lblParamStatus = Add-Ctl "Label" "" $form 16 608 668 18
+  $lblParamStatus = Add-Ctl "Label" "" $form 16 638 668 18
   $lblParamStatus.ForeColor = $colInfo
-  $lblFooter = Add-Ctl "Label" ("保存后自动重新部署生效　|　本机逻辑核 " + [Environment]::ProcessorCount + "　|　出错日志：install_error.log（本目录）") $form 16 630 668 16
+  $lblFooter = Add-Ctl "Label" ("保存后自动重新部署生效　|　本机逻辑核 " + [Environment]::ProcessorCount + "　|　出错日志：install_error.log（本目录）") $form 16 660 668 16
   $lblFooter.ForeColor = [System.Drawing.Color]::DimGray
   $lblFooter.Font = New-Object System.Drawing.Font($form.Font.FontFamily, [float]($form.Font.Size - 0.75))
 
@@ -1203,6 +1219,8 @@ function Run-InstallerGui {
   foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
   foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
   $chkTcs.Checked = [bool]$PARAM_DEFAULTS["sentence_mode"]
+  $chkPrefix.Checked = [bool]$PARAM_DEFAULTS["prefix_confirm"]
+  $chkPrefix.Visible = [bool]$PARAM_DEFAULTS["sentence_mode"]
 
   # ── 模型路径下拉扫描 + 模型状态（与源码版同款：只扫用户文件夹与
   #    %USERPROFILE%\gguf_models，避免遍历整盘）──
@@ -1297,6 +1315,7 @@ function Run-InstallerGui {
     }
     $parts += [string]$chkEnabled.Checked
     $parts += [string]$chkTcs.Checked
+    $parts += [string]$chkPrefix.Checked
     $parts += [string]$chkDebug.Checked
     $parts += $cmbModel.Text.Trim()
     return ($parts -join "|")
@@ -1353,6 +1372,9 @@ function Run-InstallerGui {
     $script:sentSuppress = $true
     $chkEnabled.Checked = $v.enabled
     $chkTcs.Checked = [bool]$v.sentence_mode
+    # 前缀自动确认（2026-11-23）：值照读，可见性跟随整句模式
+    $chkPrefix.Checked = [bool]$v.prefix_confirm
+    $chkPrefix.Visible = [bool]$v.sentence_mode
     $chkDebug.Checked = $v.debug_fusion
     if ($v.sentence_mode) {
       $script:patBeforeSent = [string]$v.code_pattern
@@ -1597,6 +1619,9 @@ function Run-InstallerGui {
     }
     $p.enabled = $chkEnabled.Checked
     $p.sentence_mode = $chkTcs.Checked
+    # 前缀自动确认（2026-11-23）：只在整句模式开启时落 true（关整句模式
+    # 恒写 false——lua 运行期同样 gate，双保险）
+    $p.prefix_confirm = $chkTcs.Checked -and $chkPrefix.Checked
     $p.debug_fusion = $chkDebug.Checked
     # 整句模式锁定编码匹配（2026-11-22）：勾选时恒写 '.{2,}'——即使输入框
     # 被跨进程工具改过也以锁定值为准（输入框本身已禁用，此处为兜底）

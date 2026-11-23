@@ -14,6 +14,8 @@
 --   G  子词复用排序（2026-11-23）：PM token 前缀命中 FM → 复用 CE 融合分
 --      参与排序（"错" 的 token 是 FM "错事/错失" 首 token → 有分），无前缀
 --      匹配的 PM（"混能"）保引擎序殿后
+--   H  前缀软确认判定（2026-11-23）：配置键 prefix_confirm（仅整句模式
+--      生效）→ 多字 PM 首选 margin ≥ θ 时挂起；关闭后不挂起
 -- 真 DLL + 真模型（Qwen3-0.6B base）；live_write 打桩截获管道行。
 -- C 行 1 基下标：C=1 eng=2 word=3 s1=4 ce=5 … full=9 cerank=10 fin=11 win=12
 package.cpath = [[build/Release/?.dll]]
@@ -41,7 +43,7 @@ end
 print(string.format("[smoke] model ready %.0fs", os.clock() - t0))
 
 -- mock env：sentence_mode 开关 + code_pattern + composition 活动段
-local function mkenv(sent, input, seg)
+local function mkenv(sent, input, seg, pfx)
   return {
     engine = {
       schema = { config = {
@@ -49,6 +51,7 @@ local function mkenv(sent, input, seg)
           if k == "llm_rerank/enabled" then return true end
           if k == "llm_rerank/debug_fusion" then return true end
           if k == "llm_rerank/sentence_mode" then return sent end
+          if k == "llm_rerank/prefix_confirm" then return pfx end
           return nil
         end,
         get_int = function(_, k)
@@ -86,20 +89,19 @@ end
 local filter = dofile("../user/llm_filter.lua")
 assert(type(filter) == "function", "filter not loaded")
 
--- 异步基建（2026-11-22）适配：整句模式首轮异步挂账不评分（层1 序输出 +
--- S|async_pending），同输入二次 query 经收割回填后缓存命中走融合路径。
--- 本 helper 先跑挂账轮、等评分完成、再跑收割轮，使场景断言仍落在融合
--- 路径（FM 窗融合序 + L/C 行——语义与同步版等价）。
+-- 异步基建（2026-11-22）适配：整句模式 2026-11-23 起改为同步短预算
+-- （150ms）——首轮即融合序；helper 仍跑二次同输入（命中缓存、0 LLM），
+-- 断言落在稳定的融合路径上。
 local function msleep(ms)
   local t = os.clock()
   while (os.clock() - t) * 1000 < ms do end
 end
-local function sent_run(cands, input, seg, wait_ms)
+local function sent_run(cands, input, seg, wait_ms, pfx)
   OUT = {}; LIVE = {}
-  filter(mktrans(cands), mkenv(true, input, seg))
+  filter(mktrans(cands), mkenv(true, input, seg, pfx))
   msleep(wait_ms or 250)
   OUT = {}; LIVE = {}
-  filter(mktrans(cands), mkenv(true, input, seg))
+  filter(mktrans(cands), mkenv(true, input, seg, pfx))
 end
 
 local function lrows()
@@ -257,9 +259,13 @@ end
 -- 是正确生产语义，场景隔离靠换候选）
 OUT = {}
 LIVE = {}
+-- 2026-11-23：整句模式已改同步短预算等待；本场景保留"超时挂账"回归，
+-- 用 0 预算强制走 pending 分支（迁移是否触发整句模式仍由挂账证明）
+_G.llm_sentence_wait_ms = 0
 filter(mktrans({
     mkc("生产", 0, 2), mkc("生活", 0, 2), mkc("生", 0, 1), mkc("活", 0, 1),
   }), mkenv_tcs("ns", { start = 0, _end = 2 }))
+_G.llm_sentence_wait_ms = nil
 assert(#OUT == 4, "F1: yield count=" .. #OUT)
 assert(saw_skip("async_pending"), "F1: 迁移配置未触发整句模式（无挂账）")
 -- F2：长度规则 skip（原 smoke_tcs 场景 A 断言原样）
@@ -299,29 +305,29 @@ end
 assert(sawc, "G: 缺 PM 行")
 print("[smoke] G 子词复用排序 OK")
 
--- ═══ 场景 H：前缀软确认判定（2026-11-23 实验，_G.llm_prefix_confirm）═══
+-- ═══ 场景 H：前缀软确认判定（2026-11-23 实验，配置键 prefix_confirm）═══
 -- 候选：FM = 我们德文 / 我们的文（满覆盖），PM = 我们 / 我们的（首 token
 -- 与 FM 相同 → 有复用分）。θ 设 0.01 保证触发；断言挂起项为多字词、
--- endp < 段末、input 与当前一致。关闭开关后同候选不再挂起。
-_G.llm_prefix_confirm = true
+-- endp < 段末、input 与当前一致。开关走配置项（init_config 折
+-- _G.llm_prefix_confirm = prefix_confirm and sentence_mode）；关闭后同候选
+-- 不再挂起。
 _G.llm_prefix_confirm_theta = 0.01
 _G.llm_pending_confirm = nil
 sent_run({
     mkc("我们德文", 0, 10), mkc("我们的文", 0, 10),
     mkc("我们", 0, 6), mkc("我们的", 0, 8),
-  }, "womendewen", { start = 0, _end = 10 })
+  }, "womendewen", { start = 0, _end = 10 }, nil, true)
 local hpc = _G.llm_pending_confirm
 assert(type(hpc) == "table", "H: 未挂起确认")
 assert(type(hpc.text) == "string" and #hpc.text > 0, "H: text 空")
 assert(hpc.endp and hpc.endp < 10, "H: endp 应 < 段末: " .. tostring(hpc.endp))
 assert(hpc.input == "womendewen", "H: input 不符")
-_G.llm_prefix_confirm = nil
 _G.llm_prefix_confirm_theta = nil
 _G.llm_pending_confirm = nil
 sent_run({
     mkc("我们德文", 0, 10), mkc("我们的文", 0, 10),
     mkc("我们", 0, 6), mkc("我们的", 0, 8),
-  }, "womendewen", { start = 0, _end = 10 })
+  }, "womendewen", { start = 0, _end = 10 }, nil, false)
 assert(_G.llm_pending_confirm == nil, "H: 关闭后不应挂起")
 print("[smoke] H 前缀软确认判定 OK")
 

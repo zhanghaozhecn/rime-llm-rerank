@@ -3,10 +3,11 @@
 -- false 时不加载 DLL，不推理，候选原样透传
 --
 -- 异步基建（2026-11-22，两版同构）：评分移出按键路径——DLL 持久评分线程
--- （覆盖式任务槽 + 代次中断 + 40ms 去抖），同步路径零 LLM。字词模式
--- submit+wait（等价既有同步评分，当前词重排零回归）；整句模式纯异步投递
--- （打字流畅优先，评分结果由后续 query 收割回填——当前轮层1 序、翻页/重
--- 重建命中缓存即融合序）。快照缓存指纹 = 上文\x1f候选\x1e拼接串。
+-- （覆盖式任务槽 + 代次中断），字词模式 submit+wait（等价既有同步评分）。
+-- **2026-11-23 修**：整句模式也改为 submit + 短预算 wait（150ms）——此前
+-- "投递即走"使当前键只能显示层 1 序、LLM 结果仅在同指纹重查时可见（真机
+-- 连续整句打字实测从未上屏）；超时仍回退挂账 pending。快照缓存指纹 =
+-- 上文\x1f候选\x1e子词清单拼接串。
 
 local llm = nil
 local llm_loaded_for = nil  -- enabled value when llm was loaded
@@ -17,8 +18,24 @@ local llm_loaded_for = nil  -- enabled value when llm was loaded
 -- PM 块里 margin（首选与次选的加权负 CE 和之差，同一 ctx 下两个候选词）≥ θ、
 -- 首选是多字词且只覆盖前缀（_end < 段末）时，挂起 {input, text}；下一次按键
 -- 由 llm_processor 执行 ctx:select → Segment::Close 截段 → Forward + Compose
--- 只重译剩余码（组合区内预确认，不上屏）。开关 = _G.llm_prefix_confirm。
+-- 只重译剩余码（组合区内预确认，不上屏）。
+-- 开关 = 方案节 `llm_rerank/prefix_confirm`（2026-11-23：由实验期 `_G`
+-- 手置改为配置项，GUI「前缀自动确认」复选框——只在整句模式勾选时显示）；
+-- 生效条件 = prefix_confirm **且** sentence_mode（配置页在整句模式外不写
+-- true，运行期再兜一层）。θ 仍为内置常数（与 β 同待遇，调整随发版）。
 local PREFIX_CONFIRM_THETA = 1.0
+-- 整句模式同步等待预算（2026-11-23 修）：原先整句模式"投递即走"，当前键
+-- 只能显示层 1 序，LLM 评分只在同指纹重查时才用上（真机实测连续打字从未
+-- 上屏）。改为每键最多等这么久——真机 100ms/键实测 6 个长词候选的
+-- 3-token 打分约 65ms，150ms 留余量；超时仍回退挂账 pending（层 1 序）。
+local SENTENCE_WAIT_MS = 150
+-- 冒烟/调参入口（同 theta 模式）：_G.llm_sentence_wait_ms 置 0 = 不等，
+-- 强制走旧的挂账 pending 路径（超时回退分支的测试用）。
+local function sentence_wait_ms()
+    local v = tonumber(_G.llm_sentence_wait_ms)
+    if v and v >= 0 then return v end
+    return SENTENCE_WAIT_MS
+end
 local FREQ_BETA = 14 -- 对数词频融合系数（2026-11-14 默认模型改
                      -- Qwen2.5-0.5B 后重标定: 用户域 34k + wiki 池化
                      -- 180k 网格, kCeW (1.0,1.10,0.60)+β14 偶半选→奇半
@@ -229,6 +246,10 @@ local cfg = {
     sentence_mode    = false, -- 整句模式：满覆盖候选进评分窗、部分覆盖排后
                               -- （2026-11-22 取代 two_code_sentence 两码整句；
                               --  旧键读取端兜底一次，保存/重建节时剥除）
+    prefix_confirm   = false, -- 前缀自动确认（2026-11-23，实验）：PM 首选多字
+                              -- 词且只覆盖前缀时，下一键自动选入组合区。
+                              -- **只在 sentence_mode 开启时生效**（GUI 也只在
+                              -- 整句模式勾选时显示该复选框）
     -- freq_beta 不再从 schema 读取（2026-11-05 用户配置面移除，标定产物退出配置面）
     -- → 内置常数 FREQ_BETA；方案里残留旧行读取端忽略，保存/重建节时剥除
 }
@@ -684,6 +705,12 @@ local function init_config(env)
     -- code_pattern 恒 '.{2,}'（2 码起参与重排），上方读取的方案节该行被
     -- 覆盖（手改 yaml 也不生效）；off 时方案节值生效
     if cfg.sentence_mode then cfg.code_pattern = '.{2,}' end
+    -- 前缀自动确认（2026-11-23）：配置项，**只在整句模式开启时生效**
+    -- （GUI 只在整句模式勾选时显示该复选框；运行期再兜一层——手改 yaml
+    -- 写 true 但 sentence_mode 关也不触发）
+    local pfc = sc:get_bool("llm_rerank/prefix_confirm")
+    if pfc ~= nil then cfg.prefix_confirm = pfc end
+    _G.llm_prefix_confirm = cfg.prefix_confirm and cfg.sentence_mode
     _G.llm_debug_enabled = cfg.debug_fusion
     -- H 行（进程/方案配置起点）：按方案各写一次——分目录后每个方案的语料
     -- 文件需要自己的 H 行，切方案时不得跳过（旧 one-shot 只写首方案）
@@ -988,19 +1015,32 @@ return function(translation, env)
         snap = res_cache[fp]
         if snap and not snap.scores then snap = nil end
         if not snap and llm.async_submit then
+            -- 评测立即开跑（两模式都不走去抖）：短预算等待后再决定
+            -- 是否挂账——整句模式此前"投递即走"，当前键只能显示层1 序，
+            -- 快照只在同指纹重查时才用上；真机实测连续整句打字 LLM 结果
+            -- 从未上屏（2026-11-23 修）。
             local okp, fp_r = pcall(llm.async_submit, context, cands,
-                                    not sent_on, pm_texts, prefix_text)
+                                    true, pm_texts, prefix_text)
             if okp and fp_r then
                 if sent_on then
-                    -- 整句模式：0 LLM 投递即走（打字流畅优先——40ms 去抖 +
-                    -- 可中断 decode，快速连打自动作废重投）。当前轮层1 序，
-                    -- 评分结果由后续 query 的收割点补写语料（挂账 pending）。
-                    pending[fp_r] = { wid = wid, code = code,
-                                      ctx_src = ctx_src, context = context,
-                                      engine_top = engine_top,
-                                      l1win = l1win, tick = tick }
-                    cache_trim()
-                    sent_pending = true
+                    -- 整句模式：短预算同步等待（SENTENCE_WAIT_MS）。正常
+                    -- 打分在预算内完成 → 当前键就用 LLM 序（子词复用分同时
+                    -- 就位，前缀自动确认才可能触发）；超时 → 回退挂账
+                    -- pending（本轮层1 序，后续收割点补写语料/缓存）。
+                    local okw, res = pcall(llm.async_wait, fp_r,
+                                           sentence_wait_ms())
+                    if okw and type(res) == "table" and res.scores then
+                        res_cache[fp_r] = res
+                        snap = res
+                        cache_trim()
+                    else
+                        pending[fp_r] = { wid = wid, code = code,
+                                          ctx_src = ctx_src, context = context,
+                                          engine_top = engine_top,
+                                          l1win = l1win, tick = tick }
+                        cache_trim()
+                        sent_pending = true
+                    end
                 else
                     -- 字词模式：同步等待评分完成（等价既有同步评分——当前
                     -- 词重排零回归；wait 超时 = skip，评分线程继续跑完，
@@ -1254,10 +1294,11 @@ return function(translation, env)
                 pm_order = {}
                 for _, e in ipairs(scored) do pm_order[#pm_order + 1] = e.c end
                 for _, c in ipairs(unscored) do pm_order[#pm_order + 1] = c end
-                -- 前缀软确认判定（2026-11-23 实验）：开关 = _G.llm_prefix_confirm
-                -- （缺省关闭；真机实验时置 true）。首选多字词、只覆盖前缀
-                -- （_end < 段末）、与次选 margin ≥ θ → 挂起，下一次按键由
-                -- processor 执行 ctx:select
+                -- 前缀软确认判定（2026-11-23 实验）：开关 = 配置项
+                -- llm_rerank/prefix_confirm（init_config 折成 _G.llm_prefix_confirm
+                -- = prefix_confirm and sentence_mode，只在整句模式生效）。
+                -- 首选多字词、只覆盖前缀（_end < 段末）、与次选 margin ≥ θ
+                -- → 挂起，下一次按键由 processor 执行 ctx:select
                 if _G.llm_prefix_confirm and #scored >= 2 then
                     local b1, b2 = scored[1], scored[2]
                     local _s, be = cand_span(b1.c)

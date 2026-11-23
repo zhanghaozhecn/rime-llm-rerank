@@ -8,8 +8,10 @@
 --   D  cancel：代次递增 + 清槽，丢弃任务无结果
 --   E  filter 字词路径：首次 submit+wait 融合序；二次同输入缓存命中同序
 --      且显著更快
---   F  filter 整句路径：首次层1 序 + S|async_pending + 无 L 行（PM 引擎序
---      保持）；换输入 query 触发收割回填（语料 W ok 行 flags=async）；
+--   F0 filter 整句路径（2026-11-23 修）：默认 150ms 预算内完成 → 首轮即
+--      LLM 融合序 + L 行，不挂账
+--   F  filter 整句超时回退：_G.llm_sentence_wait_ms=0 → 层1 序 +
+--      S|async_pending + 无 L 行；换输入触发收割回填（W ok flags=async）；
 --      原输入再 query 缓存命中融合序 + L 行
 --   G  commit 收割（2026-11-22 测试精简补）：_G.llm_async_cancel（=
 --      commit 通知链路）先收割落账（挂账 W ok flags=async）再取消——
@@ -203,8 +205,26 @@ do
       "[smoke] E 字词 wait %.0fms → 缓存 %.0fms 同序", dt1, dt2))
 end
 
--- ═══ 场景 F：filter 整句路径（挂账 / 收割回填 / 缓存命中）═══
+-- ═══ 场景 F0：整句模式同步预算（2026-11-23 修）——当前键即融合序 ═══
+-- 默认预算 150ms；真模型小窗评分应远快于此 → 不再挂账、首轮就有 L 行，
+-- 子词复用分同时就位（前缀确认的判定前提）。
 do
+  OUT = {}; LIVE = {}; CORPUS = {}
+  _G.llm_sentence_wait_ms = nil         -- 用默认预算
+  local tr, ev = mktrans({
+      mkc("我们", 0, 2), mkc("你们", 0, 2), mkc("我", 0, 1), mkc("们", 0, 1),
+    }), mkenv(true, "wm", { start = 0, _end = 2 })
+  filter(tr, ev)
+  assert(#OUT == 4, "F0: yield 数 " .. #OUT)
+  assert(not saw_skip("async_pending"), "F0: 预算内不应挂账")
+  assert(lrow() and lrow()[3] == "wm", "F0: 首轮应有 L 行（同步融合）")
+  print("[smoke] F0 整句同步预算首轮融合 ok")
+end
+
+-- ═══ 场景 F：整句超时回退（挂账 / 收割回填 / 缓存命中）═══
+do
+  -- 预算置 0 强制走超时挂账分支（旧的"投递即走"语义，保留回归覆盖）
+  _G.llm_sentence_wait_ms = 0
   local fmk = function(inp, seg)
     return mktrans({
       mkc("你们", 0, 2), mkc("尼玛", 0, 2), mkc("你", 0, 1), mkc("那", 0, 1),
@@ -236,11 +256,13 @@ do
   filter(tr, ev)
   assert(not saw_skip("async_pending"), "F: 缓存命中不应再挂账")
   assert(lrow() and lrow()[3] == "nm", "F: 缓存命中应有 L 行（融合）")
-  print("[smoke] F 整句异步挂账/收割回填/缓存命中 ok")
+  print("[smoke] F 整句超时挂账/收割回填/缓存命中 ok")
+  _G.llm_sentence_wait_ms = nil     -- 恢复默认预算
 end
 
 -- ═══ 场景 G：commit 收割（llm_async_cancel = commit 通知链路）═══
 do
+  _G.llm_sentence_wait_ms = 0       -- 预算 0 强制挂账，测 commit 收割链
   OUT = {}; LIVE = {}; CORPUS = {}   -- 清空：F 已写过 async 行，计数需只看本轮
   -- 候选文本换新词：指纹 = 上文+候选，同候选会命中 F 的缓存（缓存命中
   -- 不再挂账是正确生产语义，场景隔离靠换候选）
@@ -258,6 +280,7 @@ do
   assert(n_async >= 1, "G: commit 收割未落账（W ok flags=async 缺）")
   assert(llm.async_poll() == nil, "G: 结果槽应已被收割消费")
   print("[smoke] G commit 收割落账 ok")
+  _G.llm_sentence_wait_ms = nil     -- 恢复默认预算
 end
 
 print("[smoke_async] ALL PASS")
