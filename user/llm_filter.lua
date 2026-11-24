@@ -22,13 +22,16 @@ local llm_loaded_for = nil  -- enabled value when llm was loaded
 --   ② 窗口侧：该 lead 文本必须是**窗口融合序第 1** 且 span 对齐（文本一致
 --      铁律：同码同长同音字不得按区间捡）——位次即 CE 全序比较，再加 CE
 --      margin 净收益反降（研究库 §「窗口侧只认第 1」）；
---   ③ 守卫（2026-11-24 标定，音节单位）：确认后剩余 ≥2 音节；单音节
---      lead 例外（剩余 ≥1）。组句句子字数 = 音节数（中文一字一音节）；
+--   ③ 守卫（2026-11-24 真机定案，音节单位）：确认后**剩余 ≥2 音节**，
+--      单字 lead 不再有"余 1 例外"（下载 xiazai 在 xia 确认「下」→ 剩 zai
+--      只能出单字，2 字词被拆）。组句句子字数 = 音节数（中文一字一音节）；
 --      不用码数——简拼/双拼/混拼下码数与音节数无固定关系。
 -- 挂起后由 llm_processor 下一键执行 ctx:select → Segment::Close 截段 →
 -- Forward + Compose 只重译剩余码（组合区内预确认，不上屏）。
--- 开关 = 方案节 `llm_rerank/prefix_confirm`（GUI「前缀自动确认」复选框，
--- 只在整句模式勾选时显示）；生效条件 = prefix_confirm **且** sentence_mode。
+-- 开关 = 方案节 `llm_rerank/ngram_group`（GUI「N-gram 组句候选」复选框）：
+-- 前缀确认的唯一信号源是组句 lead，2026-11-24 用户定案并入同一开关
+-- （独立键 `prefix_confirm` 退役、读取端忽略）；生效条件 = 整句模式 +
+-- 组句开 + 方案输出简体。
 -- θ 与单字倍数已退役（位次门不需要 θ）；组句返回空（码切在音节中间）的窗
 -- 不再自动确认（研究库：该档窗口 A 精度仅 56.8%）。
 local PREFIX_CONFIRM_P = 0.95
@@ -261,11 +264,10 @@ local cfg = {
                               -- 概率序（2026-11-24 统一准入取代 2026-11-22
                               -- 满覆盖优先；2026-11-22 取代 two_code_sentence
                               -- 两码整句；旧键读取端兜底一次，保存/重建节剥除）
-    prefix_confirm   = false, -- 前缀自动确认（2026-11-24 合并单一路线）：
-                              -- 组句 lead 概率 ≥0.95 且该文本是窗口融合序第 1
-                              -- 时，下一键自动选入组合区。
-                              -- **只在 sentence_mode 开启时生效**（GUI 也只在
-                              -- 整句模式勾选时显示该复选框）
+    prefix_confirm   = false, -- 【已退役，2026-11-24 并入 ngram_group】前缀自动
+                              -- 确认的唯一信号源 = 组句 lead，故与组句同开关；
+                              -- 旧键读取端忽略、保存/重建节时剥除。
+                              -- _G.llm_prefix_confirm = _G.llm_ngram_group
     ngram_group      = false, -- N-gram 组句候选（2026-11-23 整句模式第②段）：
                               -- 用万象 LTS `.gram` + 万象词库做词级 beam，生成
                               -- top-20 整句候选（显示 1 条、概率供前缀确认；
@@ -727,12 +729,10 @@ local function init_config(env)
     -- code_pattern 恒 '.{2,}'（2 码起参与重排），上方读取的方案节该行被
     -- 覆盖（手改 yaml 也不生效）；off 时方案节值生效
     if cfg.sentence_mode then cfg.code_pattern = '.{2,}' end
-    -- 前缀自动确认（2026-11-23）：配置项，**只在整句模式开启时生效**
-    -- （GUI 只在整句模式勾选时显示该复选框；运行期再兜一层——手改 yaml
-    -- 写 true 但 sentence_mode 关也不触发）
-    local pfc = sc:get_bool("llm_rerank/prefix_confirm")
-    if pfc ~= nil then cfg.prefix_confirm = pfc end
-    _G.llm_prefix_confirm = cfg.prefix_confirm and cfg.sentence_mode
+    -- 前缀自动确认已并入 ngram_group（2026-11-24 用户定案）：确认信号完全
+    -- 来自组句 lead，没有组句就没有确认，故不保留独立开关。旧键
+    -- `llm_rerank/prefix_confirm` 读取端忽略、保存/重建节时剥除。
+    -- _G.llm_prefix_confirm 在下方按 ngram 门派生（含整句模式/简体门）。
     -- N-gram 组句候选（2026-11-23 整句模式第②段）：开关 + 只需在整句模式。
     -- 组句词表 = 万象（简体）词库——只在方案输出简体时注入。
     -- 输出字形门（2026-11-23 晚修，与源码版同构）：旧判据只认
@@ -765,6 +765,9 @@ local function init_config(env)
     end
     _G.llm_ngram_group = cfg.ngram_group and cfg.sentence_mode
                              and _G.llm_simplified_scheme
+    -- 前缀自动确认 = 组句同一开关（2026-11-24 用户定案）：确认信号只有
+    -- 组句 lead 一条来源；要前缀确认就必须有万象资产，所以并成一个开关。
+    _G.llm_prefix_confirm = _G.llm_ngram_group
     _G.llm_debug_enabled = cfg.debug_fusion
     -- H 行（进程/方案配置起点）：按方案各写一次——分目录后每个方案的语料
     -- 文件需要自己的 H 行，切方案时不得跳过（旧 one-shot 只写首方案）
@@ -944,11 +947,13 @@ local function prefix_gate(gen, b1, seg_start, seg_end, p_thr)
     if p < (p_thr or prefix_confirm_p()) then return nil end
     local le = le_of[lead]
     if le < 0 or le >= n then return nil end     -- 必须是严格前缀
-    -- 音节守卫：剩余音节 ≥2；单音节 lead 时 ≥1
-    local sl = nchars(lead)
+    -- 音节守卫（2026-11-24 真机定案）：**剩余必须 ≥2 音节**——单字 lead 的
+    -- "余 1 例外"退役：`xiazai` 想在 xia 就确认「下」，剩 zai 只能出单字，
+    -- 「下载」这个 2 字词被拆开（标定：该例外仅 +112 触发，去掉后精度
+    -- 95.48% / 召回 40.23% / K=5 1935，几乎无损）。
     local st = nchars(txt_of[lead])
-    local sr = st - sl
-    if st < sl or sr < (sl == 1 and 1 or 2) then return nil end
+    local sr = st - nchars(lead)
+    if st < 1 or sr < 2 then return nil end
     local s1pos, b1e = cand_span(b1)
     if b1.text ~= lead or s1pos ~= seg_start or b1e ~= seg_start + le then
         return nil
@@ -1046,20 +1051,21 @@ return function(translation, env)
         simp_on = env.engine.context:get_option(_G.llm_simplifier_option)
     end
     local gen = nil
-    local genset = nil   -- 句候选文本集（只显示 1 条用；2026-11-24 用户定案）
+    local genset = nil   -- 只放"显示置顶"的那 1 条组句文本（2026-11-24 定案）
     -- 2026-11-24 用户定案：无上文也要组句——前缀确认此时按"剩余项融合"
     -- 判定（见下方 freq_only），组句侧证据照常需要。
     if cfg.sentence_mode and _G.llm_ngram_group and simp_on and pattern_ok
             and #code >= 4 and code:match("^[a-z]+$") then
         gen = ngram_make(env, code, context, prefix_text, seg_start, seg_end)
         if gen then
+            -- 只注入/抑制显示的那一条（ngram 序第 1）；其余只供前缀概率。
+            -- 2026-11-24 真机报障（象/向/想 等整字从候选里消失）：旧实现把
+            -- top-20 全部文本都登记进 genset 参与抑制/去重，而显示端只留 1
+            -- 条——与组句 top-20 同名的引擎候选被整条删掉且无替代。
             local merged, seen_t = {}, {}
-            genset = {}
-            for _, it in ipairs(gen) do
-                seen_t[it.text] = true
-                genset[it.text] = true
-                merged[#merged + 1] = it.cand
-            end
+            genset = { [gen[1].text] = true }
+            seen_t[gen[1].text] = true
+            merged[1] = gen[1].cand
             for _, c in ipairs(all) do
                 if not seen_t[c.text] then merged[#merged + 1] = c end
             end

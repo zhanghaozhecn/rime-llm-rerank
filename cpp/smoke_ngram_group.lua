@@ -72,7 +72,6 @@ local function mkenv(input, seg, opts)
           if k == "llm_rerank/enabled" then return true end
           if k == "llm_rerank/debug_fusion" then return true end
           if k == "llm_rerank/sentence_mode" then return true end
-          if k == "llm_rerank/prefix_confirm" then return opts.prefix ~= false end
           if k == "llm_rerank/ngram_group" then return opts.ngram ~= false end
           return nil
         end,
@@ -176,13 +175,23 @@ run(engine_cands(), "detianqi", { start = 0, _end = 8 })
 local tx = texts()
 -- 2026-11-24 用户定案：5 句仍然参与内部计算，但**界面上只显示 1 条**
 --（排在最前的整句首选），其余位置是引擎候选。
-local gset, shown = {}, 0
+-- 2026-11-24 修：只**注入/抑制**显示的那 1 条；与组句 top-20 同名（但非首位）
+-- 的引擎候选必须照常出现在候选列表里（真机报障：象/向/想 整字消失）。
+local gset, n_inj, first_inj = {}, 0, false
 for i = 1, 5 do gset[GEN[i].text] = true end
-for _, t in ipairs(tx) do
-  if gset[t] then shown = shown + 1 end
+for i, c in ipairs(OUT) do
+  if c.type == "ngram_group" then
+    n_inj = n_inj + 1
+    if i == 1 then first_inj = true end
+  end
 end
-check("A 句候选只显示 1 条", shown == 1 and gset[tx[1]] ~= nil,
-      "shown=" .. shown .. " first=" .. tostring(tx[1]))
+check("A 组句只注入/显示 1 条（置顶）", n_inj == 1 and first_inj,
+      "n_inj=" .. n_inj .. " first=" .. tostring(tx[1]))
+local kept_engine = false
+for _, t in ipairs(tx) do
+  if t == "的天气" then kept_engine = true end   -- = GEN[4]，引擎也有
+end
+check("A 同名引擎候选不被组句吞掉", kept_engine, "的天气 in out")
 check("A 句候选排在首位", gset[tx[1] or ""] == true, tx[1])
 local pc = _G.llm_pending_confirm
 -- 合并门（2026-11-24）后确认还要求"该 lead 是窗口融合序第 1"，融合序由真实
@@ -343,9 +352,11 @@ check("M4 span 不对齐不确认", l == nil, tostring(l))
 -- M5 多字 lead、确认后只剩 1 音节 → 不确认（边界歧义档，实测 90.5%）
 l = gate(gsum({ { "我们", 6, -1, "我们德" } }), mkc("我们", 0, 6), 0, 9)
 check("M5 多字 lead 余 1 音节不确认", l == nil, tostring(l))
--- M5b 单字 lead、只剩 1 音节 → 确认（单字边界无歧义，实测 99.1%）
+-- M5b 单字 lead、只剩 1 音节 → **不确认**（2026-11-24 真机定案：`xiazai`
+-- 在 xia 就确认「下」会把 2 字词拆成 单字+单字；该例外仅 +112 触发，去掉后
+-- 精度 95.48% / 召回 40.23% / K=5 1935）
 l = gate(gsum({ { "的", 2, -1, "的天" } }), mkc("的", 0, 2), 0, 6)
-check("M5b 单字 lead 余 1 音节确认", l == "的", tostring(l))
+check("M5b 单字 lead 余 1 音节不确认", l == nil, tostring(l))
 -- M6 简拼/双拼形态：码只 3 个但音节正常（的天气 3 音节，余 2）→ 确认
 --（旧「≥6 码」守卫会误拒；音节守卫按 3 音节放行）
 l = gate(gsum({ { "的", 1, -1, "的天气" } }), mkc("的", 0, 1), 0, 3)
@@ -418,17 +429,18 @@ end
 check("N3 无组句仍 skip ctx_empty",
       _G.llm_pending_confirm == nil and saw_ctx_empty)
 
--- ── N4：无上文 + 前缀确认关闭 → 保持旧行为（skip ctx_empty）────────
--- freq_only 只在 prefix_confirm 开启时生效（与源码版 Apply 放行门同构）。
+-- ── N4：无上文 + N-gram 开关关 → 保持旧行为（skip ctx_empty）────────
+-- 2026-11-24 单开关：前缀自动确认并入 ngram_group（旧键 prefix_confirm
+-- 读取端忽略），关组句即关确认，freq_only 不再生效。
 GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
 _G.llm_pending_confirm = nil
 run({ mkc("的", 0, 2), mkc("得", 0, 2), mkc("的天气", 0, 8) },
-    "detianqi", { start = 0, _end = 8 }, { prefix = false })
+    "detianqi", { start = 0, _end = 8 }, { ngram = false })
 saw_ctx_empty = false
 for _, ln in ipairs(LIVE) do
   if ln:find("|ctx_empty|", 1, true) then saw_ctx_empty = true end
 end
-check("N4 前缀确认关时不走 freq_only",
+check("N4 组句关时不走 freq_only",
       _G.llm_pending_confirm == nil and saw_ctx_empty)
 _G.llm_context_get = saved_ctx_get
 

@@ -46,7 +46,6 @@ local function mkenv(sent, input, seg, pfx)
           if k == "llm_rerank/enabled" then return true end
           if k == "llm_rerank/debug_fusion" then return true end
           if k == "llm_rerank/sentence_mode" then return sent end
-          if k == "llm_rerank/prefix_confirm" then return pfx end
           return nil
         end,
         get_int = function(_, k)
