@@ -74,6 +74,59 @@ function Get-ModelState([string]$path) {
 # 对话微调版在重排任务上差 0.67pp，故自建上传。旧 instruct 下载源已退役）
 $MODEL_URL = "https://www.modelscope.cn/models/zhanghaozhecn/Qwen3-0.6B-Base-GGUF/resolve/master/Qwen3-0.6B-Base-Q4_K_M.gguf"
 
+# ── N-gram 组句资产（2026-11-24 用户定案：打开开关时检测、可确认后自动下载）──
+# 来源 = 万象 RIME-LMDG 官方 release：LTS 语法模型 + nightly 词库包（dicts.zip）。
+# env 覆盖镜像/测试：RIME_LLM_NGRAM_URL / RIME_LLM_NGRAM_DICTS_URL。
+$NGRAM_GRAM_NAME = "wanxiang-lts-zh-hans.gram"
+$NGRAM_GRAM_URL = "https://github.com/amzxyz/RIME-LMDG/releases/download/LTS/wanxiang-lts-zh-hans.gram"
+$NGRAM_DICTS_URL = "https://github.com/amzxyz/RIME-LMDG/releases/download/dict-nightly/dicts.zip"
+$NGRAM_GRAM_EXPECTED_BYTES = 390786092   # LTS 资产精确体量（转正判据）
+$NGRAM_DICTS_MIN_BYTES = 10MB            # nightly 词库包体量浮动，只设下限
+$NGRAM_DICT_NAMES = @("zi", "jichu", "duoyin", "diming", "mingren", "yiren")
+# 返回 @{ ok = $bool; why = "缺失原因（含路径，多行）" }
+# -Real：绕过测试钩子走真实检测（下载完成后的校验必须看真文件）
+function Get-NgramAssets {
+  param([switch]$Real)
+  # 测试钩子（2026-11-24）：LLM_INSTALLER_FAKE_NGRAM_FILE 指向的文件内容即
+  # 判定结果（"ok" = 资产齐；其它非空内容 = 缺失原因原文）——沙箱测试准备
+  # 不了 391MB 真资产，提示分支需要确定性。生产不设该变量 = 走真实检测。
+  $ff = $env:LLM_INSTALLER_FAKE_NGRAM_FILE
+  if (-not $Real -and $ff -and (Test-Path -LiteralPath $ff)) {
+    $fake = (Get-Content -LiteralPath $ff -Raw -ErrorAction SilentlyContinue)
+    if ($null -ne $fake) { $fake = $fake.Trim() }
+    if ($fake -eq "ok") { return @{ ok = $true; why = "" } }
+    if ($fake) { return @{ ok = $false; why = $fake } }
+  }
+  $gram = if ($env:RIME_LLM_NGRAM_PATH) { $env:RIME_LLM_NGRAM_PATH }
+          else { Join-Path (Join-Path $RIME_USER "llm_ngram") $NGRAM_GRAM_NAME }
+  $ddir = if ($env:RIME_LLM_NGRAM_DICT) { $env:RIME_LLM_NGRAM_DICT }
+          else { Join-Path (Join-Path $RIME_USER "llm_ngram") "dicts" }
+  $fi = Get-Item -LiteralPath $gram -ErrorAction SilentlyContinue
+  if (-not $fi) {
+    return @{ ok = $false; why = "缺少组句模型：$gram（约 391 MB）" }
+  }
+  if ($fi.Length -lt 300000000) {
+    return @{ ok = $false; why = ("组句模型不完整（{0} MB，应为约 391 MB）：{1}" -f
+              [Math]::Round($fi.Length / 1e6), $gram) }
+  }
+  $miss = @()
+  foreach ($n in $NGRAM_DICT_NAMES) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ddir "$n.dict.yaml"))) {
+      $miss += "$n.dict.yaml"
+    }
+  }
+  if ($miss.Count -gt 0) {
+    return @{ ok = $false; why = ("缺少词库（{0}/{1}）：{2}" -f
+              ($NGRAM_DICT_NAMES.Count - $miss.Count), $NGRAM_DICT_NAMES.Count,
+              (Join-Path $ddir ($miss -join ", "))) }
+  }
+  return @{ ok = $true; why = "" }
+}
+# N-gram 资产未就绪的统一提示文案（两版逐字一致；tail = 结尾问句）
+function Format-NgramPrompt([string]$why, [string]$tail) {
+  return ($why + "`n`n缺失时 N-gram 组句会自动关闭（60 秒后重试），不影响其它功能。`n可自动下载安装（万象 LTS 语言模型 + 词库），或把上面两项手动放到该目录。`n`n" + $tail)
+}
+
 function Find-WeaselDir {
   # ① 注册表 WeaselRoot（安装器写入；最可靠）
   foreach ($k in @("HKLM:\SOFTWARE\Rime\Weasel", "HKLM:\SOFTWARE\WOW6432Node\Rime\Weasel")) {
@@ -258,7 +311,7 @@ $PARAM_DEFAULTS = [ordered]@{
   #   候选段 100ms / 最优 3.65%；旧 10/5 为 0.5B 时代值）
   sentence_mode = $false; debug_fusion = $false
   prefix_confirm = $false
-  ngram_group = $false   # 2026-11-23 第②段：N-gram 组句候选（无勾选框，键位透传）
+  ngram_group = $false   # 2026-11-23 第②段：N-gram 组句候选（2026-11-24 起有勾选框）
 }
 $PARAM_INT_KEYS  = @("max_tokens","max_candidates","cpu_cores")
 $PARAM_DBL_KEYS  = @()
@@ -700,6 +753,123 @@ function Download-ModelAction([string]$modelPath, $Log) {
   }
 }
 
+# 万象 N-gram 组句资产下载（2026-11-24 用户定案：开关里确认后直接装）：
+# curl 断点续传语法模型（精确体量转正）→ curl 词库包 → tar 解压到 dicts\ →
+# 校验六库 → 完成。失败保留分片，重试可续传。
+function Download-NgramAction($Log) {
+  & $Log "── 下载万象 N-gram 组句资产 ──"
+  $base = if ($env:RIME_LLM_NGRAM_PATH) {
+            Split-Path $env:RIME_LLM_NGRAM_PATH -Parent
+          } else { Join-Path $RIME_USER "llm_ngram" }
+  $gram = if ($env:RIME_LLM_NGRAM_PATH) { $env:RIME_LLM_NGRAM_PATH }
+          else { Join-Path $base $NGRAM_GRAM_NAME }
+  $ddir = if ($env:RIME_LLM_NGRAM_DICT) { $env:RIME_LLM_NGRAM_DICT }
+          else { Join-Path $base "dicts" }
+  New-Item -ItemType Directory -Path $base -Force | Out-Null
+  New-Item -ItemType Directory -Path $ddir -Force | Out-Null
+  $gurl = if ($env:RIME_LLM_NGRAM_URL) { $env:RIME_LLM_NGRAM_URL } else { $NGRAM_GRAM_URL }
+  $durl = if ($env:RIME_LLM_NGRAM_DICTS_URL) { $env:RIME_LLM_NGRAM_DICTS_URL } else { $NGRAM_DICTS_URL }
+  # 词库包下限可被测试/镜像覆盖（生产 10MB；沙箱测试用的小 zip 需要放低）
+  $minDicts = if ($env:RIME_LLM_NGRAM_DICTS_MIN_BYTES) {
+                [long]$env:RIME_LLM_NGRAM_DICTS_MIN_BYTES
+              } else { $NGRAM_DICTS_MIN_BYTES }
+
+  function Invoke-CurlResume([string]$url, [string]$tmp, [long]$expected, [string]$label) {
+    & $Log "  $label → $tmp"
+    & $Log "  来源: $url"
+    if (Test-Path $tmp) {
+      $have = (Get-Item $tmp).Length
+      if ($have -gt 0) { & $Log ("  发现未完成分片 {0} MB — 断点续传" -f [Math]::Round($have / 1e6)) }
+    }
+    $p = Start-Process -FilePath "curl.exe" `
+      -ArgumentList @("-L", "-C", "-", "-s", "-S", "--retry", "3", "--retry-delay", "2",
+                      "-o", "`"$tmp`"", "`"$url`"") -PassThru -WindowStyle Hidden
+    try { Set-Content -LiteralPath ($tmp + ".pid") -Value $p.Id -Encoding ascii -Force } catch { }
+    while (-not $p.HasExited) {
+      Start-Sleep -Seconds 3
+      if (Test-Path $tmp) {
+        $len = (Get-Item $tmp).Length
+        if ($expected -gt 0) {
+          $pct = [Math]::Min(99, [int][Math]::Floor(($len * 100) / $expected))
+          & $Log ("  进度: {0} MB / {1} MB（{2}%）" -f [Math]::Round($len / 1e6),
+                  [Math]::Round($expected / 1e6), $pct)
+        } else {
+          & $Log ("  进度: {0} MB" -f [Math]::Round($len / 1e6))
+        }
+      }
+    }
+    Remove-Item -LiteralPath ($tmp + ".pid") -Force -ErrorAction SilentlyContinue
+    if ($p.ExitCode -ne 0) {
+      throw ("$label 下载失败（curl 退出码 $($p.ExitCode)）——分片已保留，重试可续传")
+    }
+    if (Test-Path $tmp) { return (Get-Item $tmp).Length }
+    return 0
+  }
+
+  # ① 语法模型（LTS 资产精确体量为转正判据）
+  $gtmp = $gram + ".download"
+  if ((Test-Path $gram) -and (Get-Item $gram).Length -eq $NGRAM_GRAM_EXPECTED_BYTES) {
+    & $Log "  语法模型已就绪，跳过"
+  } else {
+    $len = Invoke-CurlResume $gurl $gtmp $NGRAM_GRAM_EXPECTED_BYTES "语法模型（约 391 MB）"
+    if ($len -ne $NGRAM_GRAM_EXPECTED_BYTES) {
+      throw ("语法模型体量不符（{0} MB，应为 {1} MB）——分片已保留，重试可续传" -f
+             [Math]::Round($len / 1e6), [Math]::Round($NGRAM_GRAM_EXPECTED_BYTES / 1e6))
+    }
+    Move-Item $gtmp $gram -Force
+    & $Log ("  语法模型完成: {0} MB" -f [Math]::Round($len / 1e6))
+  }
+
+  # ② 词库包（nightly 体量浮动 → 只设下限）
+  $zip = Join-Path $base "dicts.zip"
+  $ztmp = $zip + ".download"
+  if ((Test-Path $zip) -and (Get-Item $zip).Length -ge $minDicts) {
+    & $Log "  词库包已就绪，跳过"
+  } else {
+    $len = Invoke-CurlResume $durl $ztmp 0 "词库包"
+    if ($len -lt $minDicts) {
+      throw ("词库包体量异常（{0} MB）——分片已保留，重试可续传" -f [Math]::Round($len / 1e6))
+    }
+    Move-Item $ztmp $zip -Force
+    & $Log ("  词库包完成: {0} MB" -f [Math]::Round($len / 1e6))
+  }
+
+  # ③ 解压（Win10 1803+ 自带 tar/bsdtar 可解 zip；缺失回退 Expand-Archive）
+  $tar = Join-Path $env:SystemRoot "System32\tar.exe"
+  if (Test-Path $tar) {
+    & $tar -xf $zip -C $ddir
+    $code = $LASTEXITCODE
+  } else {
+    try {
+      Expand-Archive -LiteralPath $zip -DestinationPath $ddir -Force
+      $code = 0
+    } catch {
+      $code = -1
+      & $Log ("  [ERROR] 解压失败：" + $_.Exception.Message)
+    }
+  }
+  if ($code -ne 0) { throw "词库包解压失败（退出码 $code）" }
+  # 部分打包把文件放在子目录 → 平移到 dicts 根（运行期只认根下的六个）
+  foreach ($n in $NGRAM_DICT_NAMES) {
+    if (Test-Path (Join-Path $ddir "$n.dict.yaml")) { continue }
+    $hit = Get-ChildItem -LiteralPath $ddir -Recurse -Filter "$n.dict.yaml" -File -ErrorAction SilentlyContinue |
+           Select-Object -First 1
+    if ($hit -and $hit.DirectoryName -ne $ddir) {
+      Get-ChildItem -LiteralPath $hit.DirectoryName -File -ErrorAction SilentlyContinue |
+        Move-Item -Destination $ddir -Force -ErrorAction SilentlyContinue
+    }
+  }
+  $miss = @($NGRAM_DICT_NAMES | Where-Object { -not (Test-Path (Join-Path $ddir "$_.dict.yaml")) })
+  if ($miss.Count -gt 0) {
+    throw ("词库解压后仍缺 " + ($miss -join ", ") + "（$ddir）——可手动放置")
+  }
+  Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+  & $Log ("  词库就位: {0}（6/6，已删除 zip）" -f $ddir)
+  $st = Get-NgramAssets -Real   # 校验必须看真文件（不走测试钩子）
+  if (-not $st.ok) { throw ("安装后校验未通过：" + $st.why) }
+  & $Log "完成。"
+}
+
 # ── 线程数实测（2026-10-01 用户定案；2026-11-19 口径改 t_cand）──────────
 # 起点 4 线程、终点 8 线程；本机不足 5 逻辑核**不实测**，直接取最大线程数。
 # 指标 = t_cand：候选段两次 decode（k 个 3-token 候选，首 token 互异，
@@ -883,8 +1053,9 @@ function Invoke-Installer([string]$cliAction, [string]$schemaName, [string]$mode
           Schema-RemoveAction $schemaName $Log
         }
         "download-model" { Download-ModelAction $modelPath $Log }
+        "download-ngram" { Download-NgramAction $Log }
         "bench" { [void](Bench-Action $modelPath $BenchTrials (Get-BenchCands $BenchCands) $Log) }
-        default { & $Log "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove | download-model | bench）"; exit 1 }
+        default { & $Log "未知动作: $cliAction（status | install | copy-files | schema-add | schema-remove | download-model | download-ngram | bench）"; exit 1 }
       }
     } catch {
       & $Log ("[ERROR] " + $_.Exception.Message)
@@ -953,7 +1124,8 @@ function Run-InstallerGui {
   $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
   $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（t_cand = 当前「候选数」个 3-token 候选的候选段延迟，预填充不计；`n取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
   $tipTcs = "整句模式 sentence_mode（默认关闭）。`n开启后：只有覆盖整个活动段（音节数与编码一致）的候选进`nLLM 评分窗——全拼/简拼整句的满覆盖候选优先，部分编码对应的`n候选保持引擎序排后；两码一字方案（双拼/五笔/郑码）下与旧`n「词长==⌊码长/2⌋」效果一致。`n开启后编码匹配固定为 .{2,}（2 码起参与重排，输入框锁定）。`n取代 two_code_sentence 两码整句（2026-11-22）。"
-  $tipPrefix = "前缀自动确认 prefix_confirm（实验，默认关闭；只在整句模式开启时显示）。`n开启后：子词首选满足「多字词 + 只覆盖编码前缀 + 与次选分差 ≥ 1.0」`n时，下一次按键自动把它选入组合区（截段重译剩余码，不上屏），`n用户只需选择没把握的词；误确认按退格即可回退。"
+  $tipPrefix = "前缀自动确认 prefix_confirm（默认关闭；只在整句模式开启时显示）。`n开启后：组句 top-20 的前导词概率 ≥0.95、且该词就是窗口融合序第 1 名`n（span/文本一致；确认后剩余 ≥2 音节，单字前导词例外 ≥1）时，`n下一次按键/刷新自动把它选入组合区（截段重译剩余码，不上屏）；`n误确认按退格即可回退。无上文时按词频序判同一条规则。"
+  $tipNgram = "N-gram 组句候选 ngram_group（默认关闭；只在整句模式开启、方案输出简体时生效）。`n用万象 LTS 语言模型 + 词库生成整句候选（top-20），候选窗只显示首选 1 条，`n其前导词概率用于「前缀自动确认」。`n需要资产：用户文件夹\llm_ngram\wanxiang-lts-zh-hans.gram（约 391 MB）`n+ llm_ngram\dicts\（六个词库）；缺失时自动关闭（60 秒后重试），不影响其它功能。"
   $tipDebug = "诊断日志：开启后每次重排都往用户文件夹的 llm_rerank\<方案> 子目录写`nrime_llm_debug.txt（逐候选 CE / 词频 / 词长与名次变化；语料/账本/词码对同目录，按方案隔离）。排障用，平时关闭。`n实时调试窗口：插件版随『复制文件』装到 Rime 用户文件夹`nllm_rerank\viewer\open_debug_window.bat；源码版走托盘「LLM 设置+调试」。"
   $tipSave = "把上面的参数写进选中方案的 llm_rerank 配置节（键名与 yaml 里相同），`n随后自动重新部署生效。`n方案还没接入（缺配置节 / 缺组件行 / 残留另一版组件行）时，`n本按钮会先剥净再补齐组件行 + 写入配置节（原「接入 LLM」已并入这里）。"
   $tipScheme = "配置就写在选中的方案文件里。下拉列出**用户文件夹** %APPDATA%\Rime 与`n**程序文件夹** <小狼毫目录>\data（预装方案，带「（程序）」后缀）两处的 *.schema.yaml；`n**打开下拉即重扫两处**（外部新增/删除方案后无需手动刷新），界面无改动时还会重读当前文件。`n预装方案在写入前会自动复制到用户文件夹（Rime 解析顺序：用户文件夹优先）。"
@@ -1106,6 +1278,9 @@ function Run-InstallerGui {
   # ── 触发条件（两行：编码匹配 + 整句模式）──
   # 整句模式归入触发条件组（2026-11-22 用户定案：取消「候选排序融合」组——
   # 满覆盖准入本质是触发/准入条件；复选框不再带英文键名）
+  # 触发条件组（2026-11-24）：前缀自动确认 与 N-gram 组句候选**同行并排**
+  # （两者都只在整句模式勾选时显示；并排避免新增一行把下面各组的坐标整体
+  # 下移、页面超高）。各自的「?」徽标紧跟在复选框右侧。
   $g2 = Add-Group $form "触发条件" $GX 222 $GW 128
   [void](Add-Ctl "Label" "编码匹配:" $g2 14 24 76 20)
   $txtCodePat = Add-Ctl "TextBox" "" $g2 92 21 240 22
@@ -1116,15 +1291,25 @@ function Run-InstallerGui {
   Add-Help $g2 $tipTcs (Help-X $g2) 55 | Out-Null
   # 前缀自动确认（2026-11-23 用户定案）：**只在整句模式勾选时显示**
   # （实验功能，整句模式外无意义；隐藏时行位保留，不重排后续控件）
-  $chkPrefix = Add-Ctl "CheckBox" "前缀自动确认" $g2 14 84 220 22
+  # 2026-11-24：与 N-gram 组句候选同行并排（两个都只在整句模式显示；
+  # 并排避免新行把下方各组坐标整体下移、页面总高超屏）。
+  $chkPrefix = Add-Ctl "CheckBox" "前缀自动确认" $g2 14 84 150 22
   $script:tip.SetToolTip($chkPrefix, $tipPrefix)
-  Add-Help $g2 $tipPrefix (Help-X $g2) 85 | Out-Null
+  Add-Help $g2 $tipPrefix 168 85 | Out-Null
   $chkPrefix.Visible = $false
+  # N-gram 组句候选（2026-11-24 用户定案）：同款显隐；勾选时检测万象资产，
+  # 缺失弹 YesNo 提示安装（选否自动取消勾选）。
+  $chkNgram = Add-Ctl "CheckBox" "N-gram 组句候选" $g2 200 84 200 22
+  $script:tip.SetToolTip($chkNgram, $tipNgram)
+  Add-Help $g2 $tipNgram 404 85 | Out-Null
+  $chkNgram.Visible = $false
   # 整句模式锁定编码匹配（2026-11-22 用户定案）：勾选 → 框固定 '.{2,}' 并
   # 禁用；取消 → 恢复勾选前的值可编辑。$script:sentSuppress 抑制程序化赋值
   # （读入路径）触发的本事件；真点击（含测试 BM_CLICK）才联动。
   $script:patBeforeSent = $null
   $script:sentSuppress = $false
+  # N-gram 勾选框的程序化赋值抑制（读入/回填不应触发"检测+提示"）
+  $script:ngramSuppress = $false
   $chkTcs.add_CheckedChanged({
     if ($script:sentSuppress) { return }
     if ($chkTcs.Checked) {
@@ -1134,6 +1319,7 @@ function Run-InstallerGui {
       $txtCodePat.Text = ".{2,}"
       $txtCodePat.Enabled = $false
       $chkPrefix.Visible = $true
+      $chkNgram.Visible = $true
     } else {
       $txtCodePat.Enabled = $true
       if ($script:patBeforeSent) { $txtCodePat.Text = $script:patBeforeSent }
@@ -1141,7 +1327,33 @@ function Run-InstallerGui {
       # 关整句模式 → 隐藏并取消勾选（落盘恒 false，界面与文件一致）
       $chkPrefix.Visible = $false
       $chkPrefix.Checked = $false
+      $chkNgram.Visible = $false
+      $chkNgram.Checked = $false
     }
+  })
+  # N-gram 组句候选（2026-11-24 用户定案）：勾选时检测万象资产；缺失则询问
+  # 是否现在下载安装——**开关先回到关**，只有下载/解压/校验全部成功才显示开
+  # （见工作完成回调里的 action="download-ngram" 分支）。
+  $chkNgram.add_CheckedChanged({
+    if ($script:ngramSuppress) { return }
+    if (-not $chkNgram.Checked) { return }
+    $st = Get-NgramAssets
+    if ($st.ok) { return }
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+      (Format-NgramPrompt $st.why "是否现在下载安装（约 421 MB，来源 GitHub）？下载成功后开关才会显示为开。"),
+      "N-gram 组句资产未就绪", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+      [System.Windows.Forms.MessageBoxIcon]::Question)
+    # 无论选是选否，开关先回关（只有安装成功才显示开）
+    $script:ngramSuppress = $true
+    $chkNgram.Checked = $false
+    $script:ngramSuppress = $false
+    if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    if (-not $script:WorkDone) {
+      $lblParamStatus.Text = "已有操作在进行中，请等它完成后再装 N-gram 资产"
+      $lblParamStatus.ForeColor = $colInfo
+      return
+    }
+    Start-Work "download-ngram" "" ""
   })
 
   # ── 推理规模 + 候选排序融合（一行）：标签列用同一个实测宽度 ──
@@ -1221,9 +1433,13 @@ function Run-InstallerGui {
   }
   foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
   foreach ($k in $PARAM_INT_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
+  $script:ngramSuppress = $true
   $chkTcs.Checked = [bool]$PARAM_DEFAULTS["sentence_mode"]
   $chkPrefix.Checked = [bool]$PARAM_DEFAULTS["prefix_confirm"]
   $chkPrefix.Visible = [bool]$PARAM_DEFAULTS["sentence_mode"]
+  $chkNgram.Checked = [bool]$PARAM_DEFAULTS["ngram_group"]
+  $chkNgram.Visible = [bool]$PARAM_DEFAULTS["sentence_mode"]
+  $script:ngramSuppress = $false
 
   # ── 模型路径下拉扫描 + 模型状态（与源码版同款：只扫用户文件夹与
   #    %USERPROFILE%\gguf_models，避免遍历整盘）──
@@ -1319,6 +1535,7 @@ function Run-InstallerGui {
     $parts += [string]$chkEnabled.Checked
     $parts += [string]$chkTcs.Checked
     $parts += [string]$chkPrefix.Checked
+    $parts += [string]$chkNgram.Checked
     $parts += [string]$chkDebug.Checked
     $parts += $cmbModel.Text.Trim()
     return ($parts -join "|")
@@ -1373,11 +1590,14 @@ function Run-InstallerGui {
     # 整句模式锁定编码匹配显示（2026-11-22）：勾选 → 框固定 '.{2,}' 禁用；
     # 未勾选 → 方案值可编辑。suppress 抑制程序化赋值触发的联动事件。
     $script:sentSuppress = $true
+    $script:ngramSuppress = $true
     $chkEnabled.Checked = $v.enabled
     $chkTcs.Checked = [bool]$v.sentence_mode
-    # 前缀自动确认（2026-11-23）：值照读，可见性跟随整句模式
+    # 前缀自动确认 / N-gram 组句（2026-11-24）：值照读，可见性跟随整句模式
     $chkPrefix.Checked = [bool]$v.prefix_confirm
     $chkPrefix.Visible = [bool]$v.sentence_mode
+    $chkNgram.Checked = [bool]$v.ngram_group
+    $chkNgram.Visible = [bool]$v.sentence_mode
     $chkDebug.Checked = $v.debug_fusion
     if ($v.sentence_mode) {
       $script:patBeforeSent = [string]$v.code_pattern
@@ -1388,6 +1608,7 @@ function Run-InstallerGui {
       $txtCodePat.Enabled = $true
     }
     $script:sentSuppress = $false
+    $script:ngramSuppress = $false
     # 模型路径：节里是正斜杠，显示统一反斜杠；未配置显示默认路径
     # （model_path 不在 $PARAM_*_KEYS 里——那是六个参数框的键集，故直接从节读）
     $mp = ""
@@ -1625,6 +1846,8 @@ function Run-InstallerGui {
     # 前缀自动确认（2026-11-23）：只在整句模式开启时落 true（关整句模式
     # 恒写 false——lua 运行期同样 gate，双保险）
     $p.prefix_confirm = $chkTcs.Checked -and $chkPrefix.Checked
+    # N-gram 组句候选（2026-11-24）：同样只在整句模式开启时落 true
+    $p.ngram_group = $chkTcs.Checked -and $chkNgram.Checked
     $p.debug_fusion = $chkDebug.Checked
     # 整句模式锁定编码匹配（2026-11-22）：勾选时恒写 '.{2,}'——即使输入框
     # 被跨进程工具改过也以锁定值为准（输入框本身已禁用，此处为兜底）
@@ -1656,6 +1879,22 @@ function Run-InstallerGui {
           [System.Windows.Forms.MessageBoxIcon]::Warning)
         if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
           $lblParamStatus.Text = "已取消保存——先点『下载模型』或『浏览…』就位模型，再保存"
+          $lblParamStatus.ForeColor = $colInfo
+          return
+        }
+      }
+    }
+    # N-gram 组句（2026-11-24）：开启但万象资产缺失 → 保存前确认（同模型口径，
+    # 避免"勾了但没生效"静默）。开关时的提示在 CheckedChanged 里。
+    if ($p.sentence_mode -and $p.ngram_group) {
+      $ng = Get-NgramAssets
+      if (-not $ng.ok) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+          (Format-NgramPrompt $ng.why "仍要保存吗？"),
+          "N-gram 组句资产未就绪", [System.Windows.Forms.MessageBoxButtons]::YesNo,
+          [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
+          $lblParamStatus.Text = "已取消保存——先安装万象 N-gram 组句资产（模型 + 词库），再保存"
           $lblParamStatus.ForeColor = $colInfo
           return
         }
@@ -1779,6 +2018,7 @@ function Run-InstallerGui {
   $actionDone = @{
     "copy-files"     = "文件复制完成（rime_llm.dll + lua 已部署，服务已重启）"
     "download-model" = "模型下载完成"
+    "download-ngram" = "N-gram 组句资产安装完成"
     "schema-add"     = "已接入 LLM（组件行 + llm_rerank 配置节）"
     "schema-remove"  = "已剥离 LLM（组件行 + 配置节）"
   }
@@ -1890,6 +2130,21 @@ function Run-InstallerGui {
       }
       $script:DlFill = ""
       $doneMsg = $(if ($actionDone.ContainsKey($act)) { $actionDone[$act] } else { "完成" })
+      # N-gram 资产装完 → 复核资产；通过才把开关显示为开（2026-11-24 用户定案：
+      # 开关只在安装成功后开）。校验失败保持关并提示。
+      $ngramBad = $false
+      if ($act -eq "download-ngram") {
+        $st2 = Get-NgramAssets
+        if ($st2.ok) {
+          $script:ngramSuppress = $true
+          $chkNgram.Checked = $true
+          $script:ngramSuppress = $false
+          $doneMsg = "N-gram 组句资产安装完成——开关已打开，点『保存并生效』启用"
+        } else {
+          $ngramBad = $true
+          $doneMsg = "N-gram 资产下载完成但校验未通过：" + $st2.why
+        }
+      }
       # B2（2026-11-21）：真下载完成 → 状态行补"下一步"指引（"已存在"秒回分支不补）
       if ($act -eq "download-model" -and ($text -match '下载完成:')) {
         $doneMsg = $doneMsg + "——接着选方案、点『保存并生效』启用重排"
@@ -1900,6 +2155,9 @@ function Run-InstallerGui {
       $rdTok = [regex]::Match($text, '\[REDEPLOY=(\w+)').Groups[1].Value
       if ($rdTok -and $rdTok -ne "ok" -and $rdTok -ne "skipped") {
         $lblInstallStatus.Text = "$doneMsg；自动重新部署未完成（$rdTok）——请托盘手动重新部署"
+        $lblInstallStatus.ForeColor = $colErr
+      } elseif ($ngramBad) {
+        $lblInstallStatus.Text = $doneMsg
         $lblInstallStatus.ForeColor = $colErr
       } else {
         $lblInstallStatus.Text = $doneMsg

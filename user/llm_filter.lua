@@ -1047,8 +1047,10 @@ return function(translation, env)
     end
     local gen = nil
     local genset = nil   -- 句候选文本集（只显示 1 条用；2026-11-24 用户定案）
+    -- 2026-11-24 用户定案：无上文也要组句——前缀确认此时按"剩余项融合"
+    -- 判定（见下方 freq_only），组句侧证据照常需要。
     if cfg.sentence_mode and _G.llm_ngram_group and simp_on and pattern_ok
-            and context ~= "" and #code >= 4 and code:match("^[a-z]+$") then
+            and #code >= 4 and code:match("^[a-z]+$") then
         gen = ngram_make(env, code, context, prefix_text, seg_start, seg_end)
         if gen then
             local merged, seen_t = {}, {}
@@ -1103,8 +1105,15 @@ return function(translation, env)
         for _, c in ipairs(all) do yield(c) end; return
     end
 
-    -- 空上文：与源码版一致跳过评分（W skip 记录）
-    if context == "" then
+    -- 无上文（2026-11-24 用户定案）：CE 不可算，但**前缀确认照常**——融合分
+    -- 按剩余项（β·log1p(eff) + log(uni+1) + 词码对修正）计算，组句 lead 与
+    -- 窗口融合序第 1 比较。只在整句模式 + 前缀确认 + 组句都开且组句有结果时
+    -- 走这条（其余保持旧行为：跳过，W 记 ctx_empty）。
+    -- 组合区已确认前缀 prefix_text 非空 = 已有临时上文 → 不进 freq_only，
+    -- 下一键自动回到完整 CE 融合（"选一次 phrase 就有了上文"）。
+    local freq_only = (context == "" and prefix_text == "" and gen ~= nil
+            and _G.llm_prefix_confirm)
+    if context == "" and prefix_text == "" and not freq_only then
         if wid then
             _G.llm_write_w(wid, ctx_src, code, context, engine_top, {}, {},
                            tick, "skip", "ctx_empty", false, "")
@@ -1112,6 +1121,10 @@ return function(translation, env)
         live("S|" .. os.date("%H:%M:%S") .. "|ctx_empty|" ..
              live_esc(code) .. "|" .. live_esc(ctx_src))
         for _, c in ipairs(all) do yield(c) end; return
+    end
+    if freq_only then
+        live("S|" .. os.date("%H:%M:%S") .. "|freq_only|" ..
+             live_esc(code) .. "|" .. live_esc(ctx_src))
     end
     -- ═══ 层1: 全体候选 用户词频打分重排（v3 两层重排, 2026-11-07 定案）═══
     -- 全体候选 S1 = FREQ_BETA·log1p(eff) + 累计 Unigram 项, 稳定降序（同分保引擎序）,
@@ -1221,7 +1234,7 @@ return function(translation, env)
     local ev_ms = 0   -- 本轮评分耗时（实时调试 L 行用；异步路径 = 纯评分耗时）
     local sent_pending = false   -- 整句模式已投递挂账（本轮层1 序输出）
     local prep_flag = "0"
-    if #cands >= 2 then
+    if #cands >= 2 and not freq_only then
         -- 提交清单 = 评分窗（≤max_candidates）。组句候选**不进评分**（2026-11-24
         -- 定案：phrase-only——组句只提供文本与"自信前缀"概率，位次证据来自
         -- 窗口融合序；句子本身不再参与 CE，显示 = ngram 序首选 1 条）。
@@ -1294,9 +1307,9 @@ return function(translation, env)
         prep_flag = snap.prep and "1" or "0"
     end
 
-    -- 失败原因（用于 W skip）；snap 成功时为空
+    -- 失败原因（用于 W skip）；snap 成功或 freq_only（无上文）时为空
     local skip_reason = nil
-    if #cands >= 2 and not snap then
+    if #cands >= 2 and not snap and not freq_only then
         if sent_pending then
             skip_reason = "async_pending"    -- 已投递待收割（本轮层1 序）
         elseif llm.async_submit then
@@ -1318,7 +1331,7 @@ return function(translation, env)
     if dbg then
         local okr, r = pcall(function() return llm.is_ready() end)
         if okr then live_ready = r and "1" or "0" end
-        if not snap then
+        if not snap and not freq_only then
             local okp, ph = pcall(function() return llm.prep_hit end)
             prep_flag = (okp and ph) and "1" or "0"
         end
@@ -1328,13 +1341,17 @@ return function(translation, env)
         end
     end
 
-    if snap or (ok and result) then
+    if freq_only or snap or (ok and result) then
         if snap and not result then
             -- 快照路径（缓存命中 / 字词 wait）：cands = 提交序文本数组。
             -- 融合块对 ordered 全量重排，初序仅影响浮点精确同分的打破序
             --（旧 DLL = CE 降序，快照路径 = 层1 提交序——同分罕见，v1 接受）
             result = snap.cands
             scores = snap.scores
+        end
+        if freq_only and not result then
+            -- 无上文：无评分，窗口初序 = 层1 序（cands 已是准入序）
+            result = cands
         end
         local seen = {}
         local ordered_all = {}
@@ -1371,11 +1388,15 @@ return function(translation, env)
         --   ④ 冷启动 eff≡0 且 uni 无计数时自动退化为 score 序, 成熟期三项叠加。
         --   ⑤ 词码对分数修正（2026-11-17 有符号表）: 正分 = 固定首选/次选
         --      （+200/+100，不受 fade）；负分 = pairfix 降噪（原 −λ，保留
-        --      fade）。无 CE 分支同样生效；debug 行尾 修正%+g，C 行尾追加
+        --      fade）。**只对已算 CE 的候选生效**（2026-11-24 用户定案：
+        --      pairfix 修的是 CE 系统性偏差，无 CE 分支/无上文 freq_only 不叠
+        --      修正）；debug 行尾 修正%+g，C 行尾追加
         --      sdelta（有符号；旧 pf 字段仍为负分幅度，兼容旧查看器）。
         -- 失败哨兵分 (≤-1e9) 排尾部不参与; 同分稳定保序 (融合序)。
         local fused_scores = nil
-        if #ordered > 1 and scores then
+        -- freq_only（无上文）：scores 为 nil，融合只剩词频/词码对项——
+        -- 下方 else 分支按 s1_of 计算，min_valid 为 nil（加 0）。
+        if #ordered > 1 and (scores or freq_only) then
             local freq_eff = _G.user_freq_eff
             -- CE 三分量（2026-11-11 协议 v2）：text → {c1,c2,c3} 原始分量
             --（未乘权重）。异步基建（2026-11-22）：快照路径从 snap 读（避免
@@ -1410,7 +1431,7 @@ return function(translation, env)
             -- 加 0 = 自然回退层1 序。
             local min_valid = nil
             for _, c in ipairs(ordered) do
-                local s = scores[c.text]
+                local s = scores and scores[c.text]
                 if is_valid_llm_score(s)
                         and (not min_valid or s < min_valid) then
                     min_valid = s
@@ -1420,7 +1441,7 @@ return function(translation, env)
             -- 本窗已在窗口准入前读过同一份表（正分占位用），这里复用。
             local arr = {}
             for i, c in ipairs(ordered) do
-                local s = scores[c.text]
+                local s = scores and scores[c.text]
                 if is_valid_llm_score(s) then
                     local n = freq_eff and freq_eff(c.text, code) or 0
                     local u1_term = _G.user_unigram_term
@@ -1443,18 +1464,24 @@ return function(translation, env)
                                         fused = t, cerank = i }
                     end
                 else
-                    -- 无 CE 分（评分失败/无法表示）→ 层1 分 + 窗内最低
-                    -- LLM 分（压制到窗底, 保留层1 耦合; 见上注）
+                    -- 无 CE 分（评分失败/无法表示/无上文 freq_only）→ 层1 分
+                    -- + 窗内最低 LLM 分（压制到窗底, 保留层1 耦合; 见上注）。
+                    -- 无上文时 min_valid=nil → 融合 = β·log1p(eff) +
+                    -- log(uni+1)（2026-11-24 用户定案）。
+                    -- **不叠词码对修正**：pairfix 修的是 CE 的系统性偏差，
+                    -- 没有 CE 就无从修（2026-11-24 用户定案）。
                     local s1 = s1_of[c.text]
-                    local delta = pairfix_delta(pftbl, c.text, input)
                     local t = (s1 or -math.huge)
-                            + (min_valid and min_valid or 0) + delta
+                            + (min_valid and min_valid or 0)
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
-                        dbg[c.text] = { ce = s, eff = 0, fb = 0,
-                                        pf = delta < 0 and -delta or nil,
-                                        sdelta = delta ~= 0 and delta or nil,
+                        local n = freq_eff and freq_eff(c.text, code) or 0
+                        local u1_term = _G.user_unigram_term
+                                and _G.user_unigram_term(c.text, code) or 0
+                        dbg[c.text] = { ce = s, eff = n,
+                                        fb = FREQ_BETA * math.log(1 + n),
+                                        u1 = u1_term,
                                         uni = _G.user_uni_count
                                               and _G.user_uni_count(c.text,
                                                                     code) or 0,
@@ -1545,7 +1572,7 @@ return function(translation, env)
             -- 协议 v4（2026-11-12）：L 尾追加 ctx_used = 推理实际使用的
             -- 上文尾部文本（去空白上文中末 ≤max_ctx token 的原文段，
             -- get_ctx_used 容错旧 DLL；查看器据此灰显未用前缀）
-            local cu = snap and snap.ctx_used
+            local cu = freq_only and "" or (snap and snap.ctx_used)
             if cu == nil then
                 local okcu, cu2 = pcall(function() return llm.get_ctx_used() end)
                 cu = (okcu and type(cu2) == "string") and cu2 or ""
@@ -1609,10 +1636,11 @@ return function(translation, env)
             end
         end
         -- 常开语料 W ok（最终序 + 引擎前 10 + 层1 窗）
+        -- flags 追加 nofreq（2026-11-24）：本窗无 CE、融合只含词频剩余项
         if wid and not w_written then
             _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
                            texts_of(out, 20), tick, "ok", "",
-                           prep_flag == "1", "")
+                           prep_flag == "1", freq_only and "nofreq" or "")
             w_written = true
         end
         -- 来源徽章已删（2026-11-10 用户定案：实时调试窗口上线——上文来源/

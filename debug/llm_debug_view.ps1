@@ -34,7 +34,8 @@
                                                        时折进 CE 格数值 + 公式尾项）
    S|HH:MM:SS|reason|input|src                        跳过原因：pattern/ctx_empty/
                                                        not_ready/ctx_short/scores_nil/
-                                                       score_failed/few_candidates
+                                                       score_failed/few_candidates；
+                                                       freq_only = 无上文（非跳过）
    E|HH:MM:SS|word|eff0|eff1|tick0|tick1              commit 落账
    R|HH:MM:SS|reason                                  上文重置（编辑键等）
 
@@ -584,9 +585,17 @@ function Handle-Line {
     }
     'S' {
       if ($f.Count -lt 3) { return }
-      Add-Stream 'evt' ('{0} 跳过 {1}（输入 {2} 来源 {3}）' -f $f[1], $f[2],
-        $(if ($f.Count -gt 3) { $f[3] } else { '' }),
-        $(if ($f.Count -gt 4) { $f[4] } else { '-' })) 0
+      # 无上文（2026-11-24）：freq_only 不是"跳过"——本窗照常融合/前缀确认，
+      # 只是不含 CE。用中性措辞，避免被读成"没触发重排"。
+      if ($f[2] -eq 'freq_only') {
+        Add-Stream 'evt' ('{0} 无上文：按词频融合（无 CE）（输入 {1} 来源 {2}）' -f
+          $f[1], $(if ($f.Count -gt 3) { $f[3] } else { '' }),
+          $(if ($f.Count -gt 4) { $f[4] } else { '-' })) 0
+      } else {
+        Add-Stream 'evt' ('{0} 跳过 {1}（输入 {2} 来源 {3}）' -f $f[1], $f[2],
+          $(if ($f.Count -gt 3) { $f[3] } else { '' }),
+          $(if ($f.Count -gt 4) { $f[4] } else { '-' })) 0
+      }
     }
     'E' {
       if ($f.Count -lt 7) { return }

@@ -72,7 +72,7 @@ local function mkenv(input, seg, opts)
           if k == "llm_rerank/enabled" then return true end
           if k == "llm_rerank/debug_fusion" then return true end
           if k == "llm_rerank/sentence_mode" then return true end
-          if k == "llm_rerank/prefix_confirm" then return true end
+          if k == "llm_rerank/prefix_confirm" then return opts.prefix ~= false end
           if k == "llm_rerank/ngram_group" then return opts.ngram ~= false end
           return nil
         end,
@@ -357,6 +357,80 @@ check("M7 多字确认", l == "今天", tostring(l))
 -- M8 窗口第 1 是短子词（不是证据词本身）→ 不确认
 l = gate(gsum({ { "的天气", 6, -1, "的天气" } }), mkc("的", 0, 2), 0, 8)
 check("M8 窗1 非证据词不确认", l == nil, tostring(l))
+
+-- ── N：无上文（CE 不可算）→ 融合按剩余项 + 组句 lead 照常确认 ──────
+-- 2026-11-24 用户定案：无上文时 fused = β·log1p(eff) + log(uni+1) + 词码对；
+-- 组句 lead 仍与窗口融合序第 1 比较、照常挂起。窗口序无 CE → 层1 序 =
+-- 引擎序（全零计数时）→ 首候选「的」必与 lead 一致，判定是确定性的。
+local saved_ctx_get = _G.llm_context_get
+_G.llm_context_get = function() return "", "com" end
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
+_G.llm_pending_confirm = nil
+run({ mkc("的", 0, 2), mkc("得", 0, 2), mkc("的天气", 0, 8), mkc("得", 0, 2) },
+    "detianqi", { start = 0, _end = 8 })
+pc = _G.llm_pending_confirm
+check("N 无上文仍确认（窗1 = 组句 lead）",
+      pc ~= nil and pc.text == "的" and pc.input == "detianqi",
+      pc and tostring(pc.text) or "nil")
+local saw_freq, saw_ctx_empty, ctx_used_empty = false, false, false
+for _, ln in ipairs(LIVE) do
+  if ln:find("|freq_only|", 1, true) then saw_freq = true end
+  if ln:find("|ctx_empty|", 1, true) then saw_ctx_empty = true end
+  if ln:sub(1, 2) == "L|" then
+    local f = {}
+    for s in (ln .. "|"):gmatch("([^|]*)|") do f[#f + 1] = s end
+    ctx_used_empty = (f[12] == "")   -- 第 12 字段 = ctx_used
+  end
+end
+check("N 无上文走 freq_only（不 skip ctx_empty）", saw_freq and not saw_ctx_empty)
+check("N 无上文不做 CE（ctx_used 空）", ctx_used_empty)
+
+-- ── N2：确认过一次 phrase（组合区有已确认前缀）→ 有临时上文 → 完整 CE ──
+-- prefix_text 非空时 freq_only 必须关闭：本轮按 prefix 作 ctx 真跑 CE
+-- （L 行 ctx_used = 前缀文本；不是 freq_only）。
+_G.llm_confirmed_prefix = function() return "的" end
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
+_G.llm_pending_confirm = nil
+run({ mkc("的", 0, 2), mkc("得", 0, 2), mkc("的天气", 0, 8), mkc("得", 0, 2) },
+    "detianqi", { start = 0, _end = 8 })
+_G.llm_confirmed_prefix = nil
+local saw_freq2, ctx_used_prefix = false, false
+for _, ln in ipairs(LIVE) do
+  if ln:find("|freq_only|", 1, true) then saw_freq2 = true end
+  if ln:sub(1, 2) == "L|" then
+    local f = {}
+    for s in (ln .. "|"):gmatch("([^|]*)|") do f[#f + 1] = s end
+    ctx_used_prefix = (f[12] == "的")
+  end
+end
+check("N2 有临时上文不降级 freq_only", not saw_freq2)
+check("N2 CE 上文含已确认前缀", ctx_used_prefix)
+
+-- ── N3：无上文 + 组句不可用（gen 空）→ 保持旧行为（skip ctx_empty）──
+GEN = nil
+_G.llm_pending_confirm = nil
+run({ mkc("的", 0, 2), mkc("得", 0, 2), mkc("的天气", 0, 8) },
+    "detianqi", { start = 0, _end = 8 })
+saw_ctx_empty = false
+for _, ln in ipairs(LIVE) do
+  if ln:find("|ctx_empty|", 1, true) then saw_ctx_empty = true end
+end
+check("N3 无组句仍 skip ctx_empty",
+      _G.llm_pending_confirm == nil and saw_ctx_empty)
+
+-- ── N4：无上文 + 前缀确认关闭 → 保持旧行为（skip ctx_empty）────────
+-- freq_only 只在 prefix_confirm 开启时生效（与源码版 Apply 放行门同构）。
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
+_G.llm_pending_confirm = nil
+run({ mkc("的", 0, 2), mkc("得", 0, 2), mkc("的天气", 0, 8) },
+    "detianqi", { start = 0, _end = 8 }, { prefix = false })
+saw_ctx_empty = false
+for _, ln in ipairs(LIVE) do
+  if ln:find("|ctx_empty|", 1, true) then saw_ctx_empty = true end
+end
+check("N4 前缀确认关时不走 freq_only",
+      _G.llm_pending_confirm == nil and saw_ctx_empty)
+_G.llm_context_get = saved_ctx_get
 
 print(string.format("[smoke] ngram_group: %d pass, %d fail", OK, FAIL))
 if FAIL > 0 then os.exit(1) end

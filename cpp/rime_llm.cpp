@@ -2095,7 +2095,11 @@ static int lua_async_submit(lua_State * L) {
     }
     // 第 5 参（可选，2026-11-23）：组合区已确认前缀（完整追加，不参与上文截断）
     const char * prefix = luaL_optstring(L, 5, "");
-    if ((int)cands.size() < 2 || !context || !*context) {
+    // 2026-11-24：空上文 + 非空前缀 = 有临时上文（确认过 phrase），任务成立
+    // ——ctx_ids_with_prefix 会把前缀拼进 ctx（旧判据只看 context 会误拒，
+    // 使"选一次 phrase 后就能算 CE"失效）。
+    if ((int)cands.size() < 2 ||
+        ((!context || !*context) && (!prefix || !*prefix))) {
         lua_pushnil(L);   // 任务不成立（调用方走层1 序）
         return 1;
     }

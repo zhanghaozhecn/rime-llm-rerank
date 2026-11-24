@@ -36,6 +36,14 @@ $env:LLM_INSTALLER_NO_REDEPLOY = "1"
 # 用户目录也要钉在沙箱：GUI 现在优先注册表 RimeUserDir（真实机器上指向真目录），
 # 该覆盖变量优先级最高，保证测试读写全落沙箱
 $env:RIME_LLM_USER_DIR = Join-Path $sandbox "Rime"
+# N-gram 组句资产（2026-11-24）：沙箱准备不了 391MB 真资产 → 用 GUI 内置
+# 测试钩子 LLM_INSTALLER_FAKE_NGRAM_FILE（内容 "ok" = 资产齐；其它非空 =
+# 缺失原因原文，每次调用现读文件 → 测试可中途改写）。G4c/G4d 用它验证
+# 保存时的"缺资产提示"分支（勾选事件的 managed 回调跨进程 BM_CLICK 不触发，
+# 与 S/T 同族怪癖，故只测保存路径）。
+$env:LLM_INSTALLER_FAKE_NGRAM_FILE = Join-Path $sandbox "ngram_fake.txt"
+New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
+Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE -Value "ok" -Encoding ascii
 # 线程数实测：GUI 相位全程伪装成 3 逻辑核（<5 → 不实测、直接取最大线程数）；
 # 真机路径（≥5 核）另走 G13b 的 CLI 子进程（环境变量可按用例切换）
 $env:RIME_LLM_FAKE_CORES = "3"
@@ -491,7 +499,9 @@ engine:
                       (($f | Select-String "lua_filter@\*llm_filter").Count) -eq 1)
   Assert "llm_rerank 节恰 1" ((($f | Where-Object { $_ -match '^llm_rerank:' }).Count) -eq 1)
   Assert "prefix_confirm: false（默认关闭，整句模式 on 但未勾选）" (($f | Where-Object { $_ -match '^\s+prefix_confirm: false\s*$' }).Count -eq 1)
+  Assert "ngram_group: false（默认关闭，整句模式 on 但未勾选）" (($f | Where-Object { $_ -match '^\s+ngram_group: false\s*$' }).Count -eq 1)
   Assert "「前缀自动确认」可见（整句模式 on 才显示）" (Check-Visible "前缀自动确认")
+  Assert "「N-gram 组句候选」可见（整句模式 on 才显示）" (Check-Visible "N-gram 组句候选")
   Show-File
 
   Write-Host "== G4b: 前缀自动确认勾选 → 落盘 true =="
@@ -502,6 +512,33 @@ engine:
   $f = Get-Content $test -Encoding UTF8
   Assert "prefix_confirm: true（勾选后落盘）" (($f | Where-Object { $_ -match '^\s+prefix_confirm: true\s*$' }).Count -eq 1)
   Assert "sentence_mode: true（未动保持）" (($f | Where-Object { $_ -match '^\s+sentence_mode: true\s*$' }).Count -eq 1)
+
+  Write-Host "== G4c: N-gram 组句勾选 → 落盘 true + 缺资产保存提示（选是）=="
+  $hNgram = Find-Check "N-gram 组句候选"
+  [void][W]::SendMsg($hNgram, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # BM_CLICK 勾选（与 G4b 同款）
+  Start-Sleep -Milliseconds 300
+  Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE `
+               -Value "MISSING: C:\fake\llm_ngram\wanxiang-lts-zh-hans.gram" -Encoding ascii
+  Click-Btn (Find-Button "保存并生效")
+  [void](Dismiss-Prompt "是")   # 模型未就绪（沙箱无模型）
+  [void](Dismiss-Prompt "是")   # N-gram 资产未就绪
+  $f = Get-Content $test -Encoding UTF8
+  Assert "ngram_group: true（缺资产确认后落盘）" (($f | Where-Object { $_ -match '^\s+ngram_group: true\s*$' }).Count -eq 1)
+
+  Write-Host "== G4d: N-gram 缺资产保存选『否』→ 取消保存 =="
+  $h1 = (Get-FileHash $test -Algorithm MD5).Hash
+  Click-Btn (Find-Button "保存并生效")
+  [void](Dismiss-Prompt "是")   # 模型未就绪
+  [void](Dismiss-Prompt "否")   # N-gram 资产未就绪 → 取消
+  Assert "状态含 已取消保存" (Any-Text "已取消保存")
+  Assert "文件未改动" ((Get-FileHash $test -Algorithm MD5).Hash -eq $h1)
+  Set-Content -LiteralPath $env:LLM_INSTALLER_FAKE_NGRAM_FILE -Value "ok" -Encoding ascii
+  [void][W]::SendMsg($hNgram, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # 取消勾选（后续相位回到 false）
+  Start-Sleep -Milliseconds 300
+  Click-Btn (Find-Button "保存并生效")
+  [void](Dismiss-Prompt "是")   # 模型未就绪
+  $f = Get-Content $test -Encoding UTF8
+  Assert "ngram_group: false（取消勾选后落盘）" (($f | Where-Object { $_ -match '^\s+ngram_group: false\s*$' }).Count -eq 1)
 
   Write-Host "== G5: 幂等重存（逐字节一致）=="
   $h1 = (Get-FileHash $test -Algorithm MD5).Hash
@@ -526,6 +563,7 @@ engine:
   Assert "enabled: false（点击翻转）" (($f | Where-Object { $_ -match '^\s+enabled: false\s*$' }).Count -eq 1)
   Assert "sentence_mode: false（点击翻转）" (($f | Where-Object { $_ -match '^\s+sentence_mode: false\s*$' }).Count -eq 1)
   Assert "prefix_confirm: false（整句模式关 → 恒落 false，即使框内仍是勾选态）" (($f | Where-Object { $_ -match '^\s+prefix_confirm: false\s*$' }).Count -eq 1)
+  Assert "ngram_group: false（整句模式关 → 恒落 false）" (($f | Where-Object { $_ -match '^\s+ngram_group: false\s*$' }).Count -eq 1)
   # 取消勾选的"恢复原值"联动走 CheckedChanged——**跨进程 BM_CLICK 不触发
   # managed 事件**（与 WM_SETTEXT 不触发 TextChanged 同族怪癖；原生检查态
   # 已翻转、保存端 BM_GETCHECK 读到 false）→ 框文本残留锁定值 '.{2,}' 随
@@ -540,6 +578,7 @@ engine:
   Assert "max_tokens 字段 = 12" ((Get-WText $e[1].h) -eq "12")
   Assert "code_pattern 字段 = .{2,}（off 读入 = 方案节值，见 G7 怪癖注）" ((Get-WText $e[0].h) -eq ".{2,}")
   Assert "「前缀自动确认」隐藏（读入 sentence_mode off）" (-not (Check-Visible "前缀自动确认"))
+  Assert "「N-gram 组句候选」隐藏（读入 sentence_mode off）" (-not (Check-Visible "N-gram 组句候选"))
 
   Write-Host "== G9: 只在出错时写 install_error.log（GUI 程序目录）=="
   $logFile = Join-Path $PSScriptRoot "install_error.log"
@@ -888,6 +927,42 @@ engine:
     Start-Sleep -Milliseconds 500
     Assert ("关窗后无遗留 bench_threads 进程（实测 {0} 个）" -f @(Get-Process bench_threads -ErrorAction SilentlyContinue).Count) (@(Get-Process bench_threads -ErrorAction SilentlyContinue).Count -eq 0)
     Get-Process bench_threads -ErrorAction SilentlyContinue | Stop-Process -Force
+  }
+
+  # ══ CLI 相位：download-ngram（2026-11-24 用户定案：开关里直接下载安装）══
+  # file:// 源替代 GitHub（本机到 GitHub release CDN 实测只有几 KB/s）：
+  # 校验链完整——断点 curl → 精确体量转正 → zip 解压 → 六库校验。
+  Write-Host "== N1: download-ngram（file:// 源）=="
+  $ngroot = Join-Path $sandbox "llm_ngram"
+  $ngsrc = Join-Path $sandbox "ngsrc"
+  New-Item -ItemType Directory -Path $ngsrc -Force | Out-Null
+  $fakeGram = Join-Path $ngsrc "wanxiang-lts-zh-hans.gram"
+  $fs = [IO.File]::Create($fakeGram); $fs.SetLength(390786092); $fs.Close()
+  $dsrc = Join-Path $ngsrc "dictsrc"
+  New-Item -ItemType Directory -Path $dsrc -Force | Out-Null
+  foreach ($n in @("zi", "jichu", "duoyin", "diming", "mingren", "yiren")) {
+    Set-Content -LiteralPath (Join-Path $dsrc "$n.dict.yaml") -Value "name: $n" -Encoding utf8
+  }
+  $fakeZip = Join-Path $ngsrc "dicts.zip"
+  Compress-Archive -Path (Join-Path $dsrc '*') -DestinationPath $fakeZip -Force
+  $env:RIME_LLM_NGRAM_PATH = Join-Path $ngroot "wanxiang-lts-zh-hans.gram"
+  $env:RIME_LLM_NGRAM_DICT = Join-Path $ngroot "dicts"
+  $env:RIME_LLM_NGRAM_URL = "file:///" + ($fakeGram -replace '\\', '/')
+  $env:RIME_LLM_NGRAM_DICTS_URL = "file:///" + ($fakeZip -replace '\\', '/')
+  $env:RIME_LLM_NGRAM_DICTS_MIN_BYTES = "1"
+  Run-Cli "download-ngram" | Out-Null
+  Assert "download-ngram 退出码 0" ($LASTEXITCODE -eq 0)
+  $gfi = Get-Item -LiteralPath $env:RIME_LLM_NGRAM_PATH -ErrorAction SilentlyContinue
+  Assert "语法模型落位且体量精确" ($gfi -and $gfi.Length -eq 390786092)
+  $nmiss = @(@("zi", "jichu", "duoyin", "diming", "mingren", "yiren") |
+            Where-Object { -not (Test-Path (Join-Path $env:RIME_LLM_NGRAM_DICT "$_.dict.yaml")) })
+  Assert "六库解压就位" ($nmiss.Count -eq 0)
+  Assert "词库包已删除" (-not (Test-Path (Join-Path $ngroot "dicts.zip")))
+  $out2 = Run-Cli "download-ngram"
+  Assert "二次执行幂等（已就绪跳过）" (($out2 -join "`n") -match '已就绪')
+  foreach ($k in @("RIME_LLM_NGRAM_PATH", "RIME_LLM_NGRAM_DICT", "RIME_LLM_NGRAM_URL",
+                   "RIME_LLM_NGRAM_DICTS_URL", "RIME_LLM_NGRAM_DICTS_MIN_BYTES")) {
+    Remove-Item "Env:$k" -ErrorAction SilentlyContinue
   }
 }
 finally {
