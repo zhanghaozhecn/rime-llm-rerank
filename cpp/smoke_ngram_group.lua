@@ -38,7 +38,8 @@ print(string.format("[smoke] model ready %.0fs", os.clock() - t0))
 local GEN = nil          -- 当前场景的生成结果
 llm.ngram_load = function() return true end
 llm.ngram_sentences = function(code, ctx, params)
-  assert(params and params.topk == 5, "params.topk")
+  -- 2026-11-24 定案：topk 20（lead 概率质量；显示仍只置顶 1 条）
+  assert(params and params.topk == 20, "params.topk")
   return GEN
 end
 
@@ -48,7 +49,20 @@ function Candidate(t, s, e, txt, cm)
   return c
 end
 
--- mock env：sentence_mode / ngram_group / simplifier 三开关 + 活动段
+-- mock env：sentence_mode / ngram_group / 输出字形门 + 活动段
+--   opts.ngram    false = 关闭 ngram_group
+--   opts.simp     false = filters 里没有 simplifier（纯繁体方案）
+--   opts.noopt    true  = 有 simplifier 但无 option_name（朙月恒转换）
+--   opts.opt_off  "<名>" = 显式开关方案里该开关当前关闭
+local function simp_filters(opts)
+  local names = opts.simp == false
+      and { [0] = "uniquifier", [1] = "llm_filter" }
+      or { [0] = "simplifier", [1] = "llm_filter" }
+  return { size = 2,
+    get_value_at = function(_, i)
+      return { get_string = function() return names[i] end }
+    end }
+end
 local function mkenv(input, seg, opts)
   opts = opts or {}
   return {
@@ -70,14 +84,20 @@ local function mkenv(input, seg, opts)
           if k == "llm_rerank/code_pattern" then return ".{2,}" end
           if k == "llm_rerank/model_path" then return MODEL end
           if k == "simplifier/option_name" then
-            return opts.simp == false and nil or "zh_simp"
+            if opts.simp == false or opts.noopt then return nil end
+            return "zh_simp"
           end
+          return nil
+        end,
+        get_list = function(_, k)
+          if k == "engine/filters" then return simp_filters(opts) end
           return nil
         end,
       } },
       context = {
         input = input,
         composition = seg and { back = function() return seg end } or nil,
+        get_option = function(_, name) return name ~= opts.opt_off end,
       },
     },
   }
@@ -109,6 +129,16 @@ local function texts()
   local t = {}
   for i, c in ipairs(OUT) do t[i] = c.text end
   return t
+end
+-- 统一准入（2026-11-24）后窗口按融合序混排，首条可能是子词；"未注入"的
+-- 判据改为"输出里没有组句文本"。
+local function has_gen(tx)
+  for _, t in ipairs(tx) do
+    for _, it in ipairs(GEN or {}) do
+      if t == it.text then return true end
+    end
+  end
+  return false
 end
 
 local OK = 0
@@ -144,50 +174,126 @@ GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的�
 _G.llm_pending_confirm = nil
 run(engine_cands(), "detianqi", { start = 0, _end = 8 })
 local tx = texts()
--- 前 5 条 = 组句候选（打分后融合序可重排，集合必须是这 5 条）
-local gset, top5 = {}, {}
-for i = 1, 5 do
-  gset[GEN[i].text] = true
-  top5[tx[i]] = true
+-- 2026-11-24 用户定案：5 句仍然参与内部计算，但**界面上只显示 1 条**
+--（排在最前的整句首选），其余位置是引擎候选。
+local gset, shown = {}, 0
+for i = 1, 5 do gset[GEN[i].text] = true end
+for _, t in ipairs(tx) do
+  if gset[t] then shown = shown + 1 end
 end
-local top5_ok = true
-for t in pairs(gset) do
-  if not top5[t] then top5_ok = false end
-end
-check("A 前 5 条都是组句候选", top5_ok, table.concat(tx, ","))
-check("A 引擎候选排在组句候选之后", (function()
-  for i = 6, #tx do
-    if gset[tx[i]] then return false end
-  end
-  return true
-end)())
+check("A 句候选只显示 1 条", shown == 1 and gset[tx[1]] ~= nil,
+      "shown=" .. shown .. " first=" .. tostring(tx[1]))
+check("A 句候选排在首位", gset[tx[1] or ""] == true, tx[1])
 local pc = _G.llm_pending_confirm
-check("A 单字前缀确认挂起", pc and pc.text == "的" and pc.input == "detianqi",
+-- 合并门（2026-11-24）后确认还要求"该 lead 是窗口融合序第 1"，融合序由真实
+-- 模型 CE 决定 → 集成场景只做一致性检查（挂起时必须是证据词），正/负判定
+-- 由下方直测场景 M 覆盖。
+check("A 单字前缀确认（若挂起必须是「的」）",
+      pc == nil or (pc.text == "的" and pc.input == "detianqi"),
       pc and (tostring(pc.text) .. "/" .. tostring(pc.input)) or "nil")
 
 -- ── B：ngram_group 关闭 → 不注入、不挂起 ───────────────────────────
+-- 哨兵组句文本避开引擎候选「的天气」，防止把引擎候选误判成注入
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气啊", "的天气吧" })
 _G.llm_pending_confirm = nil
 run(engine_cands(), "detianqi", { start = 0, _end = 8 }, { ngram = false })
 tx = texts()
-check("B 关闭时不注入", tx[1] == "得天器" or tx[1] == "的天气", tx[1])
+check("B 关闭时不注入", not has_gen(tx), table.concat(tx, ","))
 check("B 关闭时不挂起", _G.llm_pending_confirm == nil)
 
 -- ── C：多字前导词「今天」一致 → 挂起「今天」 ──────────────────────
-GEN = gen5("今天", 6, { "今天天气好", "今天天气热", "今天晚上", "今天上午", "今天下午" })
+-- 2026-11-23 晚修后需留足剩余码：用 15 码长串（今天止于 7，剩余 8 ≥4）
+GEN = gen5("今天", 7, { "今天天气好", "今天天气热", "今天晚上", "今天上午", "今天下午" })
 _G.llm_pending_confirm = nil
 run({
-  mkc("今天天气", 0, 8), mkc("金田天气", 0, 8),
-  mkc("今天", 0, 6), mkc("金田", 0, 6),
-}, "jintianti", { start = 0, _end = 8 })
+  mkc("今天天气", 0, 15), mkc("金田天气", 0, 15),
+  mkc("今天", 0, 7), mkc("金田", 0, 7),
+}, "jintiandetianqi", { start = 0, _end = 15 })
 pc = _G.llm_pending_confirm
-check("C 多字前缀确认挂起", pc and pc.text == "今天", pc and tostring(pc.text))
+check("C 多字前缀确认（若挂起必须是「今天」）",
+      pc == nil or pc.text == "今天", pc and tostring(pc.text) or "nil")
 
--- ── D：无 simplifier（繁体输出方案）→ gate 关闭 ───────────────────
-GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
+-- ── D：filters 无 simplifier（纯繁体方案）→ gate 关闭 ──────────────
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气啊", "的天气吧" })
 _G.llm_pending_confirm = nil
 run(engine_cands(), "detianqi", { start = 0, _end = 8 }, { simp = false })
 tx = texts()
-check("D 无 simplifier 不注入", tx[1] == "得天器" or tx[1] == "的天气", tx[1])
+check("D 无 simplifier 不注入", not has_gen(tx), table.concat(tx, ","))
+
+-- ── G：有 simplifier、无 option_name（朙月恒转换）→ 注入 + 单字确认 ──
+-- 2026-11-23 真机报障场景：luna_pinyin 的 simplifier 缺节 = opencc 默认
+-- t2s 恒转换（候选恒简体）；旧判据只认 option_name 非空，把它判成繁体
+-- 方案 → 组句静默关闭、单字前缀确认永不触发。新判据必须放行。
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
+_G.llm_pending_confirm = nil
+run(engine_cands(), "detianqi", { start = 0, _end = 8 }, { noopt = true })
+tx = texts()
+local injected = false
+for i = 1, 5 do
+  for _, it in ipairs(GEN) do
+    if tx[i] == it.text then injected = true end
+  end
+end
+check("G 无 option_name 仍注入", injected, table.concat(tx, ","))
+pc = _G.llm_pending_confirm
+check("G 无 option_name 单字确认（若挂起必须是「的」）",
+      pc == nil or pc.text == "的", pc and tostring(pc.text) or "nil")
+
+-- ── H：显式开关方案、开关当前关闭 → 注入点 gate 拦住 ───────────────
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气啊", "的天气吧" })
+_G.llm_pending_confirm = nil
+run(engine_cands(), "detianqi", { start = 0, _end = 8 }, { opt_off = "zh_simp" })
+tx = texts()
+check("H 开关关闭不注入", not has_gen(tx), table.concat(tx, ","))
+
+-- ── I：短码/组句不可用 → 不确认（2026-11-24 口径：守卫改音节单位）──
+-- 旧「整段 ≥6 码 ∧ 剩余 ≥4 码」是拍的，已退役（简拼/双拼/混拼下码数无意义）。
+-- 现在：① 码切在音节中间时组句返回空 → 合并门没有组句证据，不确认；
+-- ② 剩余音节不足由 M5/M5b 覆盖（多字 lead 余 1 拒、单字 lead 余 1 放行）。
+local function short_cands()
+  return { mkc("进天", 0, 4), mkc("金田", 0, 4),
+           mkc("进", 0, 3), mkc("金", 0, 3) }
+end
+GEN = nil            -- 模拟 jint（音节中间）→ 生成器返回空
+_G.llm_pending_confirm = nil
+run(short_cands(), "jint", { start = 0, _end = 4 })
+check("I 组句空（码断在音节中）不确认", _G.llm_pending_confirm == nil,
+      _G.llm_pending_confirm and tostring(_G.llm_pending_confirm.text))
+_G.llm_pending_confirm = nil
+run(short_cands(), "jinti", { start = 0, _end = 5 })
+check("I 组句空（jinti）不确认", _G.llm_pending_confirm == nil)
+-- 长前导词贴段末：detianq 里「的天气」止于 6、句长 4 音节 → 只剩 1 音节，
+-- 且 lead 是 3 音节（>1）→ 不确认
+GEN = gen5("的天气", 6, { "的天气啊", "的天气好", "的天气真", "的天气很", "的天气吧" })
+_G.llm_pending_confirm = nil
+run(engine_cands(), "detianq", { start = 0, _end = 7 })
+check("I 多字 lead 余 1 音节不确认", _G.llm_pending_confirm == nil)
+
+-- ── J：同码同长同音字占位 → 文本不符必须不确认（2026-11-24 真机报障）──
+-- 「今天的天气很好」把「的」确认成「得」：句级证据 lead=的，但子词块里
+-- [0,2) 只有「得」时，旧逻辑按码位区间 + 字符数命中 → 挂起「得」。
+-- 修复后要求文本一致：证据词不在子词块 → 放弃（宁可不确认，不可错确认）。
+local function wrong_cands()
+  return { mkc("得天气", 0, 8), mkc("得天器", 0, 8),
+           mkc("得", 0, 2), mkc("得天", 0, 6) }
+end
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
+_G.llm_pending_confirm = nil
+run(wrong_cands(), "detianqi", { start = 0, _end = 8 })
+check("J 子词无证据词时不确认", _G.llm_pending_confirm == nil,
+      _G.llm_pending_confirm and tostring(_G.llm_pending_confirm.text))
+
+-- ── K：同区间存在 的/得 → 必须选证据词「的」（不论融合序先后）────────
+local function mixed_cands()
+  return { mkc("得天气", 0, 8), mkc("的天气", 0, 8),
+           mkc("得", 0, 2), mkc("的", 0, 2), mkc("得天", 0, 6) }
+end
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
+_G.llm_pending_confirm = nil
+run(mixed_cands(), "detianqi", { start = 0, _end = 8 })
+pc = _G.llm_pending_confirm
+check("K 同区间同音字（若挂起必须是证据词「的」）",
+      pc == nil or pc.text == "的", pc and tostring(pc.text) or "nil")
 
 -- ── F：组句文本与引擎候选重复 → 输出去重 ──────────────────────────
 GEN = gen5("的天气", 6, { "的天气", "的天气很", "的天气真", "的天气好", "的天气啊" })
@@ -199,6 +305,58 @@ for _, t in ipairs(tx) do
   seen[t] = true
 end
 check("F 输出去重", not dup)
+
+-- ── M：合并前缀门直测（2026-11-24：lead 概率 ∧ 窗口第 1 ∧ span/文本 ∧ 音节守卫）──
+-- 集成场景的窗口融合序由真实模型 CE 决定（非确定），正/负判定在这里直测
+-- 纯计算函数 `_G.llm_prefix_gate`（filter 同一份实现）。
+-- gsum 项 = { lead, lead_end, score, 整句文本 }：整句字符数 = 音节数（中文
+-- 一字一音节），守卫按「剩余音节」判——不再看码数。
+local gate = _G.llm_prefix_gate
+check("M 合并门已导出", type(gate) == "function")
+local function gsum(items)
+  local t = {}
+  for i, x in ipairs(items) do
+    t[i] = { text = x[4] or x[1], lead = x[1], lead_end = x[2], score = x[3] }
+  end
+  return t
+end
+-- M1 单字 lead、P=1.0、窗口第 1、剩 2 音节（的天气：3−1）
+local l, p = gate(gsum({ { "的", 2, -1, "的天气" }, { "的", 2, -2, "的天气" } }),
+                  mkc("的", 0, 2), 0, 8)
+check("M1 P=1 ∧ 窗1 单字确认", l == "的" and p and p > 0.99, tostring(l))
+-- M2 两个 lead（P≈0.62）→ 低于 0.95 不确认
+l = gate(gsum({ { "的", 2, -1, "的天气" }, { "得", 2, -1.5, "得天气" } }),
+         mkc("的", 0, 2), 0, 8)
+check("M2 概率不足不确认", l == nil, tostring(l))
+-- M2b 阈值 hook 放宽 → 同一窗通过（冒烟/调参入口）
+_G.llm_prefix_confirm_p = 0.5
+l = gate(gsum({ { "的", 2, -1, "的天气" }, { "得", 2, -1.5, "得天气" } }),
+         mkc("的", 0, 2), 0, 8)
+_G.llm_prefix_confirm_p = nil
+check("M2b 阈值 hook 生效", l == "的", tostring(l))
+-- M3 窗口第 1 是同 span 同音字（文本不一致）→ 不确认
+l = gate(gsum({ { "的", 2, -1, "的天气" } }), mkc("得", 0, 2), 0, 8)
+check("M3 文本不一致不确认", l == nil, tostring(l))
+-- M4 窗口第 1 同文本但 span 不对齐 → 不确认
+l = gate(gsum({ { "的", 2, -1, "的天气" } }), mkc("的", 0, 1), 0, 8)
+check("M4 span 不对齐不确认", l == nil, tostring(l))
+-- M5 多字 lead、确认后只剩 1 音节 → 不确认（边界歧义档，实测 90.5%）
+l = gate(gsum({ { "我们", 6, -1, "我们德" } }), mkc("我们", 0, 6), 0, 9)
+check("M5 多字 lead 余 1 音节不确认", l == nil, tostring(l))
+-- M5b 单字 lead、只剩 1 音节 → 确认（单字边界无歧义，实测 99.1%）
+l = gate(gsum({ { "的", 2, -1, "的天" } }), mkc("的", 0, 2), 0, 6)
+check("M5b 单字 lead 余 1 音节确认", l == "的", tostring(l))
+-- M6 简拼/双拼形态：码只 3 个但音节正常（的天气 3 音节，余 2）→ 确认
+--（旧「≥6 码」守卫会误拒；音节守卫按 3 音节放行）
+l = gate(gsum({ { "的", 1, -1, "的天气" } }), mkc("的", 0, 1), 0, 3)
+check("M6 短码正常音节确认", l == "的", tostring(l))
+-- M7 多字 lead、窗第 1、剩 2 音节（今天天气：4−2）→ 确认
+l = gate(gsum({ { "今天", 7, -1, "今天天气" }, { "今天", 7, -2, "今天天气" } }),
+         mkc("今天", 0, 7), 0, 15)
+check("M7 多字确认", l == "今天", tostring(l))
+-- M8 窗口第 1 是短子词（不是证据词本身）→ 不确认
+l = gate(gsum({ { "的天气", 6, -1, "的天气" } }), mkc("的", 0, 2), 0, 8)
+check("M8 窗1 非证据词不确认", l == nil, tostring(l))
 
 print(string.format("[smoke] ngram_group: %d pass, %d fail", OK, FAIL))
 if FAIL > 0 then os.exit(1) end

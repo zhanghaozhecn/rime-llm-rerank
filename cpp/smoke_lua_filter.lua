@@ -30,6 +30,16 @@ local cfgmock = {
     end
     return nil
   end,
+  get_list = function(_, k)
+    if k == "engine/filters" then
+      return { size = 2, get_value_at = function(_, i)
+        return { get_string = function()
+          return (i == 0) and "simplifier" or "llm_filter"
+        end }
+      end }
+    end
+    return nil
+  end,
 }
 local env = {
   engine = {

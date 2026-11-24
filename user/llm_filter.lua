@@ -14,22 +14,30 @@ local llm_loaded_for = nil  -- enabled value when llm was loaded
 
 -- 融合系数 β 为内置常数（2026-11-05 用户定案：标定产物退出用户配置面——用户没有
 -- 标定能力；与 FREQ_TAU=400 同待遇。调整 = 改代码随下次发版生效）：
--- 前缀软确认（2026-11-23 实验，默认关闭；设计见研究库 §十/§11.8）：
--- PM 块里 margin（首选与次选的加权负 CE 和之差，同一 ctx 下两个候选词）≥ θ、
--- 首选是多字词且只覆盖前缀（_end < 段末）时，挂起 {input, text}；下一次按键
--- 由 llm_processor 执行 ctx:select → Segment::Close 截段 → Forward + Compose
--- 只重译剩余码（组合区内预确认，不上屏）。
--- 开关 = 方案节 `llm_rerank/prefix_confirm`（2026-11-23：由实验期 `_G`
--- 手置改为配置项，GUI「前缀自动确认」复选框——只在整句模式勾选时显示）；
--- 生效条件 = prefix_confirm **且** sentence_mode（配置页在整句模式外不写
--- true，运行期再兜一层）。θ 仍为内置常数（与 β 同待遇，调整随发版）。
-local PREFIX_CONFIRM_THETA = 1.0
--- 单字前导词的 θ 倍数（2026-11-23 第②段实测修正：2.0 → 1.0，与源码版同值）。
--- 「今天的天气」detianqi 场景：整句 CE 首选 的天气(-21.41)、最佳异前导词竞争者
--- 地天气(-22.58)，margin = 1.17 nat（≈3.2× 似然比）——×2.0 会让「的/地/得」
--- 这类同音单字前缀永远确认不了（用户报的缺陷）。设 1.0 = 与多字同门槛，
--- 仍保留真实 margin 闸；确认只发生在组合区内（不上屏），误确认可见可撤。
-local PREFIX_CONFIRM_SINGLE_SCALE = 1.0
+-- 前缀软确认（2026-11-24 定案：合并单一路线，取代窗口 A + 句级 B 两路）：
+-- 唯一 pending 生产者 = 组句（ngram）给文本 + 窗口融合序投票：
+--   ① 组句侧：top-20 组句按前导词(lead) 分组做 softmax，P(lead) ≥ 0.95
+--      （研究库 §「组句『自信前缀』的更本质度量」：同精度下召回比"5 条
+--      lead 全一致"高 51%；阈值 0.90 会掉进双峰低谷，0.95–0.97 才稳）；
+--   ② 窗口侧：该 lead 文本必须是**窗口融合序第 1** 且 span 对齐（文本一致
+--      铁律：同码同长同音字不得按区间捡）——位次即 CE 全序比较，再加 CE
+--      margin 净收益反降（研究库 §「窗口侧只认第 1」）；
+--   ③ 守卫（2026-11-24 标定，音节单位）：确认后剩余 ≥2 音节；单音节
+--      lead 例外（剩余 ≥1）。组句句子字数 = 音节数（中文一字一音节）；
+--      不用码数——简拼/双拼/混拼下码数与音节数无固定关系。
+-- 挂起后由 llm_processor 下一键执行 ctx:select → Segment::Close 截段 →
+-- Forward + Compose 只重译剩余码（组合区内预确认，不上屏）。
+-- 开关 = 方案节 `llm_rerank/prefix_confirm`（GUI「前缀自动确认」复选框，
+-- 只在整句模式勾选时显示）；生效条件 = prefix_confirm **且** sentence_mode。
+-- θ 与单字倍数已退役（位次门不需要 θ）；组句返回空（码切在音节中间）的窗
+-- 不再自动确认（研究库：该档窗口 A 精度仅 56.8%）。
+local PREFIX_CONFIRM_P = 0.95
+-- 冒烟/调参入口：_G.llm_prefix_confirm_p（0..1）覆盖阈值。
+local function prefix_confirm_p()
+    local v = tonumber(_G.llm_prefix_confirm_p)
+    if v and v >= 0 and v <= 1 then return v end
+    return PREFIX_CONFIRM_P
+end
 -- 整句模式同步等待预算（2026-11-23 修）：原先整句模式"投递即走"，当前键
 -- 只能显示层 1 序，LLM 评分只在同指纹重查时才用上（真机实测连续打字从未
 -- 上屏）。改为每键最多等这么久——真机 100ms/键实测 6 个长词候选的
@@ -249,17 +257,20 @@ local cfg = {
     max_candidates   = 6,   -- 2026-11-19：0.6B k*=6（候选段 100ms / 最优 3.65%）
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
     debug_fusion     = false, -- true = 逐候选融合明细写 rime_llm_debug.txt (诊断用)
-    sentence_mode    = false, -- 整句模式：满覆盖候选进评分窗、部分覆盖排后
-                              -- （2026-11-22 取代 two_code_sentence 两码整句；
-                              --  旧键读取端兜底一次，保存/重建节时剥除）
-    prefix_confirm   = false, -- 前缀自动确认（2026-11-23，实验）：PM 首选多字
-                              -- 词且只覆盖前缀时，下一键自动选入组合区。
+    sentence_mode    = false, -- 整句模式：等长词+子词统一进评分窗、显示统一
+                              -- 概率序（2026-11-24 统一准入取代 2026-11-22
+                              -- 满覆盖优先；2026-11-22 取代 two_code_sentence
+                              -- 两码整句；旧键读取端兜底一次，保存/重建节剥除）
+    prefix_confirm   = false, -- 前缀自动确认（2026-11-24 合并单一路线）：
+                              -- 组句 lead 概率 ≥0.95 且该文本是窗口融合序第 1
+                              -- 时，下一键自动选入组合区。
                               -- **只在 sentence_mode 开启时生效**（GUI 也只在
                               -- 整句模式勾选时显示该复选框）
     ngram_group      = false, -- N-gram 组句候选（2026-11-23 整句模式第②段）：
                               -- 用万象 LTS `.gram` + 万象词库做词级 beam，生成
-                              -- top-5 整句候选前置注入候选流（LLM 从 5 句里选
-                              -- 首选）。**只在 sentence_mode 且方案输出简体时
+                              -- top-20 整句候选（显示 1 条、概率供前缀确认；
+                              -- 2026-11-24 phrase-only，组句不参与 CE）。
+                              -- **只在 sentence_mode 且方案输出简体时
                               -- 生效**；资产缺失（用户目录 llm_ngram\）自动关闭
     -- freq_beta 不再从 schema 读取（2026-11-05 用户配置面移除，标定产物退出配置面）
     -- → 内置常数 FREQ_BETA；方案里残留旧行读取端忽略，保存/重建节时剥除
@@ -723,12 +734,35 @@ local function init_config(env)
     if pfc ~= nil then cfg.prefix_confirm = pfc end
     _G.llm_prefix_confirm = cfg.prefix_confirm and cfg.sentence_mode
     -- N-gram 组句候选（2026-11-23 整句模式第②段）：开关 + 只需在整句模式。
-    -- 组句词表 = 万象（简体）词库，方案输出字形由 compositor 的 simplifier
-    -- 保证——无 simplifier 的方案（纯繁体输出）不启用，避免吐简体候选。
+    -- 组句词表 = 万象（简体）词库——只在方案输出简体时注入。
+    -- 输出字形门（2026-11-23 晚修，与源码版同构）：旧判据只认
+    -- simplifier/option_name 非空，把朙月 luna_pinyin 这类**无 option_name
+    -- 的恒转换** simplifier（缺节 → opencc 默认 t2s，候选恒简体）误判成
+    -- 繁体方案 → 组句静默关闭、单字前缀确认永不触发（真机报障根因）。
+    -- 新判据 = filters 里确有 simplifier（排除 s2t 反向）；option_name
+    -- 存在时在注入点按开关当前状态再 gate。
     local ngg = sc:get_bool("llm_rerank/ngram_group")
     if ngg ~= nil then cfg.ngram_group = ngg end
-    local simp = sc:get_string("simplifier/option_name")
-    _G.llm_simplified_scheme = (simp ~= nil and simp ~= "")
+    _G.llm_simplifier_option = sc:get_string("simplifier/option_name") or ""
+    _G.llm_simplified_scheme = false
+    local flist = sc:get_list("engine/filters")
+    if flist then
+        for i = 0, flist.size - 1 do
+            local fv = flist:get_value_at(i)
+            local fname = fv and fv:get_string()
+            if fname and (fname == "simplifier"
+                          or fname:sub(1, 11) == "simplifier@") then
+                _G.llm_simplified_scheme = true
+                break
+            end
+        end
+    end
+    if _G.llm_simplified_scheme then
+        local occ = sc:get_string("simplifier/opencc_config")
+        if occ and occ:find("s2t", 1, true) then  -- 简→繁不算"输出简体"
+            _G.llm_simplified_scheme = false
+        end
+    end
     _G.llm_ngram_group = cfg.ngram_group and cfg.sentence_mode
                              and _G.llm_simplified_scheme
     _G.llm_debug_enabled = cfg.debug_fusion
@@ -791,8 +825,11 @@ end
 -- 资产在用户目录 llm_ngram\（安装器可选下载），缺失时整块功能自动关闭，
 -- 每 60 秒最多重试一次（避免每键反复打开大文件）。
 local NGRAM_FILES = { "zi", "jichu", "duoyin", "diming", "mingren", "yiren" }
+-- topk 20（2026-11-24 定案）：前缀确认的组句侧自信度 = 按 lead 分组的
+-- top-20 softmax 概率质量；beam 本来就探索 32，只是输出截断不同（实测
+-- 4.0 → 4.1ms/窗，零额外成本）。显示端仍只置顶 1 条（ngram 序首选）。
 local NGRAM_PARAMS = {
-    topk = 5, beam = 32, min_weight = 10, max_edges = 8, ctx_tail = 10,
+    topk = 20, beam = 32, min_weight = 10, max_edges = 8, ctx_tail = 10,
 }
 local ngram_ready = false
 local ngram_retry_at = 0
@@ -854,6 +891,71 @@ local function ngram_make(env, code, context, prefix_text, seg_start, seg_end)
     end
     return (#out > 0) and out or nil
 end
+
+-- 合并前缀门（2026-11-24 定案；纯计算，供 filter 与冒烟/排障直测）：
+--   gen = 组句结果（top-20，含 lead / lead_end / score / text）
+--   b1  = 窗口融合序第 1 候选（含 start / _end / text）
+-- 返回 lead, prob, endp；不满足 = nil。
+-- 判据：top-20 按 lead 分组 softmax → argmax lead 的概率质量 ≥ p_thr；
+-- b1 文本 == lead、span 对齐；**音节守卫**（2026-11-24 标定，取代码数）：
+--   组句句子的字符数 = 该句覆盖的音节数（中文一字一音节），lead 字数 =
+--   已覆盖音节；确认后剩余 ≥2 音节；**单音节 lead 例外（剩余 ≥1）**
+--   ——单字词边界无歧义，实测该档精度 99.1%（lead≥2 音节 + 余 1 音节
+--   只有 90.5%，因末音节会把前一个字抢到边界另一侧）。
+-- 不用码数：全拼 1 音节 2–6 码、简拼 1 码、双拼固定 2 码/音节，混拼后
+-- 码数与音节数无固定关系（旧「≥6 码 / 余 ≥4 码」是拍的，已退役）。
+local function nchars(s)
+    if utf8 and utf8.len then
+        local n = utf8.len(s)
+        if n then return n end
+    end
+    return #s
+end
+local function prefix_gate(gen, b1, seg_start, seg_end, p_thr)
+    if not gen or #gen == 0 or not b1 then return nil end
+    local n = seg_end - seg_start
+    if n < 1 then return nil end
+    local mx = -math.huge
+    for _, it in ipairs(gen) do
+        if is_finite_number(it.score) and it.score > mx then mx = it.score end
+    end
+    if mx == -math.huge then return nil end
+    local mass, le_of, txt_of, tot = {}, {}, {}, 0
+    for _, it in ipairs(gen) do
+        local s = it.score
+        if is_finite_number(s) and it.lead and it.lead_end then
+            local w = math.exp(s - mx)
+            tot = tot + w
+            mass[it.lead] = (mass[it.lead] or 0) + w
+            -- gen 按分数降序（ngram 序）→ 首见即该 lead 的最高分句
+            le_of[it.lead] = le_of[it.lead] or it.lead_end
+            txt_of[it.lead] = txt_of[it.lead] or (it.text or "")
+        end
+    end
+    local lead, best = nil, -1
+    for t, m in pairs(mass) do
+        -- 同质量时按文本序取定（避免 pairs 顺序导致非确定性）
+        if m > best or (m == best and lead and t < lead) then
+            lead, best = t, m
+        end
+    end
+    if not lead or tot <= 0 then return nil end
+    local p = best / tot
+    if p < (p_thr or prefix_confirm_p()) then return nil end
+    local le = le_of[lead]
+    if le < 0 or le >= n then return nil end     -- 必须是严格前缀
+    -- 音节守卫：剩余音节 ≥2；单音节 lead 时 ≥1
+    local sl = nchars(lead)
+    local st = nchars(txt_of[lead])
+    local sr = st - sl
+    if st < sl or sr < (sl == 1 and 1 or 2) then return nil end
+    local s1pos, b1e = cand_span(b1)
+    if b1.text ~= lead or s1pos ~= seg_start or b1e ~= seg_start + le then
+        return nil
+    end
+    return lead, p, b1e
+end
+_G.llm_prefix_gate = prefix_gate
 
 -- === Filter ===
 return function(translation, env)
@@ -931,19 +1033,29 @@ return function(translation, env)
     local rec = enabled and pattern_ok
     local wid = rec and _G.llm_new_event("W", tick) or nil
     local engine_top = texts_of(all, 10)
-    -- ═══ N-gram 组句候选前置注入（2026-11-23 第②段）═══
-    -- 生成 5 条整句候选放在候选流最前（同文本去重），后面层1/满覆盖/子词/
-    -- 评分/前缀判定全部沿用既有逻辑：它们 span == 活动段 → FM，同分保序 →
-    -- ngram 序即注入序；LLM 3-token 融合再把 5 句重排（源码版为整句 CE）。
-    -- 只对 ≥4 码（≈2 音节）且方案输出简体时启用；engine_top 保持引擎原序。
+    -- ═══ N-gram 组句候选前置注入（2026-11-23 第②段；2026-11-24 phrase-only）═══
+    -- 生成 top-20 整句候选放在候选流最前（同文本去重），后面层1/准入/评分/
+    -- 前缀判定沿用既有逻辑：它们 span == 活动段 → FM。组句**不参与 CE**
+    -- （显示只置顶 ngram 序第 1，其余 19 条不上屏；top-20 分数供 lead 概率）。
+    -- 只对 ≥4 码（≈2 音节）、纯小写字母、方案输出简体时启用；engine_top
+    -- 保持引擎原序。
+    -- 注入点开关态 gate：option_name 存在时按当前开关判定（显式开关方案）；
+    -- 空 = simplifier 恒转换，恒可注入。
+    local simp_on = true
+    if _G.llm_simplifier_option and _G.llm_simplifier_option ~= "" then
+        simp_on = env.engine.context:get_option(_G.llm_simplifier_option)
+    end
     local gen = nil
-    if cfg.sentence_mode and _G.llm_ngram_group and pattern_ok
-            and context ~= "" and #code >= 4 then
+    local genset = nil   -- 句候选文本集（只显示 1 条用；2026-11-24 用户定案）
+    if cfg.sentence_mode and _G.llm_ngram_group and simp_on and pattern_ok
+            and context ~= "" and #code >= 4 and code:match("^[a-z]+$") then
         gen = ngram_make(env, code, context, prefix_text, seg_start, seg_end)
         if gen then
             local merged, seen_t = {}, {}
+            genset = {}
             for _, it in ipairs(gen) do
                 seen_t[it.text] = true
+                genset[it.text] = true
                 merged[#merged + 1] = it.cand
             end
             for _, c in ipairs(all) do
@@ -1072,27 +1184,13 @@ return function(translation, env)
         if fm_set then return fm_set[c] == true end
         return false
     end
-    if sent_on then
-        for _, e in ipairs(layer1) do
-            if is_fm(e.c) then add_win(e) end
-        end
-    else
-        for _, e in ipairs(layer1) do
-            add_win(e)
-        end
-    end
-    -- 子词（PM，比等长词短的词典词）清单（2026-11-23 用户定案）：非满覆盖
-    -- 候选按引擎序去重——只用于"共用 FM 推理结果"的零成本排序与指纹绑定，
-    -- 不进评分窗（整句模式三块输出的第三块；关闭态无子词概念）
-    local pm_texts = {}
-    if sent_on then
-        local pm_seen = {}
-        for _, c in ipairs(all) do
-            if not is_fm(c) and not pm_seen[c.text] then
-                pm_seen[c.text] = true
-                pm_texts[#pm_texts + 1] = c.text
-            end
-        end
+    -- 统一准入（2026-11-24 用户定案，取代 2026-11-22「满覆盖优先占满窗」）：
+    -- 层1 词频在**等长词 + 子词**里统一取前 max_candidates 进评分窗，窗内全部
+    -- 真算 CE——与字词模式完全一致。等长 ≠ 概率高，等长词不再结构性在前。
+    -- 组句不参与准入（不占席、不评分），显示端只置顶 ngram 序第 1。
+    -- 子词复用分通道（pm_texts / reuse）随之退役：子词已进窗拿真分。
+    for _, e in ipairs(layer1) do
+        if not (genset and genset[e.c.text]) then add_win(e) end
     end
     local w_written = false
     -- 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在
@@ -1124,7 +1222,12 @@ return function(translation, env)
     local sent_pending = false   -- 整句模式已投递挂账（本轮层1 序输出）
     local prep_flag = "0"
     if #cands >= 2 then
-        local fp = make_fp(context, cands, pm_texts, prefix_text)
+        -- 提交清单 = 评分窗（≤max_candidates）。组句候选**不进评分**（2026-11-24
+        -- 定案：phrase-only——组句只提供文本与"自信前缀"概率，位次证据来自
+        -- 窗口融合序；句子本身不再参与 CE，显示 = ngram 序首选 1 条）。
+        local submit = {}
+        for _, t in ipairs(cands) do submit[#submit + 1] = t end
+        local fp = make_fp(context, submit, nil, prefix_text)
         snap = res_cache[fp]
         if snap and not snap.scores then snap = nil end
         if not snap and llm.async_submit then
@@ -1132,8 +1235,8 @@ return function(translation, env)
             -- 是否挂账——整句模式此前"投递即走"，当前键只能显示层1 序，
             -- 快照只在同指纹重查时才用上；真机实测连续整句打字 LLM 结果
             -- 从未上屏（2026-11-23 修）。
-            local okp, fp_r = pcall(llm.async_submit, context, cands,
-                                    true, pm_texts, prefix_text)
+            local okp, fp_r = pcall(llm.async_submit, context, submit,
+                                    true, {}, prefix_text)
             if okp and fp_r then
                 if sent_on then
                     -- 整句模式：短预算同步等待（SENTENCE_WAIT_MS）。正常
@@ -1234,16 +1337,19 @@ return function(translation, env)
             scores = snap.scores
         end
         local seen = {}
-        local ordered = {}
+        local ordered_all = {}
         for i = 1, #result do
             for _, c in ipairs(all) do
                 if c.text == result[i] and not seen[c.text] then
                     seen[c.text] = true
-                    table.insert(ordered, c)
+                    table.insert(ordered_all, c)
                     break
                 end
             end
         end
+        -- 组句候选不进评分、也不在窗口序里（2026-11-24 phrase-only 定案）：
+        -- ordered = 窗口融合序；组句仅以 ngram 序首选置顶。
+        local ordered = ordered_all
         -- 统一结合公式 (2026-09-03 冷启动标定; 2026-11-02 连续文章语料重标定;
         -- 2026-11-05 β 退出配置面 → FREQ_BETA 内置常数;
         -- 2026-11-06 v3: 六维联合标定 + 用户 bigram 项上线;
@@ -1364,142 +1470,60 @@ return function(translation, env)
             end)
             for i = 1, #arr do ordered[i] = arr[i].c end
         end
-        -- ═══ 子词块排序（2026-11-23 用户定案：共用等长词的推理结果，零成本）═══
-        -- PM 的前 k 个 token 与某个 FM 候选的前 k 个 token 逐位相同（k =
-        -- min(PM token 数, 3)）时，其条件概率与 FM 的同位置 CE 分量完全
-        -- 相同（同一上文 + 同一前缀）——DLL 在评分线程里用已算好的 FM
-        -- token 前缀做匹配（零 decode），快照 pm 表给出复用分。
-        -- 有复用分 → 与 FM 同款融合（CE + β·log1p(eff) + 累计 + pairfix）
-        -- 后按分降序（同分保引擎序）；无复用分（典型 = 单字 PM 而 FM 首
-        -- token 是多字 token）→ 保引擎序殿后；评分未就绪（挂账轮）或旧
-        -- DLL 无 pm 表 → 整块引擎序（旧行为不变）。
-        local pm_order = nil
-        if sent_on then
-            local pmsc = snap and snap.pm or nil
-            local pm_list, pidx = {}, {}
-            for _, c in ipairs(all) do
-                if not seen[c.text] and not is_fm(c) then
-                    pm_list[#pm_list + 1] = c
-                    pidx[c.text] = #pm_list
-                end
-            end
-            if pmsc and #pm_list > 0 then
-                local freq_eff2 = _G.user_freq_eff
-                local scored, unscored = {}, {}
-                for _, c in ipairs(pm_list) do
-                    local s = pmsc[c.text]
-                    if is_valid_llm_score(s) then
-                        local n = freq_eff2 and freq_eff2(c.text, code) or 0
-                        local u1 = _G.user_unigram_term
-                                and _G.user_unigram_term(c.text, code) or 0
-                        local t = s + FREQ_BETA * math.log(1 + n) + u1
-                                + pairfix_delta(pftbl, c.text, code)
-                        scored[#scored + 1] = { c = c, t = t,
-                                                idx = pidx[c.text] }
-                    else
-                        unscored[#unscored + 1] = c
-                    end
-                end
-                table.sort(scored, function(a, b)
-                    if a.t ~= b.t then return a.t > b.t end
-                    return a.idx < b.idx   -- 同分保引擎序
-                end)
-                pm_order = {}
-                for _, e in ipairs(scored) do pm_order[#pm_order + 1] = e.c end
-                for _, c in ipairs(unscored) do pm_order[#pm_order + 1] = c end
-                -- 前缀软确认判定（2026-11-23 实验）：开关 = 配置项
-                -- llm_rerank/prefix_confirm（init_config 折成 _G.llm_prefix_confirm
-                -- = prefix_confirm and sentence_mode，只在整句模式生效）。
-                -- 首选多字词、只覆盖前缀（_end < 段末）、与次选 margin ≥ θ
-                -- → 挂起，下一次按键由 processor 执行 ctx:select
-                if _G.llm_prefix_confirm and #scored >= 2 then
-                    local b1, b2 = scored[1], scored[2]
-                    local _s, be = cand_span(b1.c)
-                    local nchar = utf8 and utf8.len(b1.c.text) or 0
-                    local theta = tonumber(_G.llm_prefix_confirm_theta)
-                                  or PREFIX_CONFIRM_THETA
-                    if nchar >= 2 and be and be < seg_end
-                       and (b1.t - b2.t) >= theta then
-                        _G.llm_pending_confirm = {
-                            input = input, text = b1.c.text, endp = be,
-                        }
-                    end
+        -- ═══ 前缀软确认：合并单一路线（2026-11-24 定案）═══
+        -- 组句给文本（top-20 按 lead 分组的 softmax 概率 ≥ 0.95）∧ 该文本是
+        -- 窗口融合序第 1（span 对齐、文本一致）→ 挂起。窗口路径 A（margin）
+        -- 与句级 CE 序分支已退役：融合序位次本身就是 CE(+词频) 的全序比较，
+        -- 再叠 margin 净收益反降（研究库）；θ 与单字倍数整条退役。组句返回
+        -- 空（码切在音节中间，占 39.5%）的窗不再自动确认。守卫在
+        -- prefix_gate 内（音节单位：剩余 ≥2；单音节 lead 例外 ≥1）——
+        -- 链式确认同样逐次重新判门（每次确认后下一键的 filter 会在更短的码
+        -- 上重算，不沿用旧 pending）。
+        if sent_on and _G.llm_prefix_confirm and gen and fused_scores
+                and #ordered >= 1 then
+            local lead, prob, endp =
+                prefix_gate(gen, ordered[1], seg_start, seg_end)
+            if lead then
+                _G.llm_pending_confirm = {
+                    input = input, text = lead, endp = endp,
+                }
+                if dbg then
+                    live("G|" .. os.date("%H:%M:%S") .. "|"..
+                         live_esc(code) .. "|" .. live_esc(lead) ..
+                         "|p=" .. string.format("%.3f", prob))
                 end
             end
         end
-        -- ═══ 句级前缀判定（2026-11-23 第②段）═══
-        -- 与上面 PM 复用 margin 路径互补：整句模式下有组句候选时，改用
-        -- **前导词**证据——按融合序前 5 条（全是组句候选时）前导词一致，或
-        -- 最优与"前导词不同"的最佳竞争者融合分 margin ≥ θ（单字 ×2）→ 挂起
-        -- 确认。旧路径要求 PM 有复用分且 ≥2 字，单字前缀（的/地/得）结构上
-        -- 永远无法确认；句级路径正是"的 + 天气"这类确定场景的入口。
-        if sent_on and _G.llm_prefix_confirm and gen and scores then
-            local leadmap = {}
-            for _, it in ipairs(gen) do
-                leadmap[it.text] = { lead = it.lead, lead_end = it.lead_end }
-            end
-            local top = ordered[1]
-            local li1 = top and leadmap[top.text] or nil
-            if li1 and li1.lead and li1.lead_end
-                    and seg_start + li1.lead_end < seg_end then
-                local lim = math.min(#ordered, 5)
-                local all_gen, same_lead = true, true
-                local competitor = nil
-                for i = 2, lim do
-                    local li = leadmap[ordered[i].text]
-                    if not li or not li.lead then
-                        all_gen = false
-                    elseif li.lead ~= li1.lead then
-                        same_lead = false
-                        if not competitor then competitor = ordered[i] end
-                    end
-                end
-                local okc = all_gen and same_lead
-                if not okc and competitor and fused_scores then
-                    local t1 = fused_scores[top.text]
-                    local t2 = fused_scores[competitor.text]
-                    if t1 and t2 then
-                        local nchar = utf8 and utf8.len(li1.lead) or #li1.lead
-                        local theta = tonumber(_G.llm_prefix_confirm_theta)
-                                      or PREFIX_CONFIRM_THETA
-                        if nchar < 2 then
-                            theta = theta * PREFIX_CONFIRM_SINGLE_SCALE
-                        end
-                        okc = (t1 - t2) >= theta
-                    end
-                end
-                if okc then
-                    -- 在候选流里找该前缀词（简化字形 + 码位对齐；子词块）
-                    local want_end = seg_start + li1.lead_end
-                    local nchar = utf8 and utf8.len(li1.lead) or #li1.lead
-                    for _, c in ipairs(all) do
-                        if not is_fm(c) then
-                            local s, e = cand_span(c)
-                            local n = utf8 and utf8.len(c.text) or #c.text
-                            if s == seg_start and e == want_end
-                                    and n == nchar then
-                                _G.llm_pending_confirm = {
-                                    input = input, text = c.text, endp = e,
-                                }
-                                if dbg then
-                                    live("G|" .. os.date("%H:%M:%S") .. "|" ..
-                                         live_esc(code) .. "|" ..
-                                         live_esc(li1.lead) .. "|" ..
-                                         live_esc(c.text))
-                                end
-                                break
-                            end
-                        end
-                    end
-                end
+        -- ═══ 最终序（2026-11-24 phrase-only 定案）═══
+        -- 组句 ngram 序首选 1 条置顶（句子不再参与 CE 重排）→ 窗口融合序
+        -- （等长词与子词统一概率序）→ 窗外层1 序。三块输出与"匹配在前、
+        -- 部分在后"不变量早已退役。组句文本不进窗口/评分，故层1 尾块必须
+        -- 显式排除 genset（否则未评分的组句会以尾部身份重复出现）。
+        local best_gen = (gen and #gen > 0) and gen[1] or nil
+        local out = {}
+        if best_gen then out[#out + 1] = best_gen.cand end
+        for _, c in ipairs(ordered) do out[#out + 1] = c end
+        for _, e in ipairs(layer1) do
+            if not seen[e.c.text]
+               and not (genset and genset[e.c.text]) then
+                out[#out + 1] = e.c
             end
         end
-        -- 两码整句最终置顶块已删（2026-11-22 整句模式定案）：满覆盖候选已在
-        -- 窗口准入时结构性占满评分窗（窗内全 FM），融合序即满覆盖组内序——
-        -- 旧保险块对最终序恒 no-op，连同词长==⌊码长/2⌋ 判据一并退役。
-        -- 调试行 full 标志（协议字段，win=1 行 = FM=1）按整句模式 FM 判定补：
+        -- 组句首选可能与窗口候选同文本（注入时组句版已替换引擎版）——按
+        -- 文本去重、保首现（首选在前），避免同一词出现两次。
+        do
+            local u, ded = {}, {}
+            for _, c in ipairs(out) do
+                if not u[c.text] then
+                    u[c.text] = true
+                    ded[#ded + 1] = c
+                end
+            end
+            out = ded
+        end
+        -- 调试行 full 标志（协议字段，win 行 = FM=1）按整句模式 FM 判定补：
         if sent_on and dbg then
-            for _, c in ipairs(ordered) do
+            for _, c in ipairs(out) do
                 if dbg[c.text] then dbg[c.text].full = is_fm(c) end
             end
         end
@@ -1570,34 +1594,11 @@ return function(translation, env)
                     segmap and segmap[c.text] or ""
                 }, "|"))
             end
-            for i, c in ipairs(ordered) do live_c(c, i) end
-            local tail_pos = #ordered
-            -- 尾窗 fin 位置与实际输出序一致（整句模式 = FM 窗外层1序 + 子词块）
-            for _, e in ipairs(layer1) do
-                if not seen[e.c.text] and (not sent_on or is_fm(e.c)) then
-                    tail_pos = tail_pos + 1
-                    live_c(e.c, tail_pos)
-                end
-            end
-            if sent_on then
-                local pm_emit = pm_order
-                if not pm_emit then
-                    pm_emit = {}
-                    for _, c in ipairs(all) do
-                        if not seen[c.text] and not is_fm(c) then
-                            pm_emit[#pm_emit + 1] = c
-                        end
-                    end
-                end
-                for _, c in ipairs(pm_emit) do
-                    tail_pos = tail_pos + 1
-                    live_c(c, tail_pos)
-                end
-            end
+            for i, c in ipairs(out) do live_c(c, i) end
             -- debug P/D：只写语料没有的字段；词/候选序在语料 W，
             -- 靠 wid 关联；不写 debug 文件的人类可读块。
             _G.llm_debug_p(wid, ev_ms, prep_flag == "1")
-            for i, c in ipairs(ordered) do
+            for i, c in ipairs(out) do
                 local d = dbg[c.text]
                 if d then
                     local d3 = d.ce3 or {}
@@ -1610,39 +1611,18 @@ return function(translation, env)
         -- 常开语料 W ok（最终序 + 引擎前 10 + 层1 窗）
         if wid and not w_written then
             _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
-                           texts_of(ordered, 20), tick, "ok", "",
+                           texts_of(out, 20), tick, "ok", "",
                            prep_flag == "1", "")
             w_written = true
         end
         -- 来源徽章已删（2026-11-10 用户定案：实时调试窗口上线——上文来源/
         -- 内容与逐候选分数都在调试窗口看，候选窗保持干净、不再动 comment；
         -- 固定候选提示亦归拼读双拼 pin_filter.lua，2026-11-21 解耦）
-        for _, c in ipairs(ordered) do yield(c) end
-        -- 整句模式（2026-11-22）：三块输出——FM 窗外按层1 序，子词块在最后
-        -- （保引擎"匹配在前、部分在后"不变量）。子词块序（2026-11-23）=
-        -- 有复用分者按融合分降序 + 无复用分者引擎序殿后（pm_order）；评分
-        -- 未就绪/旧 DLL → 整块引擎序。关闭态保持旧行为：窗外全部按层1 序。
-        for _, e in ipairs(layer1) do
-            if not seen[e.c.text] and (not sent_on or is_fm(e.c)) then
-                yield(e.c)
-            end
-        end
-        if sent_on then
-            local pm_emit = pm_order
-            if not pm_emit then
-                pm_emit = {}
-                for _, c in ipairs(all) do
-                    if not seen[c.text] and not is_fm(c) then
-                        pm_emit[#pm_emit + 1] = c
-                    end
-                end
-            end
-            for _, c in ipairs(pm_emit) do yield(c) end
-        end
+        -- 输出 = 组句首选 1 条 + 窗口融合序 + 窗外层1 序（2026-11-24 定案）。
+        for _, c in ipairs(out) do yield(c) end
     else
-        -- 评分未就绪/失败: 按层1 序展示。整句模式保持三块不变量
-        -- （FM 窗外层1 序 + PM 引擎序——"匹配在前、部分在后"不因异步化
-        -- 改变；async_pending 常态路径走这里），关闭态保持全层1 序。
+        -- 评分未就绪/失败: 按层1 序展示（2026-11-24 统一口径：组句首选 1 条
+        -- 置顶 = ngram 序首选，其余全部层1 序；不再分 FM/子词两块）。
         if wid and not w_written then
             _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
                            {}, tick, "skip", skip_reason or "score_failed",
@@ -1650,11 +1630,9 @@ return function(translation, env)
             w_written = true
         end
         if sent_on then
+            if gen and gen[1] then yield(gen[1].cand) end
             for _, e in ipairs(layer1) do
-                if is_fm(e.c) then yield(e.c) end
-            end
-            for _, c in ipairs(all) do
-                if not is_fm(c) then yield(c) end
+                if not (genset and genset[e.c.text]) then yield(e.c) end
             end
         else
             for _, e in ipairs(layer1) do yield(e.c) end
