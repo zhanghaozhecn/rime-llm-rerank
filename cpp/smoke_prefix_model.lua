@@ -42,6 +42,9 @@ for _, c in ipairs(cases) do
   for _, o in ipairs(c.ordered) do
     ordered[#ordered + 1] = { text = o.t, start = 0, _end = o.e }
   end
+  -- 全窗（2026-11-26 起 pg_score 不再截断 6）；参考 pg_ref.tsv 由
+  -- eval/lgb/gen_pg_cases.py 用同一全窗口径（prefix_class_gate.build_window
+  -- mode="full"）生成。
   local win = { ordered = ordered, code = c.code, seg_start = 0,
                 gshow = c.gshow }
   local sc, x = _G.llm_prefix_score(gen, c.lead, c.p, c.le, c.ce3,

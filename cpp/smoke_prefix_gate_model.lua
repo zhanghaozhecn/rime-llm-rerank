@@ -88,6 +88,28 @@ for _, c in ipairs(cases) do
 end
 print(string.format("[smoke] A 逐例对照 %d 例", n_a))
 
+-- E：窗口不得截断到 6（2026-11-26）——CE 预算准入后 ordered 可 >6，
+-- 截断会把同档首选抛在特征窗之外（wm/r2/ss 全错位）。全窗分数必须与
+-- 「前 6 条」不同，否则说明 pg_score 又回到了旧 6 窗口径。
+do
+  local c = cases[1]
+  local gen, ordered = to_win(c)
+  local full = { ordered = ordered, code = c.code, seg_start = 0,
+                 gshow = c.gshow }
+  local trunc = {}
+  for i = 1, math.min(6, #ordered) do trunc[i] = ordered[i] end
+  local short = { ordered = trunc, code = c.code, seg_start = 0,
+                  gshow = c.gshow }
+  local sf = _G.llm_prefix_score(gen, c.lead, c.p, c.le, c.ce3,
+                                 #c.code, c.ctx_chars, full)
+  local ss = _G.llm_prefix_score(gen, c.lead, c.p, c.le, c.ce3,
+                                 #c.code, c.ctx_chars, short)
+  chk("E/no-trunc6", sf ~= nil and ss ~= nil and
+      math.abs(sf - ss) > 1e-9 and #ordered > 6,
+      string.format("n=%d full=%.6f short=%.6f", #ordered,
+                    sf or -1, ss or -1))
+end
+
 -- B：τ 边界（取一个 lead 本身是同档首选的例）
 local c1
 for _, c in ipairs(cases) do

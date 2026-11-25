@@ -1165,13 +1165,13 @@ function pg_score(gen, lead, p, le, ce3map, n, ctx_chars, win)
         if nt == 0 then return nil end
         return s, nt
     end
-    -- 评分窗 = ordered 排除组句显示第 1 条后的前 6 个（生产口径）
+    -- 评分窗 = ordered 全量（只排除组句显示的那 1 条文本）。**不得截断 6 条**
+    -- （2026-11-26）：CE 预算准入后窗口不再固定 6；同档首选可能在融合序 6 名
+    -- 之外，截断会让 lead 不在 cand 里 → 特征（wm/r2/ss/档内计数）与源码版
+    -- 和训练口径全部错位。源码版用 candidates_ 全窗，此处对齐。
     local cand = {}
     for _, c in ipairs(win.ordered) do
-        if c.text ~= gshow then
-            cand[#cand + 1] = c
-            if #cand >= 6 then break end
-        end
+        if c.text ~= gshow then cand[#cand + 1] = c end
     end
     local lead_ce, lead_nt = ce_of(lead)
     if not lead_ce then return nil end       -- 无 CE（未就绪/失败）→ 不判
