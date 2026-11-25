@@ -1239,7 +1239,6 @@ function pg_score(gen, lead, p, le, ce3map, n, ctx_chars, win)
     local r2_chars = r2t and nchars(r2t) or 0
     -- wm = CE-only 融合 margin（训练口径：融合 = −ce 加权和，冷账本）
     local wm = r2 and (r2.ce - lead_ce) or 0.0
-    local pp = math.min(math.max(p, 1e-6), 1 - 1e-6)
     -- 字频（模型文件自带表；缺字默认 −13 = 研究侧同一默认）
     local cf_min, cf_sum = nil, 0.0
     for ch in string.gmatch(lead, "[%z\1-\127\194-\244][\128-\191]*") do
@@ -1249,7 +1248,10 @@ function pg_score(gen, lead, p, le, ce3map, n, ctx_chars, win)
     end
     local x = {
         p,                                          -- 1
-        math.log(pp / math.max(1 - p, 1e-6)),       -- 2 logit_p
+        -- logit_p = log(max(p,1e-6)/max(1-p,1e-6))：分子**不**钳上界
+        -- （研究侧同式；曾误钳成 min(max(p,1e-6),1-1e-6)，p→1 时差 1e-6，
+        --  足以让树在 threshold 上翻分支 → 分数差 0.02）
+        math.log(math.max(p, 1e-6) / math.max(1 - p, 1e-6)),
         d,                                          -- 3
         math.min(-((top and top.score) or 0), 60.0), -- 4 top_score
         n_leads,                                    -- 5
@@ -1288,6 +1290,103 @@ function pg_score(gen, lead, p, le, ce3map, n, ctx_chars, win)
         cf_min or -13.0,                            -- 40 char_freq
         cf_sum / math.max(lead_len, 1),             -- 41 char_freq_mean
     }
+    -- ── CE 分布特征 ss12（2026-11-25 落地）──────────────────────────
+    -- 「lead 覆盖的那段码」= end 相同的候选簇：歧义到什么程度、lead 排第几、
+    -- 与最佳同音差多少、质量是否集中。研究侧定义见 dist_feats()：
+    --   S = 评分窗内有 CE ∧ end == seg_start+le 的候选（lead 必收）
+    --   「簇内次优」按 CE 升序取第 2 个；质量 = softmax(−CE)（同减常数不
+    --   改变概率）；熵用自然对数（nats），与 Python 侧一致
+    local S = {}
+    local lead_end_abs = (win.seg_start or 0) + le
+    for _, c in ipairs(cand) do
+        local ce = ce_of(c.text)
+        if ce then
+            local _, se = cand_span(c)
+            if se ~= nil and se == lead_end_abs then
+                local ee = ce3map and ce3map[c.text]
+                local c1 = nil
+                if ee and is_finite_number(ee[1]) and ee[1] >= 0 then
+                    c1 = ee[1]
+                end
+                S[#S + 1] = { ce = ce, ce1 = c1, t = c.text,
+                              is_lead = (c.text == lead) }
+            end
+        end
+    end
+    local lead_seen = false
+    for i = 1, #S do
+        if S[i].is_lead then lead_seen = true break end
+    end
+    if not lead_seen then
+        S[#S + 1] = { ce = lead_ce, t = lead,
+                      ce1 = (ce1v >= 0 and ce1v or nil), is_lead = true }
+    end
+    -- 并列按文本打破（与 Python/源码同一规则，勿用迭代顺序）
+    table.sort(S, function(a, b)
+        if a.ce ~= b.ce then return a.ce < b.ce end
+        return a.t < b.t
+    end)
+    local ss = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0 }
+    if #ord >= 2 then
+        local nS = #S
+        local rw, rc, lead_pos, lead_c = 0, -1, 1, nil
+        local mn, mx = math.huge, -math.huge
+        for i = 1, nS do
+            local s = S[i]
+            if s.is_lead then lead_pos = i end
+            if s.ce < mn then mn = s.ce end
+            if s.ce > mx then mx = s.ce end
+        end
+        local sum_w, lead_w, near = 0.0, 0.0, 0
+        for i = 1, nS do
+            local s = S[i]
+            local w = math.exp(-(s.ce - mn))
+            sum_w = sum_w + w
+            if s.is_lead then lead_w = w end
+            if s.ce <= lead_ce + 1.0 then near = near + 1 end
+        end
+        rw = lead_pos - 1
+        local cs = {}
+        for i = 1, nS do
+            if S[i].ce1 then cs[#cs + 1] = S[i] end
+        end
+        table.sort(cs, function(a, b)
+            if a.ce1 ~= b.ce1 then return a.ce1 < b.ce1 end
+            return a.t < b.t
+        end)
+        for i = 1, #cs do
+            if cs[i].is_lead then rc, lead_c = i - 1, i break end
+        end
+        local wgap = (nS > 1) and (S[2].ce - lead_ce) or 0.0
+        -- ss_1gap = 簇内「第 2 名 ce1 − lead 的 ce1」（lead 自己就是第 2 名 → 0）
+        local gap1 = 0.0
+        if lead_c and #cs > 1 then
+            gap1 = cs[2].ce1 - cs[lead_c].ce1
+        end
+        local top2 = (nS > 1) and (S[2].ce - S[1].ce) or 0.0
+        local ent = 0.0
+        for i = 1, nS do
+            local pv = math.exp(-(S[i].ce - mn)) / math.max(sum_w, 1e-300)
+            if pv > 0 then ent = ent - pv * math.log(pv) end
+        end
+        ss = {
+            nS,                                   -- ss_n
+            rw,                                   -- ss_lead_rank_w
+            rc,                                   -- ss_lead_rank_1
+            wgap,                                 -- ss_wgap
+            gap1,                                 -- ss_1gap
+            ent,                                  -- ss_ent
+            lead_w / math.max(sum_w, 1e-300),     -- ss_pmass
+            mx - mn,                              -- ss_range
+            top2,                                 -- ss_top2gap
+            (rw == 0) and 1.0 or 0.0,             -- ss_best_is_lead
+            near,                                 -- ss_near
+            wgap / (mx - mn + 1e-6),              -- ss_gap_ratio
+        }
+    else
+        ss[1] = #ord          -- 研究侧 len(win) < 2 分支：ss_n = 窗内有效候选数
+    end
+    for k = 1, 12 do x[41 + k] = ss[k] end
     return pg_predict(m, x), x
 end
 _G.llm_prefix_score = pg_score

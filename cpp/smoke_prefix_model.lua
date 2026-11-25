@@ -25,7 +25,7 @@ print(string.format("[smoke] model loaded: %d 树, τ=%.6f",
                     #m.trees, m.tau))
 
 local cases = dofile(CASES)
-local nf = 41
+local nf = #m.feats          -- 特征数跟模型文件走（41 → 53 = 41+ss12）
 local fo = assert(io.open(OUT, "w"))
 local head = { "wid", "score" }
 for i = 1, nf do head[#head + 1] = "f" .. i end
