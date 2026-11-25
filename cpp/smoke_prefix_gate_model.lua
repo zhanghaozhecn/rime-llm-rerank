@@ -46,7 +46,27 @@ local function to_win(c)
   return gen, ordered
 end
 
--- A：逐例与分数对照
+local function class_first_text(ord, lead)
+  local single = (utf8.len(lead) == 1)
+  for _, o in ipairs(ord) do
+    local n = utf8.len(o.text) or #o.text
+    if (n == 1) == single then return o.text end
+  end
+end
+local function put_class_first(ord, text)
+  local single = (utf8.len(text) == 1)
+  local idx
+  for i, o in ipairs(ord) do
+    local n = utf8.len(o.text) or #o.text
+    if (n == 1) == single then idx = i; break end
+  end
+  if not idx then return end
+  local j
+  for i, o in ipairs(ord) do if o.text == text then j = i; break end end
+  if j and j ~= idx then ord[idx], ord[j] = ord[j], ord[idx] end
+end
+
+-- A：逐例与分数对照（2026-11-26 起结构证据 = 同字数档首选）
 local cases = dofile(CASES)
 local n_a = 0
 for _, c in ipairs(cases) do
@@ -59,7 +79,7 @@ for _, c in ipairs(cases) do
     local b1 = { text = c.lead, start = 0, _end = c.le }
     local got = _G.llm_prefix_gate(gen, b1, 0, #c.code, nil, c.ce3,
                                    c.ctx_chars, win)
-    local want = sc >= TAU
+    local want = (sc >= TAU) and (class_first_text(ordered, c.lead) == c.lead)
     chk("A/" .. c.wid, (got ~= nil) == want,
         string.format("score=%.4f τ=%.4f got=%s", sc, TAU,
                       tostring(got)))
@@ -68,8 +88,13 @@ for _, c in ipairs(cases) do
 end
 print(string.format("[smoke] A 逐例对照 %d 例", n_a))
 
--- B：τ 边界
-local c1 = cases[1]
+-- B：τ 边界（取一个 lead 本身是同档首选的例）
+local c1
+for _, c in ipairs(cases) do
+  local _, ord = to_win(c)
+  if class_first_text(ord, c.lead) == c.lead then c1 = c; break end
+end
+c1 = c1 or cases[1]
 local gen1, ord1 = to_win(c1)
 local win1 = { ordered = ord1, code = c1.code, seg_start = 0,
                gshow = c1.gshow }
@@ -90,6 +115,7 @@ end
 for _, o in ipairs(ord2) do
   if o.text == c1.lead then o.text = "他们" end
 end
+put_class_first(ord2, "他们")
 local ce2 = {}
 for k, v in pairs(c1.ce3) do ce2[k] = v end
 ce2["他们"] = c1.ce3[c1.lead]

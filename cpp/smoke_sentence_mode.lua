@@ -305,14 +305,20 @@ sent_run({
   }, "nm", { start = 0, _end = 2 })
 _G.user_freq_eff = old_eff
 assert(#OUT == 4, "G: yield count=" .. #OUT)
-assert(OUT[1].text == "你", "G: 高频子词应排首位: " .. OUT[1].text)
--- 复核它确实进了窗（拿真 CE），而不是靠窗外层1 序
-local gwin = false
+-- 2026-11-26：整句显示序改为「先长后短」——高频子词不再要求显示首位，
+-- 但必须仍在**融合序**首位（显示序与融合序分离）。
+local gwin, gbest_t, gbest = false, nil, -1e18
 for _, f in ipairs(crows()) do
-  if f[3] == "你" and f[12] == "1" then gwin = true end
+  if f[12] == "1" then
+    if f[3] == "你" then gwin = true end
+    local v = tonumber(f[8]) or -1e18
+    if v > gbest then gbest, gbest_t = v, f[3] end
+  end
 end
 assert(gwin, "G: 高频子词应进评分窗")
-print("[smoke] G 统一窗口 高频子词排在低频等长词前 OK")
+assert(gbest_t == "你", "G: 融合序首位应为高频子词: " .. tostring(gbest_t))
+assert(#OUT[1].text >= 2, "G: 显示序应长词在前: " .. OUT[1].text)
+print("[smoke] G 统一窗口 高频子词融合首位 + 显示长词优先 OK")
 
 -- ═══ 场景 H：前缀软确认（2026-11-24 合并单一路线）═══
 -- 窗口路径 A 已退役：没有组句证据（本场景 ngram_group 未开、无 ngram 资产）

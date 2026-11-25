@@ -76,7 +76,9 @@ static int          g_n_ctx           = 512; // 3-token 与整句 CE 共用同�
                                               //   512 两者都够，且整句可直接复用 seq0 的 prep
                                               // 历史：128 为 3-token 单独口径（64 时 S2 恒 ~100ms
                                               //   vs 128 的 ~40ms，真机日志实证）
-static int          g_n_seq_max       = 12;  // 模板 seq 0 + 最多 11 worker seq
+static int          g_n_seq_max       = 20;  // 模板 seq 0 + worker seq（2026-11-26:
+                                             //   CE 预算 12 时不同首 token 行 ≤12，
+                                             //   改 20 留余量；KV cell 与 seq 数无关）
 
 // CE 位置权重（2026-09-16 采纳，首项归一规范形；与 (1.15,1.30,0.70) 排序等价、
 // ce2 判别力最强（同时携带上下文契合 + 词内连贯），ce3 已深入词内部、上下文
@@ -1453,8 +1455,14 @@ static bool score_batch(const std::vector<llama_token> & ctx_ids,
                     if (ce3_out) for (int ci : r2_cands[u]) (*ce3_out)[ci] = {NAN, NAN, NAN};
                     continue;
                 }
+                // 2026-11-25：归一化 (max,lse) 每行只算一次，行内候选 O(1) 查表
+                // ——原实现每候选重扫 O(vocab)（~2-10ms/候选），是「候选数一多
+                // 就慢」的真正来源（1-token 候选走 CE1 共享归一化 → 免费）。
+                float rm = 0;
+                double rlse = 0;
+                logits_normalizer(l, vs, rm, rlse);
                 for (int ci : r2_cands[u]) {
-                    double c2 = cross_entropy(l, vs, cands[ci][1]);
+                    double c2 = -((double)(l[cands[ci][1]] - rm) - rlse);
                     ce_sum[ci] += kCeW2 * c2;
                     if (ce3_out) (*ce3_out)[ci][1] = c2;
                 }
@@ -1519,8 +1527,11 @@ static bool score_batch(const std::vector<llama_token> & ctx_ids,
                     if (ce3_out) for (int ci : rows3[v].cands) (*ce3_out)[ci] = {NAN, NAN, NAN};
                     continue;
                 }
+                float rm = 0;
+                double rlse = 0;
+                logits_normalizer(l, vs, rm, rlse);
                 for (int ci : rows3[v].cands) {
-                    double c3 = cross_entropy(l, vs, cands[ci][2]);
+                    double c3 = -((double)(l[cands[ci][2]] - rm) - rlse);
                     ce_sum[ci] += kCeW3 * c3;
                     if (ce3_out) (*ce3_out)[ci][2] = c3;
                 }
@@ -2072,7 +2083,7 @@ static int lua_async_submit(lua_State * L) {
     luaL_checktype(L, 2, LUA_TTABLE);
     int immediate = lua_toboolean(L, 3);
     int n = (int)luaL_len(L, 2);
-    if (n > g_n_seq_max) n = g_n_seq_max;
+    if (n > 96) n = 96;   // 2026-11-26：候选输入上限与 seq 上限解耦（预算在过滤侧选）
     std::vector<std::string> cands;
     for (int i = 1; i <= n; i++) {
         lua_rawgeti(L, 2, i);
@@ -2215,7 +2226,7 @@ static int lua_score(lua_State * L) {
     std::vector<std::string> cand_texts;
     int n = (int)luaL_len(L, 2);
     if (n < 2) { lua_pushnil(L); return 1; }
-    if (n > g_n_seq_max) n = g_n_seq_max;
+    if (n > 96) n = 96;   // 2026-11-26：候选输入上限与 seq 上限解耦
     for (int i = 1; i <= n; i++) {
         lua_rawgeti(L, 2, i);
         const char * s = lua_tostring(L, -1);
@@ -2376,6 +2387,30 @@ static int lua_get_seg(lua_State * L) {
     for (size_t i = 0; i < g_last_cands.size(); i++) {
         lua_pushstring(L, g_last_seg[i].c_str());
         lua_setfield(L, -2, g_last_cands[i].c_str());
+    }
+    return 1;
+}
+
+// llm.tok_count(texts) → { [text] = ntok }：只算 token 数（不 decode），
+// 2026-11-26：过滤侧按 CE 预算选候选用（1-token 候选免费）。
+static int lua_tok_count(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int n = (int)luaL_len(L, 1);
+    if (n > 96) n = 96;
+    lua_newtable(L);
+    for (int i = 1; i <= n; i++) {
+        lua_rawgeti(L, 1, i);
+        const char *s = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        int nt = 0;
+        if (s && *s) {
+            auto ids = tokenize(s);
+            nt = (int)ids.size();
+        }
+        const char *key = (s && *s) ? s : "";
+        lua_pushstring(L, key);
+        lua_pushinteger(L, nt);
+        lua_settable(L, -3);
     }
     return 1;
 }
@@ -2752,6 +2787,8 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
 
     lua_pushcfunction(L, lua_is_ready);
     lua_setfield(L, -2, "is_ready");
+    lua_pushcfunction(L, lua_tok_count);
+    lua_setfield(L, -2, "tok_count");
 
     // 光标上文旁路（2026-09-10 三层上文前两层）：函数注册与 score/prepare
     // 同款（setfield 直挂，不走 __newindex 属性语义）

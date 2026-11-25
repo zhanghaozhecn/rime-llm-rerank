@@ -107,7 +107,7 @@ OUT = {}
 filter(translation, env)
 print("[smoke] 6-cand tail path, yields:", #OUT)
 
--- 2026-11-25 覆盖档位配额：max_candidates=6、码 ≤16 → 窗内 1 字 / 2+ 字各 ≥2
+-- 2026-11-26 CE 预算准入：窗内仍同时含单字与多字候选（预算足够时）
 CFGMAX = 6
 env.engine.context.input = "iock"
 myc = { "一次", "一处", "依次", "一次二次", "英超处", "衣傲处",

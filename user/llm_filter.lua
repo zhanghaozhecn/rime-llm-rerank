@@ -276,7 +276,8 @@ local cfg = {
     -- min_code_len / max_code_len 已废弃（用户配置面移除，2026-09-30）：
     -- 等价写法 = code_pattern '.{4}'
     max_tokens       = 20,  -- 截取的上文 token 数（2026-11-19 随生产模型切 Qwen3-0.6B base 定案，旧 10 为 0.5B 时代值）
-    max_candidates   = 6,   -- 2026-11-19：0.6B k*=6（候选段 100ms / 最优 3.65%）
+    ce_budget        = 12,  -- 2026-11-26：CE2+CE3 的总 token 预算（1-token 候选免费）；
+                            --   12 = 旧"6 候选"的等价成本（每候选 2 个 token）
     cpu_cores        = nil,  -- nil = 不设置，走 C++ 默认（固定 4，bench_threads 实测后可配）
     debug_fusion     = false, -- true = 逐候选融合明细写 rime_llm_debug.txt (诊断用)
     sentence_mode    = false, -- 整句模式：等长词+子词统一进评分窗、显示统一
@@ -475,7 +476,7 @@ function _G.llm_write_h(schema, model)
     local line = table.concat({
         "H", id, rec_stamp(), "plugin", rec_esc(schema or "unknown"),
         rec_esc(rec_base(model)), rec_esc(cfg.code_pattern or ""),
-        tostring(cfg.max_candidates or 5), tostring(cfg.max_tokens or 10),
+        tostring(cfg.ce_budget or 12), tostring(cfg.max_tokens or 10),
         cfg.sentence_mode and "1" or "0", "14.00", "400"
     }, "\t")
     _G.llm_corpus_write(line)
@@ -727,8 +728,15 @@ local function init_config(env)
     -- 保存时由安装器剥除）
     local v = sc:get_int("llm_rerank/max_tokens")
     if v then cfg.max_tokens = v end
-    v = sc:get_int("llm_rerank/max_candidates")
-    if v then cfg.max_candidates = v end
+    -- 2026-11-26：配置项由「候选数」改为「CE 预算」（CE2+CE3 token 数）。
+    -- 旧键 max_candidates 兜底映射（预算 = 2×候选数，保持旧机行为不变）。
+    v = sc:get_int("llm_rerank/ce_budget")
+    if v and v > 0 then
+        cfg.ce_budget = v
+    else
+        v = sc:get_int("llm_rerank/max_candidates")
+        if v and v > 0 then cfg.ce_budget = 2 * v end
+    end
     v = sc:get_int("llm_rerank/cpu_cores")
     if v then cfg.cpu_cores = v end
     -- min_tokens 不再从 schema 读取（2026-09-30 用户配置面移除；固定 C++ 默认 1）
@@ -990,8 +998,23 @@ local function prefix_gate(gen, b1, seg_start, seg_end, p_thr, ce3map,
     local st = nchars(txt_of[lead])
     local sr = st - nchars(lead)
     if st < 1 or sr < 2 then return nil end
-    local s1pos, b1e = cand_span(b1)
-    if b1.text ~= lead or s1pos ~= seg_start or b1e ~= seg_start + le then
+    -- 2026-11-26 用户定案：整句显示序恢复「先长后短」后，结构证据不再要求
+    -- 融合序第 1，改为「lead 的同字数档首选」（1 字档 / 多字档）。融合序
+    -- 本身不变（win.ordered 仍是融合序），树模型照旧吃完整窗口特征。
+    local pick = b1
+    if win and win.ordered then
+        local lead_single = (nchars(lead) == 1)
+        pick = nil
+        for _, c in ipairs(win.ordered) do
+            if (nchars(c.text) == 1) == lead_single then
+                pick = c
+                break
+            end
+        end
+        if not pick then return nil end
+    end
+    local s1pos, b1e = cand_span(pick)
+    if pick.text ~= lead or s1pos ~= seg_start or b1e ~= seg_start + le then
         return nil
     end
     -- ta 族黑名单（2026-11-25 用户定案）：他/它/她/他们/它们/她们 属结构性
@@ -1569,7 +1592,7 @@ return function(translation, env)
     end
     -- ═══ 层1: 全体候选 用户词频打分重排（v3 两层重排, 2026-11-07 定案）═══
     -- 全体候选 S1 = FREQ_BETA·log1p(eff) + 累计 Unigram 项, 稳定降序（同分保引擎序）,
-    -- 取前 max_candidates 进 LLM 评分（层2 三项融合重排）, 其余按层1 序透传。
+    -- 按 CE 预算选评分集（层2 三项融合重排）, 其余按层1 序透传。
     -- 目标在层1 前 k 外 → 必然不在首位（评测 sweep_2layer 同语义, 全窗参评）。
     -- 文件序无关性: 引擎调频与否仅影响冷词同分打破（目标卷入 ≤0.05pp 窗,
     -- 实测见研究库 §三十三·附 6）。
@@ -1600,14 +1623,6 @@ return function(translation, env)
     local cands = {}
     local l1win = {}
     local win_seen = {}
-    local function add_win(e)
-        if #cands >= cfg.max_candidates then return end
-        local t = e.c.text
-        if win_seen[t] then return end
-        win_seen[t] = true
-        cands[#cands + 1] = t
-        l1win[#l1win + 1] = t
-    end
     -- 整句模式准入（2026-11-22 定案取代 two_code_sentence 满长规则）：候选
     -- 覆盖整个活动段（FM）才进窗——"音节数一致"由引擎 lattice 保证；部分
     -- 覆盖候选不进窗、不算 CE。FM 判定三级兜底（见 cand_span 注释）：候选
@@ -1638,28 +1653,48 @@ return function(translation, env)
         if fm_set then return fm_set[c] == true end
         return false
     end
-    -- 覆盖档位配额（2026-11-25 用户定案）：收集池按候选**词长**分两档
-    -- （1 字 / ≥2 字），每档先各留 2 条进评分窗，余量再按层1 序填满。
-    -- 依据（luna 混合窗 399 窗、万象词典、3-token CE、窗 6）：CE 错
-    -- 48.9%→37.1%、有正确 60.2%→72.7%；三档（再分 3 字+）零增益 → 只分
-    -- 两档。码长 >16 不做配额（该档覆盖已 97%，瓶颈在 CE 判别力）。
-    local quota = 0
-    if #code <= 16 and cfg.max_candidates >= 6 then quota = 2 end
-    if quota > 0 then
-        local g1, g2 = 0, 0
-        for _, e in ipairs(layer1) do
-            if not (genset and genset[e.c.text]) then
-                local n = utf8.len(e.c.text) or #e.c.text
-                if n == 1 and g1 < quota then
-                    add_win(e); g1 = g1 + 1
-                elseif n >= 2 and g2 < quota then
-                    add_win(e); g2 = g2 + 1
-                end
-            end
+    -- 2026-11-26 用户定案：准入改为 **CE 预算**（CE2+CE3 的 token 数）。
+    --   * 层1 序扫描；1-token 候选免费（CE1 已够），全部入选；
+    --   * 多 token 候选花 min(ntok,3)−1 预算（2-token 花 1、3+ 花 2），
+    --     预算不足则跳过（进 tail，不评分、不参与首位竞争）；
+    --   * 不再区分首/次 token 行数（解码行数由打分器按 token 前缀去重）。
+    -- 依据（wiki 字词重放 8k）：B=9 起贴全池上限（2.96%），B=12 = 旧 6 候选
+    -- 成本；B<8 比旧基线差。
+    local budget = cfg.ce_budget or 12
+    local pool = {}
+    for _, e in ipairs(layer1) do
+        if not (genset and genset[e.c.text]) then
+            pool[#pool + 1] = e
         end
     end
-    for _, e in ipairs(layer1) do
-        if not (genset and genset[e.c.text]) then add_win(e) end
+    local nts = nil
+    if llm and llm.tok_count then
+        local texts = {}
+        for i, e in ipairs(pool) do texts[i] = e.c.text end
+        local ok, r = pcall(llm.tok_count, texts)
+        if ok and type(r) == "table" then nts = r end
+    end
+    local rem = budget
+    for _, e in ipairs(pool) do
+        local t = e.c.text
+        if not win_seen[t] then
+            local n = nts and tonumber(nts[t]) or nil
+            local cost
+            if n and n >= 1 then
+                cost = math.max(0, math.min(n, 3) - 1)
+            else
+                -- tok_count 不可用（旧 DLL）时的保守估计：按字数，≤3 字视作
+                -- 2-token（花 1），>3 字视作 3-token（花 2）
+                local len = utf8.len(t) or #t
+                cost = len <= 1 and 0 or (len <= 3 and 1 or 2)
+            end
+            if cost <= rem then
+                win_seen[t] = true
+                cands[#cands + 1] = t
+                l1win[#l1win + 1] = t
+                rem = rem - cost
+            end
+        end
     end
     local w_written = false
     -- 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在
@@ -1991,7 +2026,21 @@ return function(translation, env)
         local best_gen = (gen and #gen > 0) and gen[1] or nil
         local out = {}
         if best_gen then out[#out + 1] = best_gen.cand end
-        for _, c in ipairs(ordered) do out[#out + 1] = c end
+        if sent_on then
+            -- 2026-11-26 用户定案：整句模式恢复「先长后短」显示序（同字数
+            -- 保持融合序；融合/准入/前缀判定仍用融合序，不受显示序影响）。
+            local di = {}
+            for i, c in ipairs(ordered) do di[i] = { c = c, i = i } end
+            table.sort(di, function(a, b)
+                local la = utf8.len(a.c.text) or #a.c.text
+                local lb = utf8.len(b.c.text) or #b.c.text
+                if la ~= lb then return la > lb end
+                return a.i < b.i
+            end)
+            for _, x in ipairs(di) do out[#out + 1] = x.c end
+        else
+            for _, c in ipairs(ordered) do out[#out + 1] = c end
+        end
         for _, e in ipairs(layer1) do
             if not seen[e.c.text]
                and not (genset and genset[e.c.text]) then
@@ -2013,7 +2062,9 @@ return function(translation, env)
         -- 调试行 full 标志（协议字段，win 行 = FM=1）按整句模式 FM 判定补：
         if sent_on and dbg then
             for _, c in ipairs(out) do
-                if dbg[c.text] then dbg[c.text].full = is_fm(c) end
+                if dbg[c.text] then
+                    dbg[c.text].full = is_fm(c)
+                end
             end
         end
 
