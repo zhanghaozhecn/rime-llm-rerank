@@ -46,25 +46,19 @@ end
 --   可能）≤ 阈值才自动确认。现行门只看相对位次/概率质量，绝对置信度能挡
 --   掉"整个窗都不靠谱"的同音错确认（研究库 2026-11-25：95.27→97.15%，
 --   确认量 95.3%，K=2/5/12 净收益全部上升）。
---   空上文（无 CE）：用 ngram 句分差 d ≥ 阈值（d = 该 lead 最高分句 − 最佳
---   不同 lead 句）；有效上文 ≤1 字：不确认（1 字上下文精度仅 82%）。
--- 0 = 关闭新门（回到 2026-11-24 行为）；环境变量 / `_G` 钩子供真机 A/B。
-local PREFIX_CE1_DEFAULT, PREFIX_D_DEFAULT = 11.0, 10.0
+--   有效上文 <4 字：一律不确认（2026-11-25 实测：0/1/2/3 字精度
+--   90.9/98.2/99.0/99.3%，显著低于 ≥4 字的 99.8%；空上文没有 CE、
+--   只靠 ngram 一条腿，已随该下限一并关闭）。
+-- 0 = 关闭 ce1 回退门（模型缺失时退回旧行为）；`_G` 钩子供真机 A/B。
+local PREFIX_CE1_DEFAULT = 11.0
 do
     local v = tonumber(os.getenv("RIME_LLM_PREFIX_CE1"))
     if v and v >= 0 then PREFIX_CE1_DEFAULT = v end
-    v = tonumber(os.getenv("RIME_LLM_PREFIX_D"))
-    if v and v >= 0 then PREFIX_D_DEFAULT = v end
 end
 local function prefix_ce1_thr()
     local v = tonumber(_G.llm_prefix_ce1)
     if v and v >= 0 then return v end
     return PREFIX_CE1_DEFAULT
-end
-local function prefix_d_thr()
-    local v = tonumber(_G.llm_prefix_d)
-    if v and v >= 0 then return v end
-    return PREFIX_D_DEFAULT
 end
 -- 整句模式同步等待预算（2026-11-23 修）：原先整句模式"投递即走"，当前键
 -- 只能显示层 1 序，LLM 评分只在同指纹重查时才用上（真机实测连续打字从未
@@ -1008,41 +1002,22 @@ local function prefix_gate(gen, b1, seg_start, seg_end, p_thr, ce3map,
     -- 5 参数调用保持 2026-11-24 行为。
     local ce1_thr = prefix_ce1_thr()
     if ce1_thr > 0 and ctx_chars ~= nil then
-        local lead_score, best_other = nil, -math.huge
-        for _, it in ipairs(gen) do
-            if is_finite_number(it.score) and it.lead == lead
-                    and (not lead_score or it.score > lead_score) then
-                lead_score = it.score
-            end
-        end
-        for _, it in ipairs(gen) do
-            if is_finite_number(it.score) and it.lead ~= lead
-                    and it.score > best_other then
-                best_other = it.score
-            end
-        end
-        local d = lead_score
-                and (best_other > -math.huge and (lead_score - best_other)
-                     or 1e9)
-                or nil
-        if ctx_chars == 0 then
-            -- 空上文：无 CE，只有词频/句分差证据；要求 d ≥ 阈值
-            if not d or d < prefix_d_thr() then return nil end
-        elseif ctx_chars < 2 then
-            -- 1 字上文：精度仅 82%（研究库），一律不确认
-            return nil
+        -- 短上文下限（2026-11-25 实测，12,000 句 / 96,000 变体）：
+        -- ctx 0/1/2/3 字精度 90.9/98.2/99.0/99.3%，**显著低于 ≥4 字的 99.8%**
+        -- （Fisher p<0.0001 / 0.0007 / 0.0014；≤3 与 1 字统计同档）。
+        -- 空上文（0 字）走 freq_only 无 CE，只靠 ngram 一条腿（90.9%）——
+        -- 一并关闭：不确认，但 freq_only 的**排序**照旧（只关确认）。
+        if ctx_chars < 4 then return nil end
+        -- 模型门（2026-11-25）：可用则取代 ce1 门（分数 ≥ τ 才确认）；
+        -- 模型缺失/无 CE → 回退 ce1 门。
+        local sc = win and pg_score(gen, lead, p, le, ce3map, n,
+                                    ctx_chars, win)
+        if sc then
+            if sc < pg_tau() then return nil end
         else
-            -- 模型门（2026-11-25）：可用则取代 ce1 门（分数 ≥ τ 才确认）；
-            -- 模型缺失/无 CE → 回退 ce1 门。
-            local sc = win and pg_score(gen, lead, p, le, ce3map, n,
-                                        ctx_chars, win)
-            if sc then
-                if sc < pg_tau() then return nil end
-            else
-                local c1 = ce3map and ce3map[lead]
-                           and tonumber(ce3map[lead][1])
-                if not c1 or c1 > ce1_thr then return nil end
-            end
+            local c1 = ce3map and ce3map[lead]
+                       and tonumber(ce3map[lead][1])
+            if not c1 or c1 > ce1_thr then return nil end
         end
     end
     return lead, p, b1e

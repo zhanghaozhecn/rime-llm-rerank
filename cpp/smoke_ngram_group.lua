@@ -371,19 +371,21 @@ check("M8 窗1 非证据词不确认", l == nil, tostring(l))
 -- M9–M13 绝对置信度门（2026-11-25）：ce1 / 空上文 d / 1 字上文 / 关闭钩子
 local function ce1map(t, c1) return { [t] = { c1, nil, nil } } end
 local g1 = gsum({ { "的", 2, -1, "的天气" } })
-l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 5), 2)
-check("M9 ce1≤11 确认", l == "的", tostring(l))
-l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 12), 2)
+l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 5), 4)
+check("M9 ce1≤11 确认（4 字上文）", l == "的", tostring(l))
+l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 12), 4)
 check("M9b ce1>11 不确认", l == nil, tostring(l))
 l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 5), 1)
 check("M10 有效上文 1 字不确认", l == nil, tostring(l))
--- 空上文：无 CE → d≥10；两条 lead，d=10.5 过 / d=4.5 拒（P 均 ≥0.95）
+-- 短上文下限（2026-11-25 实测，12,000 句）：<4 字一律不确认——
+-- 空上文（无 CE，只靠 ngram 一条腿）d 再大也不确认
 local gd1 = gsum({ { "的", 2, -1, "的天气" }, { "得", 2, -11.5, "得天气" } })
 l = gate(gd1, mkc("的", 0, 2), 0, 8, nil, nil, 0)
-check("M11 空上文 d≥10 确认", l == "的", tostring(l))
-local gd2 = gsum({ { "的", 2, -1, "的天气" }, { "得", 2, -5.5, "得天气" } })
-l = gate(gd2, mkc("的", 0, 2), 0, 8, nil, nil, 0)
-check("M11b 空上文 d<10 不确认", l == nil, tostring(l))
+check("M11 空上文不确认", l == nil, tostring(l))
+l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 5), 2)
+check("M11b 2 字上文不确认", l == nil, tostring(l))
+l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 5), 3)
+check("M11c 3 字上文不确认", l == nil, tostring(l))
 _G.llm_prefix_ce1 = 0
 l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 99), 1)
 _G.llm_prefix_ce1 = nil
@@ -400,8 +402,7 @@ _G.llm_pending_confirm = nil
 run({ mkc("的", 0, 2), mkc("得", 0, 2), mkc("的天气", 0, 8), mkc("得", 0, 2) },
     "detianqi", { start = 0, _end = 8 })
 pc = _G.llm_pending_confirm
-check("N 无上文仍确认（窗1 = 组句 lead）",
-      pc ~= nil and pc.text == "的" and pc.input == "detianqi",
+check("N 无上文不再自动确认（<4 字下限）", pc == nil,
       pc and tostring(pc.text) or "nil")
 local saw_freq, saw_ctx_empty, ctx_used_empty = false, false, false
 for _, ln in ipairs(LIVE) do
