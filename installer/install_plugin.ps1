@@ -600,7 +600,7 @@ function Copy-FilesPluginAction($Log) {
   $installDir = Find-WeaselDir
   if (-not $installDir) { throw "未找到小狼毫安装目录。请先安装官方小狼毫 0.17.x" }
   & $Log "  安装目录: $installDir"
-  foreach ($f in @("rime_llm.dll", "llm_filter.lua", "llm_processor.lua")) {
+  foreach ($f in @("rime_llm.dll", "llm_filter.lua", "llm_processor.lua", "prefix_gate_model.lua")) {
     if (-not (Test-Path (Join-Path $PluginSrc $f))) { throw "插件版文件不完整: 缺 $f" }
   }
 
@@ -616,7 +616,7 @@ function Copy-FilesPluginAction($Log) {
     }
   }
   if (-not (Test-Path $LUA_DIR)) { New-Item -ItemType Directory -Path $LUA_DIR -Force | Out-Null }
-  foreach ($l in @("llm_filter.lua", "llm_processor.lua")) {
+  foreach ($l in @("llm_filter.lua", "llm_processor.lua", "prefix_gate_model.lua")) {
     Copy-Item (Join-Path $PluginSrc $l) (Join-Path $LUA_DIR $l) -Force
     & $Log ("  + lua\" + $l)
   }

@@ -368,6 +368,26 @@ check("M7 多字确认", l == "今天", tostring(l))
 -- M8 窗口第 1 是短子词（不是证据词本身）→ 不确认
 l = gate(gsum({ { "的天气", 6, -1, "的天气" } }), mkc("的", 0, 2), 0, 8)
 check("M8 窗1 非证据词不确认", l == nil, tostring(l))
+-- M9–M13 绝对置信度门（2026-11-25）：ce1 / 空上文 d / 1 字上文 / 关闭钩子
+local function ce1map(t, c1) return { [t] = { c1, nil, nil } } end
+local g1 = gsum({ { "的", 2, -1, "的天气" } })
+l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 5), 2)
+check("M9 ce1≤11 确认", l == "的", tostring(l))
+l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 12), 2)
+check("M9b ce1>11 不确认", l == nil, tostring(l))
+l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 5), 1)
+check("M10 有效上文 1 字不确认", l == nil, tostring(l))
+-- 空上文：无 CE → d≥10；两条 lead，d=10.5 过 / d=4.5 拒（P 均 ≥0.95）
+local gd1 = gsum({ { "的", 2, -1, "的天气" }, { "得", 2, -11.5, "得天气" } })
+l = gate(gd1, mkc("的", 0, 2), 0, 8, nil, nil, 0)
+check("M11 空上文 d≥10 确认", l == "的", tostring(l))
+local gd2 = gsum({ { "的", 2, -1, "的天气" }, { "得", 2, -5.5, "得天气" } })
+l = gate(gd2, mkc("的", 0, 2), 0, 8, nil, nil, 0)
+check("M11b 空上文 d<10 不确认", l == nil, tostring(l))
+_G.llm_prefix_ce1 = 0
+l = gate(g1, mkc("的", 0, 2), 0, 8, nil, ce1map("的", 99), 1)
+_G.llm_prefix_ce1 = nil
+check("M12 关闭钩子回到旧行为", l == "的", tostring(l))
 
 -- ── N：无上文（CE 不可算）→ 融合按剩余项 + 组句 lead 照常确认 ──────
 -- 2026-11-24 用户定案：无上文时 fused = β·log1p(eff) + log(uni+1) + 词码对；

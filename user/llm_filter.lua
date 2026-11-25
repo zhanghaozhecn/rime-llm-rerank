@@ -41,6 +41,31 @@ local function prefix_confirm_p()
     if v and v >= 0 and v <= 1 then return v end
     return PREFIX_CONFIRM_P
 end
+-- 前缀确认的绝对置信度门（2026-11-25 研究定案）：
+--   窗口融合序第 1 候选的**首 token CE**（原始正 CE，小 = 模型认为该词很
+--   可能）≤ 阈值才自动确认。现行门只看相对位次/概率质量，绝对置信度能挡
+--   掉"整个窗都不靠谱"的同音错确认（研究库 2026-11-25：95.27→97.15%，
+--   确认量 95.3%，K=2/5/12 净收益全部上升）。
+--   空上文（无 CE）：用 ngram 句分差 d ≥ 阈值（d = 该 lead 最高分句 − 最佳
+--   不同 lead 句）；有效上文 ≤1 字：不确认（1 字上下文精度仅 82%）。
+-- 0 = 关闭新门（回到 2026-11-24 行为）；环境变量 / `_G` 钩子供真机 A/B。
+local PREFIX_CE1_DEFAULT, PREFIX_D_DEFAULT = 11.0, 10.0
+do
+    local v = tonumber(os.getenv("RIME_LLM_PREFIX_CE1"))
+    if v and v >= 0 then PREFIX_CE1_DEFAULT = v end
+    v = tonumber(os.getenv("RIME_LLM_PREFIX_D"))
+    if v and v >= 0 then PREFIX_D_DEFAULT = v end
+end
+local function prefix_ce1_thr()
+    local v = tonumber(_G.llm_prefix_ce1)
+    if v and v >= 0 then return v end
+    return PREFIX_CE1_DEFAULT
+end
+local function prefix_d_thr()
+    local v = tonumber(_G.llm_prefix_d)
+    if v and v >= 0 then return v end
+    return PREFIX_D_DEFAULT
+end
 -- 整句模式同步等待预算（2026-11-23 修）：原先整句模式"投递即走"，当前键
 -- 只能显示层 1 序，LLM 评分只在同指纹重查时才用上（真机实测连续打字从未
 -- 上屏）。改为每键最多等这么久——真机 100ms/键实测 6 个长词候选的
@@ -898,13 +923,19 @@ end
 -- 合并前缀门（2026-11-24 定案；纯计算，供 filter 与冒烟/排障直测）：
 --   gen = 组句结果（top-20，含 lead / lead_end / score / text）
 --   b1  = 窗口融合序第 1 候选（含 start / _end / text）
+--   ce3map = text → {ce1,ce2,ce3} 原始正 CE（快照 / llm.get_ce3）
+--   ctx_chars = 有效上文（上文 + 已确认前缀）字数；nil = 旧 5 参数直测调用
 -- 返回 lead, prob, endp；不满足 = nil。
 -- 判据：top-20 按 lead 分组 softmax → argmax lead 的概率质量 ≥ p_thr；
--- b1 文本 == lead、span 对齐；**音节守卫**（2026-11-24 标定，取代码数）：
+-- b1 文本 == lead、span 对齐；**音节守卫**（2026-11-24 真机定案）：
 --   组句句子的字符数 = 该句覆盖的音节数（中文一字一音节），lead 字数 =
---   已覆盖音节；确认后剩余 ≥2 音节；**单音节 lead 例外（剩余 ≥1）**
---   ——单字词边界无歧义，实测该档精度 99.1%（lead≥2 音节 + 余 1 音节
---   只有 90.5%，因末音节会把前一个字抢到边界另一侧）。
+--   已覆盖音节；**确认后剩余 ≥2 音节，单字 lead 无例外**（`xiazai` 在
+--   `xia` 确认「下」会把 2 字词拆成单字+单字；旧「单字余 1 例外」退役）。
+-- **绝对置信度门（2026-11-25 研究定案）**：有效上文 0 字（新文档句首）→
+--   ngram 句分差 d（该 lead 最高分句 − 最佳不同 lead 句）≥ prefix_d 阈值；
+--   有效上文 ≤1 字 → 不确认（1 字上下文精度仅 82%）；≥2 字 → 窗口第 1 的
+--   首 token CE ≤ prefix_ce1 阈值；CE 未就绪（ce3map 缺）→ 不确认。
+--   阈值 = 内置 11 / 10，环境变量 / `_G` 钩子可覆盖（0 = 关闭新门）。
 -- 不用码数：全拼 1 音节 2–6 码、简拼 1 码、双拼固定 2 码/音节，混拼后
 -- 码数与音节数无固定关系（旧「≥6 码 / 余 ≥4 码」是拍的，已退役）。
 local function nchars(s)
@@ -914,7 +945,10 @@ local function nchars(s)
     end
     return #s
 end
-local function prefix_gate(gen, b1, seg_start, seg_end, p_thr)
+-- 前向声明：模型门的四个入口（定义在 prefix_gate 之后）
+local pg_score, pg_tau, pg_tablock_on, pg_model, PG_TA
+local function prefix_gate(gen, b1, seg_start, seg_end, p_thr, ce3map,
+                           ctx_chars, win)
     if not gen or #gen == 0 or not b1 then return nil end
     local n = seg_end - seg_start
     if n < 1 then return nil end
@@ -944,7 +978,15 @@ local function prefix_gate(gen, b1, seg_start, seg_end, p_thr)
     end
     if not lead or tot <= 0 then return nil end
     local p = best / tot
-    if p < (p_thr or prefix_confirm_p()) then return nil end
+    -- 模型门可用（且本调用带窗口信息 win）时取代 P≥0.95 硬门——P 只作特征
+    -- 之一；这里只留训练域下界 p≥0.5（cohort 只在该区间标定，p<0.5 属外推）。
+    -- 旧 5 参数直测路径（无 win）照旧走 P 阈值，冒烟用例语义不变。
+    local use_model = win ~= nil and pg_model() ~= nil
+    if use_model then
+        if p < 0.5 then return nil end
+    elseif p < (p_thr or prefix_confirm_p()) then
+        return nil
+    end
     local le = le_of[lead]
     if le < 0 or le >= n then return nil end     -- 必须是严格前缀
     -- 音节守卫（2026-11-24 真机定案）：**剩余必须 ≥2 音节**——单字 lead 的
@@ -958,9 +1000,298 @@ local function prefix_gate(gen, b1, seg_start, seg_end, p_thr)
     if b1.text ~= lead or s1pos ~= seg_start or b1e ~= seg_start + le then
         return nil
     end
+    -- ta 族黑名单（2026-11-25 用户定案）：他/它/她/他们/它们/她们 属结构性
+    -- 同音歧义（CE 方向反了：同窗内 ce1(他们) < ce1(它们)），阈值救不了，
+    -- 一律不自动确认（用户手动选）。
+    if pg_tablock_on() and PG_TA[lead] then return nil end
+    -- 绝对置信度门（2026-11-25）：只在新调用（带 ctx_chars）时生效，旧直测
+    -- 5 参数调用保持 2026-11-24 行为。
+    local ce1_thr = prefix_ce1_thr()
+    if ce1_thr > 0 and ctx_chars ~= nil then
+        local lead_score, best_other = nil, -math.huge
+        for _, it in ipairs(gen) do
+            if is_finite_number(it.score) and it.lead == lead
+                    and (not lead_score or it.score > lead_score) then
+                lead_score = it.score
+            end
+        end
+        for _, it in ipairs(gen) do
+            if is_finite_number(it.score) and it.lead ~= lead
+                    and it.score > best_other then
+                best_other = it.score
+            end
+        end
+        local d = lead_score
+                and (best_other > -math.huge and (lead_score - best_other)
+                     or 1e9)
+                or nil
+        if ctx_chars == 0 then
+            -- 空上文：无 CE，只有词频/句分差证据；要求 d ≥ 阈值
+            if not d or d < prefix_d_thr() then return nil end
+        elseif ctx_chars < 2 then
+            -- 1 字上文：精度仅 82%（研究库），一律不确认
+            return nil
+        else
+            -- 模型门（2026-11-25）：可用则取代 ce1 门（分数 ≥ τ 才确认）；
+            -- 模型缺失/无 CE → 回退 ce1 门。
+            local sc = win and pg_score(gen, lead, p, le, ce3map, n,
+                                        ctx_chars, win)
+            if sc then
+                if sc < pg_tau() then return nil end
+            else
+                local c1 = ce3map and ce3map[lead]
+                           and tonumber(ce3map[lead][1])
+                if not c1 or c1 > ce1_thr then return nil end
+            end
+        end
+    end
     return lead, p, b1e
 end
 _G.llm_prefix_gate = prefix_gate
+
+-- ═══ 前缀确认门：LightGBM 模型（2026-11-25 用户定案落地）═══
+-- 41 个**可部署**特征（顺序见研究库 eval/calib/export_prefix_gate.py）→
+-- LightGBM 300 树 / 15 叶 → p̂ ≥ τ 才确认。τ 默认取模型文件里的值
+-- （OOF 90% 量 / 98.56% 精度）。
+--
+-- 与 ce1 门的关系：模型可用时**取代** `P(lead)≥0.95 ∧ ce1≤11` 两道手调门
+-- （P 仍是特征之一）；模型文件缺失/加载失败 → 自动回退 ce1 门。空上文
+-- （无 CE）与 1 字上文两个分支不变。
+--
+-- A/B：RIME_LLM_PREFIX_MODEL=0（禁用模型→回退 ce1）、
+-- RIME_LLM_PREFIX_TAU（覆盖 τ）、RIME_LLM_PREFIX_TABLOCK=0（关 ta 族黑名单）；
+-- 冒烟钩子 _G.llm_prefix_model / _G.llm_prefix_tau / _G.llm_prefix_tablock。
+local PREFIX_TAU_DEFAULT = 0.971391
+-- ta 族：先验可论证的结构性同音歧义（他/它/她 只能靠语义定）。研究库
+-- 2026-11-25：40 触发 13 错（32.5%），真实用户域 8/10 = 80%；禁用后整体
+-- +0.07~0.08pp、user 域 +0.55pp，与模型叠加仍 +0.02~0.10pp。
+PG_TA = { ["他"] = true, ["它"] = true, ["她"] = true,
+                ["他们"] = true, ["它们"] = true, ["她们"] = true }
+local PG_MODEL = false          -- false = 未尝试；nil = 不可用；table = 已载
+-- 加载模型文件：优先 env 显式路径 → Rime 用户目录 lua\ → 相对路径（冒烟用）。
+-- 用 load(src) 而不是 require：librime-lua 按路径 dofile 组件，package.path
+-- 不保证含用户 lua 目录。
+local function pg_load_file(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local src = f:read("*a")
+    f:close()
+    if not src or #src < 100 then return nil end
+    local chunk = load(src, "@" .. path)
+    if not chunk then return nil end
+    local ok, m = pcall(chunk)
+    if ok and type(m) == "table" and m.trees and m.trees[1] then return m end
+    return nil
+end
+function pg_model()
+    if PG_MODEL == false then
+        if tonumber(os.getenv("RIME_LLM_PREFIX_MODEL")) == 0 then
+            PG_MODEL = nil
+            return nil
+        end
+        local cands = {}
+        local env = os.getenv("RIME_LLM_PREFIX_MODEL_PATH")
+        if env then cands[#cands + 1] = env end
+        local ok, dir = pcall(function()
+            return rime_api.get_user_data_dir()
+        end)
+        if ok and dir then cands[#cands + 1] = dir .. "/lua/prefix_gate_model.lua" end
+        cands[#cands + 1] = "./prefix_gate_model.lua"
+        cands[#cands + 1] = "../user/prefix_gate_model.lua"
+        for _, p in ipairs(cands) do
+            local m = pg_load_file(p)
+            if m then
+                PG_MODEL = m
+                break
+            end
+        end
+        if PG_MODEL == false then PG_MODEL = nil end
+    end
+    return PG_MODEL
+end
+_G.llm_prefix_model_reload = function()
+    PG_MODEL = false
+    return pg_model()
+end
+function pg_tau()
+    local v = tonumber(_G.llm_prefix_tau)
+    if v then return v end
+    v = tonumber(os.getenv("RIME_LLM_PREFIX_TAU"))
+    if v then return v end
+    local m = pg_model()
+    return (m and tonumber(m.tau)) or PREFIX_TAU_DEFAULT
+end
+function pg_tablock_on()
+    local v = _G.llm_prefix_tablock
+    if v == 0 or v == false then return false end
+    if tonumber(os.getenv("RIME_LLM_PREFIX_TABLOCK")) == 0 then return false end
+    return true
+end
+-- 推理：300 棵树 × 深度 ~4（实测 69µs/次，Lua 5.4）
+local function pg_predict(m, x)
+    local s = 0.0
+    local trees = m.trees
+    for i = 1, #trees do
+        local tr = trees[i]
+        local f, t, l, r, v = tr.f, tr.t, tr.l, tr.r, tr.v
+        local node = 1
+        while f[node] ~= 0 do
+            if x[f[node]] <= t[node] then node = l[node] else node = r[node] end
+        end
+        s = s + v[node]
+    end
+    if s > 35 then return 1.0 end
+    if s < -35 then return 0.0 end
+    return 1.0 / (1.0 + math.exp(-s))
+end
+-- 一窗 → 41 维特征 + 分数。口径逐项对齐训练侧
+-- （prefix_confirm_model.featurize）：CE-only 序（升 ce 为好）、缺失 CE 分量
+-- 不参与加权、rank2 = lead 之外 CE 加权和最小的候选。
+-- win = { ordered = 候选全表, code = 活动段码, seg_start = 段起点, gshow }
+function pg_score(gen, lead, p, le, ce3map, n, ctx_chars, win)
+    local m = pg_model()
+    if not m or not win or not win.ordered then return nil end
+    local KCE = { 1.0, 1.10, 0.60 }
+    local gshow = win.gshow
+    local function ce_of(t)
+        local e = ce3map and ce3map[t]
+        if not e then return nil end
+        local s, nt = 0.0, 0
+        for k = 1, 3 do
+            local x = e[k]
+            if is_finite_number(x) and x > -1e8 then
+                s = s + KCE[k] * x
+                nt = nt + 1
+            end
+        end
+        if nt == 0 then return nil end
+        return s, nt
+    end
+    -- 评分窗 = ordered 排除组句显示第 1 条后的前 6 个（生产口径）
+    local cand = {}
+    for _, c in ipairs(win.ordered) do
+        if c.text ~= gshow then
+            cand[#cand + 1] = c
+            if #cand >= 6 then break end
+        end
+    end
+    local lead_ce, lead_nt = ce_of(lead)
+    if not lead_ce then return nil end       -- 无 CE（未就绪/失败）→ 不判
+    -- CE-only 序（升 ce；同分按原始序 = 研究侧稳定排序）
+    local ord = {}
+    for i, c in ipairs(cand) do
+        local s, nt = ce_of(c.text)
+        if s then ord[#ord + 1] = { t = c.text, ce = s, nt = nt, i = i } end
+    end
+    table.sort(ord, function(a, b)
+        if a.ce ~= b.ce then return a.ce < b.ce end
+        return a.i < b.i
+    end)
+    local r2
+    for _, e in ipairs(ord) do
+        if e.t ~= lead then r2 = e break end
+    end
+    -- 组句侧
+    local top = gen[1]
+    local top_lead = top and top.lead
+    local other = -math.huge
+    local n_leads, cnt_lead = 0, 0
+    local seen = {}
+    for _, it in ipairs(gen) do
+        if is_finite_number(it.score) and it.lead then
+            if not seen[it.lead] then
+                seen[it.lead] = true
+                n_leads = n_leads + 1
+            end
+            if it.lead == lead then cnt_lead = cnt_lead + 1 end
+            if top_lead and it.lead ~= top_lead and it.score > other then
+                other = it.score
+            end
+        end
+    end
+    local d = (top and other > -math.huge) and (top.score - other) or 30.0
+    if d > 40 then d = 40 end
+    local mtxt = ""
+    for _, it in ipairs(gen) do
+        if it.lead == lead and it.text then mtxt = it.text break end
+    end
+    local sent_len = nchars(mtxt)
+    local lead_len = nchars(lead)
+    -- 歧义结构（n_single / n_same_span 按池内候选算）
+    local n_single, n_same_span = 0, 0
+    for _, c in ipairs(win.ordered) do
+        if nchars(c.text) == 1 then n_single = n_single + 1 end
+        local _, ce = cand_span(c)
+        if ce ~= nil and win.seg_start and ce == win.seg_start + le then
+            n_same_span = n_same_span + 1
+        end
+    end
+    -- CE 分量
+    local e1 = (ce3map and ce3map[lead]) or {}
+    local ce1v = is_finite_number(e1[1]) and e1[1] or -1.0
+    local ce2v = is_finite_number(e1[2]) and e1[2] or -1.0
+    local ce3v = is_finite_number(e1[3]) and e1[3] or -1.0
+    local ntok = lead_nt
+    local r2t = r2 and r2.t or nil
+    local r2e = r2t and ce3map and ce3map[r2t] or nil
+    local r2_ce1 = (r2e and is_finite_number(r2e[1])) and r2e[1] or -1.0
+    local r2_nt = r2 and r2.nt or 0
+    local r2_chars = r2t and nchars(r2t) or 0
+    -- wm = CE-only 融合 margin（训练口径：融合 = −ce 加权和，冷账本）
+    local wm = r2 and (r2.ce - lead_ce) or 0.0
+    local pp = math.min(math.max(p, 1e-6), 1 - 1e-6)
+    -- 字频（模型文件自带表；缺字默认 −13 = 研究侧同一默认）
+    local cf_min, cf_sum = nil, 0.0
+    for ch in string.gmatch(lead, "[%z\1-\127\194-\244][\128-\191]*") do
+        local v = (m.freq and m.freq[ch]) or -13.0
+        cf_sum = cf_sum + v
+        if not cf_min or v < cf_min then cf_min = v end
+    end
+    local x = {
+        p,                                          -- 1
+        math.log(pp / math.max(1 - p, 1e-6)),       -- 2 logit_p
+        d,                                          -- 3
+        math.min(-((top and top.score) or 0), 60.0), -- 4 top_score
+        n_leads,                                    -- 5
+        cnt_lead,                                   -- 6
+        #gen,                                       -- 7
+        sent_len,                                   -- 8
+        lead_len,                                   -- 9
+        sent_len - lead_len,                        -- 10 srem
+        le,                                         -- 11 lead_end
+        lead_len / math.max(le, 1),                 -- 12 lead_chars_cov
+        wm,                                         -- 13
+        #ord,                                       -- 14 n_window（有 CE 的）
+        #win.ordered,                               -- 15 n_pool
+        n,                                          -- 16 code_len
+        ctx_chars or 0,                             -- 17
+        ce1v, ce2v, ce3v,                           -- 18-20
+        lead_ce,                                    -- 21 ce_w
+        ntok,                                       -- 22
+        lead_len / math.max(ntok, 1),               -- 23 chars_per_tok
+        lead_ce / math.max(ntok, 1),                -- 24 ce_per_tok
+        lead_ce / math.max(lead_len, 1),            -- 25 ce_per_char
+        ntok > 1 and 1.0 or 0.0,                    -- 26 multi_tok
+        r2_ce1,                                     -- 27
+        (r2 and r2.ce) or 0.0,                      -- 28 ce_w_r2
+        r2_nt,                                      -- 29
+        ((r2 and r2.ce) or 0.0) / math.max(r2_nt, 1), -- 30 ce_per_tok_r2
+        r2_nt - ntok,                               -- 31 ntok_gap
+        ce1v / math.max(lead_len, 1),                -- 32 ce1_per_char
+        r2_chars,                                   -- 33
+        r2_chars == 1 and 1.0 or 0.0,               -- 34 r2_single
+        r2 and (r2_ce1 - ce1v) or 0.0,              -- 35 ce1_gap
+        n_single,                                   -- 36
+        n_same_span,                                -- 37
+        lead_len == 1 and 1.0 or 0.0,               -- 38 lead_single
+        n_single / math.max(#win.ordered, 1),       -- 39 single_ratio
+        cf_min or -13.0,                            -- 40 char_freq
+        cf_sum / math.max(lead_len, 1),             -- 41 char_freq_mean
+    }
+    return pg_predict(m, x), x
+end
+_G.llm_prefix_score = pg_score
+_G.llm_prefix_model_ready = function() return pg_model() ~= nil end
 
 -- === Filter ===
 return function(translation, env)
@@ -1400,6 +1731,7 @@ return function(translation, env)
         --      sdelta（有符号；旧 pf 字段仍为负分幅度，兼容旧查看器）。
         -- 失败哨兵分 (≤-1e9) 排尾部不参与; 同分稳定保序 (融合序)。
         local fused_scores = nil
+        local ce3map = nil
         -- freq_only（无上文）：scores 为 nil，融合只剩词频/词码对项——
         -- 下方 else 分支按 s1_of 计算，min_valid 为 nil（加 0）。
         if #ordered > 1 and (scores or freq_only) then
@@ -1407,7 +1739,7 @@ return function(translation, env)
             -- CE 三分量（2026-11-11 协议 v2）：text → {c1,c2,c3} 原始分量
             --（未乘权重）。异步基建（2026-11-22）：快照路径从 snap 读（避免
             -- 与评分线程的"最近一次评分"竞争）；旧 DLL 同步路径走 getter
-            local ce3map = nil
+            ce3map = nil
             if snap then
                 ce3map = snap.ce3
             elseif llm.get_ce3 then
@@ -1515,7 +1847,12 @@ return function(translation, env)
         if sent_on and _G.llm_prefix_confirm and gen and fused_scores
                 and #ordered >= 1 then
             local lead, prob, endp =
-                prefix_gate(gen, ordered[1], seg_start, seg_end)
+                prefix_gate(gen, ordered[1], seg_start, seg_end, nil,
+                            ce3map,
+                            nchars((context or "") .. (prefix_text or "")),
+                            { ordered = ordered, code = input,
+                              seg_start = seg_start,
+                              gshow = gen[1] and gen[1].text })
             if lead then
                 _G.llm_pending_confirm = {
                     input = input, text = lead, endp = endp,
