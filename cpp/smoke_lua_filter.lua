@@ -14,6 +14,10 @@ _G.llm_context_get = function()
 end
 -- user_freq_eff / user_unigram_term / user_freq_tick 不设（冷启动路径）
 
+-- 2026-11-25：max_candidates / code_pattern 可在脚本中切换
+-- （5 = 既有路径；6 = 覆盖档位配额；输入闸用例需要 '.{2,}' 放行长码）
+local CFGMAX = 5
+local CPAT = ".{4}"
 local cfgmock = {
   get_bool = function(_, k)
     if k == "llm_rerank/enabled" then return true end
@@ -21,10 +25,11 @@ local cfgmock = {
     return nil
   end,
   get_int = function(_, k)
-    if k == "llm_rerank/max_candidates" then return 5 end
+    if k == "llm_rerank/max_candidates" then return CFGMAX end
     return nil
   end,
   get_string = function(_, k)
+    if k == "llm_rerank/code_pattern" then return CPAT end
     if k == "llm_rerank/model_path" then
       return "d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf"
     end
@@ -101,6 +106,41 @@ myc = { "一次", "一处", "依次", "一二次", "英超处", "衣傲处" }
 OUT = {}
 filter(translation, env)
 print("[smoke] 6-cand tail path, yields:", #OUT)
+
+-- 2026-11-25 覆盖档位配额：max_candidates=6、码 ≤16 → 窗内 1 字 / 2+ 字各 ≥2
+CFGMAX = 6
+env.engine.context.input = "iock"
+myc = { "一次", "一处", "依次", "一次二次", "英超处", "衣傲处",
+        "一", "次", "处" }
+OUT = {}
+filter(translation, env)
+local n1, n2 = 0, 0
+for i = 1, math.min(#OUT, 6) do
+  local n = utf8.len(OUT[i].text) or #OUT[i].text
+  if n == 1 then n1 = n1 + 1 else n2 = n2 + 1 end
+end
+assert(n1 >= 2 and n2 >= 2, "quota window mix: 1字=" .. n1 .. " 2+字=" .. n2)
+print(string.format("[smoke] 配额窗 1字=%d 2+字=%d", n1, n2))
+
+-- 2026-11-25 输入闸：>30 码 / 连续重复 ≥8 → 不重排（W 行 skip 原因）
+CPAT = ".{2,}"
+local WR = {}
+_G.llm_write_w = function(id, src, code, ctx, eng, win, fin, tick, status, skip)
+  WR[#WR + 1] = { code = code, status = status, skip = skip }
+end
+env.engine.context.input = string.rep("a", 31)
+myc = { "一次", "一处" }
+OUT = {}
+filter(translation, env)
+assert(WR[#WR] and WR[#WR].skip == "code_too_long", "code_too_long gate")
+assert(#OUT == 2, "gate pass-through")
+print("[smoke] 输入闸 code_too_long OK")
+
+env.engine.context.input = "jjjjjjjjj"
+OUT = {}
+filter(translation, env)
+assert(WR[#WR] and WR[#WR].skip == "code_repeat", "code_repeat gate")
+print("[smoke] 输入闸 code_repeat OK")
 
 -- 等管道送达后退出（查看器侧异步收行）
 local tw2 = os.clock()

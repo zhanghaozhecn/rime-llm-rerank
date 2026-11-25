@@ -1399,19 +1399,38 @@ return function(translation, env)
     local seg_start, seg_end = resolve_segment(env, input)
     local code = input:sub(seg_start + 1, seg_end)
     local all = {}
+    -- 输入闸（2026-11-25，学万象 limit_repeated）：单段码 >30 字母或连续
+    -- 重复 ≥8 一律不重排。长码的逐键开销随码长超线性增长（实测 41 字母
+    -- 整串 80ms，与万象剖析 P99 36ms 同级），而 LLM 收益集中在短码；
+    -- 超限直接按引擎原序透传（不收集到 64、不推理）。
+    local gate_skip = nil
+    if #code > 30 then
+        gate_skip = "code_too_long"
+    else
+        local run = 1
+        for i = 2, #code do
+            if code:sub(i, i) == code:sub(i - 1, i - 1) then
+                run = run + 1
+                if run >= 8 then gate_skip = "code_repeat"; break end
+            else
+                run = 1
+            end
+        end
+    end
     -- 限量收集（2026-11-22 卡死修复）：旧 while 全量收集强制引擎一次性
     -- 完整翻译所有候选——朙月大词库的候选爆炸主要来自连续声母简拼
     -- （全拼串的 completion 有限，简拼串海量），单码秒级 CPU
     -- （enabled=false 对照实测 40 倍差）→ 每键卡死。截断后引擎惰性
     -- 停在当前位置。break 即不再拉取，exhausted 不触发。
-    -- 双重限制（源码版同构）：16 上限 + 30ms 时间预算（个数闸管收多少、
-    -- 预算闸管贵不贵）。上限取 16（2026-11-23 wiki 全拼实测：真实引擎候选
-    -- 序中正确候选位置 p95=2 / p99=7 / p99.9=20，16 覆盖 99.82% 词型、
-    -- 99.92% 词频加权；32 的边际覆盖仅 +0.16pp，性价比不足）。
+    -- 双重限制（源码版同构）：上限 + 30ms 时间预算（个数闸管收多少、
+    -- 预算闸管贵不贵）。2026-11-25 上限 16 → 64（覆盖档位配额需要更深的
+    -- 候选池；实测同一码拉 1 条与 64 条耗时相同——开销在译文构造，不在
+    -- 逐个取候选）。闸门命中的码只收 16 条（反正不重排）。
+    local kmax = gate_skip and 16 or 64
     local collect_start = os.clock()
     for cand in translation:iter() do
         table.insert(all, cand)
-        if #all >= 16 then break end
+        if #all >= kmax then break end
         if (os.clock() - collect_start) > 0.03 then break end
     end
     local ctx_text, ctx_src = "", "rime"
@@ -1443,6 +1462,17 @@ return function(translation, env)
     local rec = enabled and pattern_ok
     local wid = rec and _G.llm_new_event("W", tick) or nil
     local engine_top = texts_of(all, 10)
+    -- 输入闸命中：不组句、不评分、不确认，按引擎原序透传（只留 skip 记录）。
+    if gate_skip then
+        if wid then
+            _G.llm_write_w(wid, ctx_src, code, context, engine_top, {}, {},
+                           tick, "skip", gate_skip, false, "")
+        end
+        live("S|" .. os.date("%H:%M:%S") .. "|" .. gate_skip .. "|" ..
+             live_esc(code) .. "|" .. live_esc(ctx_src))
+        for _, c in ipairs(all) do yield(c) end
+        return
+    end
     -- ═══ N-gram 组句候选前置注入（2026-11-23 第②段；2026-11-24 phrase-only）═══
     -- 生成 top-20 整句候选放在候选流最前（同文本去重），后面层1/准入/评分/
     -- 前缀判定沿用既有逻辑：它们 span == 活动段 → FM。组句**不参与 CE**
@@ -1608,11 +1638,26 @@ return function(translation, env)
         if fm_set then return fm_set[c] == true end
         return false
     end
-    -- 统一准入（2026-11-24 用户定案，取代 2026-11-22「满覆盖优先占满窗」）：
-    -- 层1 词频在**等长词 + 子词**里统一取前 max_candidates 进评分窗，窗内全部
-    -- 真算 CE——与字词模式完全一致。等长 ≠ 概率高，等长词不再结构性在前。
-    -- 组句不参与准入（不占席、不评分），显示端只置顶 ngram 序第 1。
-    -- 子词复用分通道（pm_texts / reuse）随之退役：子词已进窗拿真分。
+    -- 覆盖档位配额（2026-11-25 用户定案）：收集池按候选**词长**分两档
+    -- （1 字 / ≥2 字），每档先各留 2 条进评分窗，余量再按层1 序填满。
+    -- 依据（luna 混合窗 399 窗、万象词典、3-token CE、窗 6）：CE 错
+    -- 48.9%→37.1%、有正确 60.2%→72.7%；三档（再分 3 字+）零增益 → 只分
+    -- 两档。码长 >16 不做配额（该档覆盖已 97%，瓶颈在 CE 判别力）。
+    local quota = 0
+    if #code <= 16 and cfg.max_candidates >= 6 then quota = 2 end
+    if quota > 0 then
+        local g1, g2 = 0, 0
+        for _, e in ipairs(layer1) do
+            if not (genset and genset[e.c.text]) then
+                local n = utf8.len(e.c.text) or #e.c.text
+                if n == 1 and g1 < quota then
+                    add_win(e); g1 = g1 + 1
+                elseif n >= 2 and g2 < quota then
+                    add_win(e); g2 = g2 + 1
+                end
+            end
+        end
+    end
     for _, e in ipairs(layer1) do
         if not (genset and genset[e.c.text]) then add_win(e) end
     end
