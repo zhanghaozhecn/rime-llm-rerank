@@ -307,14 +307,14 @@ function Write-Schema([string]$path, $lines) { [IO.File]::WriteAllLines($path, $
 $PARAM_DEFAULTS = [ordered]@{
   enabled = $false
   code_pattern = '.{4}'   # 仅 4 码；4 码以上 .{4,} / 3-4 码 .{3,4} / 指定字母 [abcde]{4}
-  max_tokens = 20; max_candidates = 6; cpu_cores = 4
+  max_tokens = 20; ce_budget = 12; cpu_cores = 4
   # ↑ 2026-11-19 随生产模型切 Qwen3-0.6B base 同步定案（研究 ctx\*=20、0.6B k\*=6：
   #   候选段 100ms / 最优 3.65%；旧 10/5 为 0.5B 时代值）
   sentence_mode = $false; debug_fusion = $false
   ngram_group = $false   # 2026-11-23 第②段：N-gram 组句候选（2026-11-24 起含
                          # 前缀自动确认；勾选框在「触发条件」组）
 }
-$PARAM_INT_KEYS  = @("max_tokens","max_candidates","cpu_cores")
+$PARAM_INT_KEYS  = @("max_tokens","ce_budget","cpu_cores")
 $PARAM_DBL_KEYS  = @()
 $PARAM_BOOL_KEYS = @("sentence_mode","debug_fusion","ngram_group")
 # 字符串型参数（不做数值解析，原样写回；空串合法 = 总是匹配）
@@ -372,7 +372,7 @@ function Update-LlmSection([string]$schemaPath, [hashtable]$p, [string]$modelPat
     "  enabled: $(if ($p.enabled) { 'true' } else { 'false' })",
     "  code_pattern: $(Convert-ToYamlScalar $p.code_pattern)",
     "  max_tokens: $($p.max_tokens)",
-    "  max_candidates: $($p.max_candidates)",
+    "  ce_budget: $($p.ce_budget)",
     "  cpu_cores: $($p.cpu_cores)",
     "  sentence_mode: $(if ($p.sentence_mode) { 'true' } else { 'false' })",
     "  ngram_group: $(if ($p.sentence_mode -and $p.ngram_group) { 'true' } else { 'false' })",
@@ -393,6 +393,12 @@ function Merge-LlmParams($prior) {
   $d = @{}
   foreach ($k in $PARAM_DEFAULTS.Keys) { $d[$k] = $PARAM_DEFAULTS[$k] }
   if ($prior) {
+    # 2026-11-26：旧键 max_candidates → CE 预算（预算 = 2×候选数）；
+    # 新键 ce_budget 优先（存在时不映射旧键）
+    if (-not $prior.ContainsKey("ce_budget") -and $prior.ContainsKey("max_candidates")) {
+      $n0 = 0
+      if ([int]::TryParse($prior["max_candidates"], [ref]$n0)) { $d["ce_budget"] = 2 * $n0 }
+    }
     foreach ($k in $PARAM_INT_KEYS) {
       if ($prior.ContainsKey($k)) {
         $n = 0
@@ -432,7 +438,7 @@ function Get-LlmCfgLines([string]$modelPath, $prior, [bool]$enabled = $true) {
     "  enabled: $(if ($enabled) { 'true' } else { 'false' })",
     "  code_pattern: $(Convert-ToYamlScalar $d.code_pattern)",
     "  max_tokens: $($d.max_tokens)",
-    "  max_candidates: $($d.max_candidates)",
+    "  ce_budget: $($d.ce_budget)",
     "  cpu_cores: $($d.cpu_cores)",
     "  sentence_mode: $(if ($d.sentence_mode) { 'true' } else { 'false' })",
     "  ngram_group: $(if ($d.sentence_mode -and $d.ngram_group) { 'true' } else { 'false' })",
@@ -885,6 +891,14 @@ $BENCH_LOG = Join-Path $env:TEMP "rime_llm_bench_stdout.txt"
 if ($BenchTrials -le 0) { $BenchTrials = $BenchTrialsDef }   # GUI / CLI 共用的每档次数
 
 # 候选数：界面/CLI 值缺省或非法时回退 6，上限与 bench_threads 一致（32）。
+function Budget-ToCands([string]$s) {
+  $n = 0
+  if ([int]::TryParse($s, [ref]$n) -and $n -gt 0) {
+    return [int][math]::Max(1, [math]::Floor($n / 2))
+  }
+  return $BenchCandsDef
+}
+
 function Get-BenchCands([string]$raw) {
   $n = 0
   if ([int]::TryParse(("$raw").Trim(), [ref]$n) -and $n -ge 1) {
@@ -1119,7 +1133,7 @@ function Run-InstallerGui {
   $tipModel = "GGUF 模型文件路径（留空 = 用户文件夹里的默认名）。`n下拉列出用户文件夹与本机 gguf_models 下的模型；`n换模型保存后会自动卸载并重载。"
   $tipCodePat = "触发条件：编码串全串正则匹配，只有匹配上的编码才交给 LLM 重排`n（写法与 Rime speller/auto_select_pattern 一致）。`n默认 .{4} = 恰 4 码。例：`n　.{4,} 4 码以上　　.{3,4} 3~4 码`n　[abcde]{4} 指定首码　　空 = 不限制`n含 \ 的写法要用单引号，如 '\d{4}'。`n整句模式开启时本项固定为 .{2,}（输入框锁定）。"
   $tipMaxTok = "上文长度上限：取光标前多少个 token 作为重排依据（默认 20）。`n越大越准，但每次都更慢。"
-  $tipMaxCand = "每次按键参与 LLM 打分的候选数上限（默认 6）。`n一般不用改——调大更准但更慢。"
+  $tipMaxCand = "每次按键参与 LLM 打分的 CE2+CE3 总 token 预算（默认 12）。`n1-token 候选免费；调大更准但更慢。12 = 旧「6 候选」的等价成本。"
   $tipCores = "推理用的 CPU 线程数（默认 4）。不要超过本机物理核；`n点右边的『实测线程数』可实测本机 4~8 线程的最优值。"
   $tipBench = "线程数实测：加载本机模型实测 4~8 线程的推理延迟，给出推荐值`n（t_cand = 当前「候选数」个 3-token 候选的候选段延迟，预填充不计；`n取最优 × 1.05 以内最快的线程数，且不超过物理核）。`n本机不足 5 线程时不做实测，直接取最大线程数。`n约 30 秒；实测期间请勿打字（后台负载会让延迟失真）。"
   $tipTcs = "整句模式 sentence_mode（默认关闭）。`n开启后：只有覆盖整个活动段（音节数与编码一致）的候选进`nLLM 评分窗——全拼/简拼整句的满覆盖候选优先，部分编码对应的`n候选保持引擎序排后；两码一字方案（双拼/五笔/郑码）下与旧`n「词长==⌊码长/2⌋」效果一致。`n开启后编码匹配固定为 .{2,}（2 码起参与重排，输入框锁定）。`n取代 two_code_sentence 两码整句（2026-11-22）。"
@@ -1347,7 +1361,7 @@ function Run-InstallerGui {
 
   # ── 推理规模 + 候选排序融合（一行）：标签列用同一个实测宽度 ──
   $lwP = 0
-  foreach ($t in @("上文 token 上限:", "参与打分的候选数:", "CPU 线程数:")) {
+  foreach ($t in @("上文 token 上限:", "CE 预算:", "CPU 线程数:")) {
     $w = ([System.Windows.Forms.TextRenderer]::MeasureText($t, $form.Font)).Width + 8
     if ($w -gt $lwP) { $lwP = $w }
   }
@@ -1358,7 +1372,7 @@ function Run-InstallerGui {
   $script:tip.SetToolTip($txtMaxTok, $tipMaxTok)
   Add-Help $g3 $tipMaxTok (Help-X $g3) ($rowY - 1) | Out-Null
   $rowY += 32
-  [void](Add-Ctl "Label" "参与打分的候选数:" $g3 14 $rowY ($lwP + 4) 20)
+  [void](Add-Ctl "Label" "CE 预算:" $g3 14 $rowY ($lwP + 4) 20)
   $txtMaxCand = Add-Ctl "TextBox" "" $g3 (14 + $lwP + 10) ($rowY - 3) 64 22
   $script:tip.SetToolTip($txtMaxCand, $tipMaxCand)
   Add-Help $g3 $tipMaxCand (Help-X $g3) ($rowY - 1) | Out-Null
@@ -1417,7 +1431,7 @@ function Run-InstallerGui {
   $paramEdits = @{
     code_pattern = $txtCodePat
     max_tokens = $txtMaxTok
-    max_candidates = $txtMaxCand
+    ce_budget = $txtMaxCand
     cpu_cores = $txtCores
   }
   foreach ($k in $PARAM_STR_KEYS) { $paramEdits[$k].Text = [string]$PARAM_DEFAULTS[$k] }
@@ -1703,9 +1717,9 @@ function Run-InstallerGui {
     }
     Remove-Item $BENCH_TMP -Force -ErrorAction SilentlyContinue
     [void]$script:BenchText.Clear()
-    # 候选数跟界面当前值走（= max_candidates；非法/空回退 6），
+    # 线程实测的候选数由 CE 预算折算（cands = max(1, ⌊预算/2⌋)；12 → 6），
     # 让实测的 t_cand 与用户即将保存的推理规模一致
-    $cands = Get-BenchCands $txtMaxCand.Text
+    $cands = Get-BenchCands ([string](Budget-ToCands $txtMaxCand.Text))
     try {
       $argList = @("--out", "`"$BENCH_TMP`"", "--trials", "$BenchTrials", "--cands", "$cands", "--no-wait", "`"$model`"")
       $script:BenchProc = Start-Process -FilePath $exe -ArgumentList $argList `

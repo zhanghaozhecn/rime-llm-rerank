@@ -96,7 +96,7 @@ llm_rerank:
   min_tokens: 2
   code_pattern: '[abcde]{4}'
   max_tokens: 12
-  max_candidates: 5
+  ce_budget: 5
   cpu_cores: 6
   freq_beta: 2.25
   expected_length_weight: 0.35
@@ -355,7 +355,7 @@ public class W {
   Assert ("参数框数 = 4（实测 $($e.Count)：$(($e | ForEach-Object { $_.text }) -join '|')）") ($e.Count -eq 4)
   Assert "code_pattern = .{4}" ((Get-WText $e[0].h) -eq ".{4}")
   Assert "max_tokens = 20" ((Get-WText $e[1].h) -eq "20")
-  Assert "max_candidates = 6" ((Get-WText $e[2].h) -eq "6")
+  Assert "ce_budget = 12" ((Get-WText $e[2].h) -eq "12")
   Assert "cpu_cores = 4" ((Get-WText $e[3].h) -eq "4")
   Assert "「用户词频权重」行已移除（β 退出配置面）" (-not (Has-Text "用户词频权重"))
   Assert "「预期词长权重」行已移除（elw 退役）" (-not (Has-Text "预期词长权重"))
@@ -423,7 +423,7 @@ llm_rerank:
   min_tokens: 2
   code_pattern: '.{3,4}'
   max_tokens: 12
-  max_candidates: 5
+  ce_budget: 5
   cpu_cores: 6
   freq_beta: 2.25
   expected_length_weight: 0.35
@@ -542,7 +542,7 @@ engine:
   $h2 = (Get-FileHash $test -Algorithm MD5).Hash
   Assert "文件逐字节一致" ($h1 -eq $h2)
 
-  Write-Host "== G6: 非法输入 max_candidates=abc → 拒绝保存 =="
+  Write-Host "== G6: 非法输入 ce_budget=abc → 拒绝保存 =="
   Set-Edit $e[2] "abc"
   Click-Btn (Find-Button "保存并生效")
   Assert "状态含 不是有效整数" (Any-Text "不是有效整数")
