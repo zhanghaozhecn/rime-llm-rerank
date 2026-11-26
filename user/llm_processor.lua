@@ -334,7 +334,11 @@ local function stats_ensure_schema()
     stats_load(sid)
 end
 
-local function stats_bump(word, code)
+-- tick 省略 = 自动 +1（单词条提交）；显式传入 = 提交级 tick（2026-11-26
+-- 整句词频归因：一次 commit 事件只推一个 tick，N 个词共享同值——tick 是
+-- 衰减年龄基准，若每词 +1 会让一次 N 词长句把全局时间轴推快 N 倍，全体
+-- 历史词条等效加速衰老）
+local function stats_bump(word, code, tick)
     if not has_non_ascii(word) then return end
     -- 纯标点提交不入账（2026-11-20 用户定案：带标点行从账本删除）——
     -- 标点永不进重排窗口，dee 纯浪费且常用标点（，。）持续 bump 永不达
@@ -342,7 +346,10 @@ local function stats_bump(word, code)
     -- 退款弹栈照常（无账目 → 不退）。含中文词条不受影响。
     if not has_cjk(word) then return end
     stats_ensure_schema()
-    _G.user_freq_tick = (_G.user_freq_tick or 0) + 1
+    if tick == nil then
+        _G.user_freq_tick = (_G.user_freq_tick or 0) + 1
+        tick = _G.user_freq_tick
+    end
     local k = freq_key(word, code)
     local e = _G.user_stats[k]
     if not e then
@@ -353,11 +360,10 @@ local function stats_bump(word, code)
     -- 近处）——formula_d 递推确定性，恢复前像即精确退款；栈只在内存，
     -- 跨重启为空则不退（回退现行为）。
     e.hist = e.hist or {}
-    e.hist[#e.hist + 1] = { tick = _G.user_freq_tick, d = e.d,
-                            t = e.t, c = e.c or 0 }
+    e.hist[#e.hist + 1] = { tick = tick, d = e.d, t = e.t, c = e.c or 0 }
     if #e.hist > 4 then table.remove(e.hist, 1) end
-    e.d = 1 + e.d * math.exp((e.t - _G.user_freq_tick) / FREQ_TAU)
-    e.t = _G.user_freq_tick
+    e.d = 1 + e.d * math.exp((e.t - tick) / FREQ_TAU)
+    e.t = tick
     if has_cjk(word) then e.c = (e.c or 0) + 1 end
     stats_dirty = stats_dirty + 1
     if stats_dirty >= FREQ_FLUSH then
@@ -385,16 +391,115 @@ end
 
 -- [回撤退款] 提交栈（cap 8）: 与语料 strict 弹栈口径对齐——backspace/
 -- delete/undo 每条 M 弹 1 条提交并退款；navigation/enter/scene 边界清栈。
-local function commit_stack_push(word, code, tick, cid)
+-- words 非空 = 词级归因的组记录（2026-11-26）：一次提交 N 个词条目，
+-- 一条 M 整组退款（弹栈粒度仍是「一次提交」）；word/code 为组内首词，
+-- 仅作退款失败时的显示兜底。
+local function commit_stack_push(word, code, tick, cid, words)
     _G.llm_commit_stack = _G.llm_commit_stack or {}
     _G.llm_commit_stack[#_G.llm_commit_stack + 1] =
-        { word = word, code = code, tick = tick, cid = cid }
+        { word = word, code = code, tick = tick, cid = cid, words = words }
     if #_G.llm_commit_stack > 8 then
         table.remove(_G.llm_commit_stack, 1)
     end
 end
 local function commit_stack_clear()
     _G.llm_commit_stack = {}
+end
+
+-- ═══ 整句词频归因（2026-11-26）═══
+-- 整句模式一次 commit 上屏的是整个句子，把整句记成词条 = 键永不复现（实测
+-- luna_pinyin 账本 8.4% 条目 ≥6 字、多段提交键错配为「整句文本⊕尾段码」）。
+-- 改为：commit 时按「组合区已确认段」逐词归因——普通段/确认词 = 单词条，
+-- 组句段 = 组句词路径（llm_filter 登记的 _G.llm_gen_paths）按段码切片。
+-- A/B：_G.llm_sentence_attr=false 或 RIME_LLM_SENTENCE_ATTR=0 关闭（回退
+-- 旧行为：整句键入账）。
+local function attr_enabled()
+    if _G.llm_sentence_attr == false then return false end
+    local e = os.getenv("RIME_LLM_SENTENCE_ATTR")
+    return not (e and e == "0")
+end
+
+local function attr_seg_has_cjk(s)
+    for _, cp in utf8.codes(s) do
+        if cp >= 0x4E00 and cp <= 0x9FFF then return true end
+    end
+    return false
+end
+
+-- 校验 + 归因。strip = commit_notifier 快照（各已确认段 {text, code}）。
+-- 全过才返回 {words={{w=,code=}…}, full_code=, path=}，否则 nil（消费端
+-- 回退旧行为——宁可不归因不错记）。校验：
+--   ① Σ段文本 == 提交文本（字节级）；
+--   ② 含中文段的段码为纯小写字母（标点/英文段跳过不记账）；
+--   ③ full_code 与通知器捕获码一致或其后缀（捕获码非空且纯字母时）；
+--   ④ 组句段词路径覆盖校验（偏移严格递增、末端 == 段码长）。
+local function build_attribution(w, strip, live_code)
+    if type(strip) ~= "table" or #strip == 0 then return nil end
+    local parts, full_code = {}, ""
+    for _, seg in ipairs(strip) do
+        parts[#parts + 1] = seg.text
+        if attr_seg_has_cjk(seg.text) then
+            if type(seg.code) ~= "string"
+                    or seg.code:match("^[a-z]+$") == nil then
+                return nil
+            end
+            full_code = full_code .. seg.code
+        end
+    end
+    if table.concat(parts) ~= w then return nil end
+    if full_code == "" then return nil end
+    if type(live_code) == "string" and live_code ~= ""
+            and live_code:match("^[a-z]+$")
+            and full_code ~= live_code
+            and full_code:sub(-#live_code) ~= live_code then
+        return nil
+    end
+    local words = {}
+    for _, seg in ipairs(strip) do
+        if attr_seg_has_cjk(seg.text) then
+            local path = nil
+            local ring = _G.llm_gen_paths
+            if ring then
+                for i = #ring, 1, -1 do
+                    if ring[i].text == seg.text and ring[i].code == seg.code
+                            and type(ring[i].words) == "table"
+                            and #ring[i].words > 0 then
+                        path = ring[i].words
+                        break
+                    end
+                end
+            end
+            if path then
+                local prev, okp, sliced = 0, true, {}
+                for _, wd in ipairs(path) do
+                    if type(wd.e) ~= "number" or type(wd.w) ~= "string"
+                            or wd.e <= prev or wd.e > #seg.code then
+                        okp = false
+                        break
+                    end
+                    sliced[#sliced + 1] = { w = wd.w,
+                                            code = seg.code:sub(prev + 1, wd.e) }
+                    prev = wd.e
+                end
+                if okp and prev == #seg.code then
+                    for _, p in ipairs(sliced) do
+                        if attr_seg_has_cjk(p.w) then
+                            words[#words + 1] = p
+                        end
+                    end
+                else
+                    words[#words + 1] = { w = seg.text, code = seg.code }
+                end
+            else
+                words[#words + 1] = { w = seg.text, code = seg.code }
+            end
+        end
+    end
+    if #words == 0 then return nil end
+    local pf = {}
+    for _, p in ipairs(words) do pf[#pf + 1] = p.w .. ":" .. p.code end
+    return { words = words, full_code = full_code,
+             path = table.concat(pf, "/") }
 end
 
 -- 衰减有效计数 (llm_filter 融合用): rime formula_d 查询式 (词码对)
@@ -417,7 +522,7 @@ _G.user_unigram_term = function(x, code)
     return math.log(((e and e.c or 0) + 1))
 end
 
--- 累计 unigram 原始计数（llm_filter 调试行"累计频"列 / pairfix fade 门用）
+-- 累计 unigram 原始计数（llm_filter 调试行"累计频"列 / CE 偏置 fade 门用）
 _G.user_uni_count = function(x, code)
     stats_ensure_schema()
     local e = _G.user_stats[freq_key(x, code)]
@@ -515,11 +620,53 @@ local function processor(key, env)
     if not env._commit_hook then
         env._commit_hook = true
         _G.llm_commit_inputs = _G.llm_commit_inputs or {}
+        _G.llm_attr_strips = _G.llm_attr_strips or {}
         pcall(function()
             env.engine.context.commit_notifier:connect(function(c)
                 table.insert(_G.llm_commit_inputs, c.input or "")
                 if #_G.llm_commit_inputs > 16 then
                     table.remove(_G.llm_commit_inputs, 1)
+                end
+                -- [整句词频归因]（2026-11-26）：commit 在 composition 清空
+                -- (Clear) 前触发——此刻逐已确认段取（选中文本, 段码切片）
+                -- 快照，与 commit_inputs 1:1 进队。读不到（librime-lua 过旧/
+                -- 时序异常）压 false 占位，消费端回退旧行为——宁可不错记。
+                local strip = false
+                pcall(function()
+                    local comp = c.composition
+                    if not comp or type(comp.toSegmentation) ~= "function"
+                            then return end
+                    local ok2, segs = pcall(function()
+                        return comp:toSegmentation():to_table()
+                    end)
+                    if not ok2 or type(segs) ~= "table" then return end
+                    local input = c.input or ""
+                    local list = {}
+                    for _, seg in ipairs(segs) do
+                        local st = seg.status
+                        if st == "kSelected" or st == "kConfirmed" then
+                            local ok3, cand = pcall(function()
+                                return seg:get_selected_candidate()
+                            end)
+                            if ok3 and cand and cand.text
+                                    and cand.text ~= "" then
+                                local scode = ""
+                                if type(seg.start) == "number"
+                                        and type(seg._end) == "number"
+                                        and seg._end > seg.start
+                                        and seg._end <= #input then
+                                    scode = input:sub(seg.start + 1, seg._end)
+                                end
+                                list[#list + 1] = { text = cand.text,
+                                                    code = scode }
+                            end
+                        end
+                    end
+                    if #list > 0 then strip = list end
+                end)
+                table.insert(_G.llm_attr_strips, strip)
+                if #_G.llm_attr_strips > 16 then
+                    table.remove(_G.llm_attr_strips, 1)
                 end
                 -- 异步基建（2026-11-22）：提交后上文变化，中断在跑的评分
                 -- （DLL 代次递增 + 清任务槽，score_batch Step 边界生效）；
@@ -675,13 +822,25 @@ local function processor(key, env)
             _G.llm_commit_stack = _G.llm_commit_stack or {}
             if #_G.llm_commit_stack > 0 then
                 local last = table.remove(_G.llm_commit_stack)
-                local okr = _G.stats_refund
-                    and _G.stats_refund(last.word, last.code, last.tick)
+                -- 词级归因组记录（2026-11-26）：一次提交 N 个词条目整组退款
+                local okr = false
+                if last.words and #last.words > 0 then
+                    for _, aw in ipairs(last.words) do
+                        if _G.stats_refund
+                                and _G.stats_refund(aw.w, aw.code, last.tick) then
+                            okr = true
+                        end
+                    end
+                else
+                    okr = _G.stats_refund
+                        and _G.stats_refund(last.word, last.code, last.tick)
+                end
                 if dbg_flag then
+                    local n = (last.words and #last.words) or 1
                     live("R|" .. os.date("%H:%M:%S") .. "|回撤退款(" .. kind
                         .. "): " .. (okr and "已退 " or "不退 ")
                         .. tostring(last.word) .. "[" .. tostring(last.code)
-                        .. "]")
+                        .. "] x" .. tostring(n))
                 end
                 if okr and _G.llm_debug_refund then
                     _G.llm_debug_refund(last.cid, last.tick)
@@ -702,6 +861,10 @@ local function processor(key, env)
                                   #_G.llm_commit_inputs)
             for _ = 1, skip do
                 table.remove(_G.llm_commit_inputs, 1)
+                -- 归因条带与 commit_inputs 1:1 对齐，同步丢弃（2026-11-26）
+                if _G.llm_attr_strips and #_G.llm_attr_strips > 0 then
+                    table.remove(_G.llm_attr_strips, 1)
+                end
             end
         end
         commit_base = #ch:to_table()
@@ -759,6 +922,11 @@ local function processor(key, env)
                 if _G.llm_commit_inputs and #_G.llm_commit_inputs > 0 then
                     live_code = table.remove(_G.llm_commit_inputs, 1)
                 end
+                -- 1:1 取本提交的归因条带（已确认段 {text, code} 列表或 false）
+                local strip = nil
+                if _G.llm_attr_strips and #_G.llm_attr_strips > 0 then
+                    strip = table.remove(_G.llm_attr_strips, 1)
+                end
                 local code = ""
                 if has_chinese then
                     -- 优先手动捕获的码，其次满码（顶屏回退），用完即清；
@@ -776,7 +944,42 @@ local function processor(key, env)
                 -- 词频计数: 仅含中文的词 (含英文/数字/标点不参与融合)
                 -- 2026-11-13 词码对记账: bump 键 = (词, 完整提交码)
                 -- 2026-11-17 单账本: dee 与累计计数同一次 bump/落盘
-                if has_chinese then
+                -- [整句词频归因]（2026-11-26）：校验通过 → 词级条目入账
+                -- （组句段按组句词路径切词、普通段/确认词单词条），N 词
+                -- 共享提交级 tick；整句键**不再**入账。C 行仍为整句原样 +
+                -- v8 path 尾字段。校验失败 → 回退旧行为（整句键入账）。
+                local attr = nil
+                if has_chinese and attr_enabled() then
+                    attr = build_attribution(w, strip, live_code)
+                end
+                if attr then
+                    stats_ensure_schema()
+                    _G.user_freq_tick = (_G.user_freq_tick or 0) + 1
+                    local tick_after = _G.user_freq_tick
+                    local cid = _G.llm_write_c
+                                and _G.llm_write_c(w, attr.full_code,
+                                                   tick_after, true, attr.path)
+                                or nil
+                    local grp = {}
+                    for _, aw in ipairs(attr.words) do
+                        local before = _G.user_freq_eff
+                            and _G.user_freq_eff(aw.w, aw.code) or 0
+                        stats_bump(aw.w, aw.code, tick_after)
+                        local after = _G.user_freq_eff
+                            and _G.user_freq_eff(aw.w, aw.code) or 0
+                        grp[#grp + 1] = aw
+                        if dbg_flag then
+                            live(string.format("E|%s|%s|%.3f|%.3f|%d|%d",
+                                os.date("%H:%M:%S"), live_esc(aw.w),
+                                before, after, tick_after - 1, tick_after))
+                            if cid and _G.llm_debug_e then
+                                _G.llm_debug_e(cid, before, after,
+                                               stats_dirty)
+                            end
+                        end
+                    end
+                    commit_stack_push(w, attr.full_code, tick_after, cid, grp)
+                elseif has_chinese then
                     stats_ensure_schema()
                     local before = _G.user_freq_eff and _G.user_freq_eff(w, code) or 0
                     local t_before = _G.user_freq_tick or 0

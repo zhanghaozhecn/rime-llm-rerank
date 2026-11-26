@@ -87,25 +87,26 @@ local FREQ_BETA = 14 -- 对数词频融合系数（2026-11-14 默认模型改
 -- 部分覆盖候选保持引擎序排后。两码一字方案下与旧「词长==⌊码长/2⌋」
 -- 逐位等价（4 码 = 2 音节满覆盖 ⟺ 词长 2）。默认 false。
 
--- 词码对扣分修正（2026-11-21 用户定案解耦：只承载负分 CE 偏差降噪）：
--- 表放用户目录 llm_pairfix.tsv，行 `词<TAB>码<TAB>-分数`
---   （无第三列 = 旧默认扣 5）；`#` 注释；无文件 = 机制休眠；
--- 每次窗口准入/融合轻量重读，编辑即时生效。负分保留 fade（用户该词码对
--- 累计 >= PAIRFIX_FADE_UNI 次 -> 预置让位）。正分行读取端跳过（2026-11-17
--- 的 +200 固定首选/+100 固定次选语义废除——固定候选归拼读双拼
--- pin_candidates.tsv + pin_filter.lua 全局重排，与 LLM 重排解耦）。
+-- CE 偏置（2026-11-26 用户定案改名，原「词码对（扣分）修正」）：
+-- 表放用户目录 `llm_rerank/<方案>/ce_bias.tsv`（属有状态资产；旧名
+-- llm_pairfix.tsv 只读兜底一次），**一个文件装两种键**（同格式、方案级
+-- 共用；一个方案要么整句要么字词，按候选文本长度分流）：
+--   ① 词键 `词<TAB>码<TAB>分数`（无第三列 = 默认 -5）——码 = 该词完整
+--      输入码；只作用于**多字**候选。
+--   ② 字-音节键 `字<TAB>码<TAB>分数`——码 = 单字覆盖的那段码；只作用于
+--      **单字**候选（见下方 ce_share_table：T1 = log P(读音|字)，λ=1）。
+-- **两种键都只承载负分**（2026-11-26 用户定案：不支持正分；正分行读取端
+-- 跳过）。字-音节行取 min(0, log share)——码不带声调时同一 (字,码) 会汇总
+-- 两个音节（如 pdsp `的 da` = de 99% + dí 1%），总和 >1 不该变成加分。
+-- fade：用户该 (词,码) 累计 >= CE_BIAS_FADE_UNI 次 -> 让位（实际行为优先）。
 -- 旧 2026-11-13 pairfix 推导（wiki 拆半/用户域回放）保留在文件头历史注释：
 -- 与@vkh 等污染对按字频抬分；负分只破 CE 险胜的近平局。
-local PAIRFIX_PENALTY_DEFAULT = 5.0
-local PAIRFIX_FADE_UNI = 3
--- 2026-11-21 用户定案：词码对扣分修正与固定候选**解耦**——本表只承载
--- 负分（CE 系统性偏差降噪，只在重排评分窗内生效，受 fade）；正分（固定
--- 候选）行读取端跳过，固定候选归拼读双拼 pin_candidates.tsv +
--- pin_filter.lua（全局生效、优先于重排，0/9/8/7/6 键写入/解除）。
+local CE_BIAS_PENALTY_DEFAULT = 5.0
+local CE_BIAS_FADE_UNI = 3
 
 -- ── LLM 记录子目录（2026-11-21 用户定案）────────────────────────────
 -- 用户文件夹下建 llm_rerank 子目录收纳全部 LLM 数据/日志文件
--- （corpus/debug/账本/词码对）；固定候选 pin_candidates.tsv 属拼读双拼
+-- （corpus/debug/账本/CE 偏置表）；固定候选 pin_candidates.tsv 属拼读双拼
 -- 本机功能，仍留用户文件夹根。resolve 规则：
 --   子目录已有 → 用之；根目录旧文件在 → 建目录后 os.rename 一次性迁移
 --   （目录建不出/改名失败 → 暂读暂写根目录，下次再迁，绝不丢数据）；
@@ -126,10 +127,9 @@ end
 
 -- ── 按方案分文件夹（2026-11-22 用户定案：四件全分）──────────────────
 -- 目录 = <用户文件夹>\llm_rerank\<方案 ID>\，四个文件全部按方案隔离：
---   rime_llm_corpus.tsv / rime_llm_debug.txt / user_ledger.tsv /
---   llm_pairfix.tsv
+--   rime_llm_corpus.tsv / rime_llm_debug.txt / user_ledger.tsv / ce_bias.tsv
 -- 迁移规则（"有状态资产"与"日志"区别对待）：
---   · 账本/词码对 = 有状态资产 → 该方案**首次读写时从旧位置复制一份**
+--   · 账本/CE 偏置表 = 有状态资产 → 该方案**首次读写时从旧位置复制一份**
 --     （旧位置 = llm_rerank\<名> 或 用户文件夹根\<名>），旧文件保留不删；
 --     每个方案各得一份快照，此后独立演进（键 = 词+码，与方案绑定、天然
 --     不相交，历史条目跨方案共存无害）。
@@ -214,10 +214,14 @@ local function llm_resolve(name, for_write, migrate)
     return nil
 end
 
--- 读参考表 → { ["词\t码"] = 有符号分数 }; 无文件返回 nil（机制休眠）
-local function pairfix_table()
-    -- migrate=true：词码对属有状态资产，该方案首次读取时从旧位置复制
-    local path = llm_resolve("llm_pairfix.tsv", false, true)
+-- 读 CE 偏置表 → { ["词\t码"] = 负分 }; 无文件返回 nil（机制休眠）
+-- **只承载负分**（2026-11-26 用户定案：字词两种键都不支持正分；正分行
+-- 读取端跳过）。文件名 ce_bias.tsv；旧名 llm_pairfix.tsv 只读兜底一次。
+local function ce_bias_table()
+    local path = llm_resolve("ce_bias.tsv", false, true)
+    if not path then
+        path = llm_resolve("llm_pairfix.tsv", false, false)   -- 旧名兜底
+    end
     if not path then return nil end
     local f = io.open(path, "r")
     if not f then return nil end
@@ -234,14 +238,12 @@ local function pairfix_table()
                 else
                     delta = tonumber(sv)
                     if delta > 0 then
-                        -- 2026-11-21 解耦：正分（固定候选）行跳过——归
-                        -- pin_candidates.tsv / pin_filter.lua，本表只留负分
-                        w, c = nil, nil
+                        delta = nil   -- 正分行不生效（2026-11-26 用户定案）
                     end
                 end
             else
                 w, c = line:match("^(.-)\t(.-)$")
-                delta = -PAIRFIX_PENALTY_DEFAULT  -- 旧两列格式 = 默认扣 5
+                delta = -CE_BIAS_PENALTY_DEFAULT  -- 旧两列格式 = 默认 -5
             end
             if w and w ~= "" and c and c ~= "" and delta then
                 tbl[w .. "\t" .. c] = delta
@@ -252,16 +254,19 @@ local function pairfix_table()
     return tbl
 end
 
--- 命中返回有符号分数修正；正分（固定首选/次选）不受 fade 限制
-local function pairfix_delta(tbl, text, input)
+-- 命中返回负分；fade 让位（用户该 (词,码) 累计 ≥3 次 → 0）
+local function ce_bias_delta(tbl, text, input)
     if not tbl then return 0 end
+    -- 词键只作用于**多字**候选（2026-11-26 定案：单字走字-音节键；
+    -- 否则 1 音节窗里「全码 == 音节码」会让同一行被两条路各加一次）
+    local tl = utf8 and utf8.len and utf8.len(text) or #text
+    if tl == 1 then return 0 end
     local key = text .. "\t" .. (input or "")
     local d = tbl[key]
-    if not d or d == 0 then return 0 end
-    if d > 0 then return d end
+    if not d or d >= 0 then return 0 end
     local uni = _G.user_uni_count
                     and _G.user_uni_count(text, input) or 0
-    if uni >= PAIRFIX_FADE_UNI then return 0 end
+    if uni >= CE_BIAS_FADE_UNI then return 0 end
     return d
 end
 
@@ -433,22 +438,32 @@ function _G.llm_write_w(id, src, code, ctx, engine, window, final, tick,
     return id
 end
 
-function _G.llm_write_c(word, code, tick, cjk)
+function _G.llm_write_c(word, code, tick, cjk, path)
     local ref, re, rw, rf = "", -1, -1, -1
     local wl = _G.llm_last_window
-    if wl and code and code ~= "" and wl.code == code then
-        ref = wl.id or ""
-        re = rec_rank(wl.engine, word)
-        rw = rec_rank(wl.window, word)
-        rf = rec_rank(wl.final, word)
+    if wl and code and code ~= "" and wl.code and wl.code ~= "" then
+        -- ref 匹配（2026-11-26 词级归因）：窗码是提交码的**后缀**也算命中
+        -- （整句归因的 C 行码 = 各段码拼接，尾段窗码是其尾部；单段 == 全等）
+        local same = wl.code == code
+            or (#code >= #wl.code and code:sub(-#wl.code) == wl.code)
+        if same then
+            ref = wl.id or ""
+            re = rec_rank(wl.engine, word)
+            rw = rec_rank(wl.window, word)
+            rf = rec_rank(wl.final, word)
+        end
     end
     _G.llm_last_window = nil
     local id = _G.llm_new_event("C", tick)
-    local line = table.concat({
+    -- v8（2026-11-26 整句词频归因）：C 行尾可选第 12 字段 path =
+    -- 「词:码/词:码/…」（词级归因路径；无归因的行保持旧 11 字段形状）
+    local fields = {
         "C", id, rec_stamp(), ref, rec_esc(word), rec_esc(code or ""),
         tostring(re), tostring(rw), tostring(rf), tostring(tick or 0),
         cjk and "cjk=1" or ""
-    }, "\t")
+    }
+    if path and path ~= "" then fields[#fields + 1] = rec_esc(path) end
+    local line = table.concat(fields, "\t")
     _G.llm_corpus_write(line)
     _G.llm_last_event_id = id
     return id
@@ -530,13 +545,13 @@ local function is_valid_llm_score(v)
 end
 
 -- 挂账回填（2026-11-22 异步基建）：整句模式异步评分结果收割时补写语料。
--- final 序 = 窗内候选按融合分重排（文本域现算：eff/uni/pairfix 为微秒级
+-- final 序 = 窗内候选按融合分重排（文本域现算：eff/uni/CE 偏置 为微秒级
 -- 内存查询；账本 tick 与提交时刻的漂移 ≤1 词提交，v1 接受——回填只写
 -- W ok（flags=async）+ debug P 行，D/L/C 明细行省略）。
 local function write_pending_result(pend, snap)
     local win = pend.l1win or {}
     local scores = snap.scores or {}
-    local pftbl = pairfix_table()
+    local cbtbl = ce_bias_table()
     local min_valid = nil
     for _, t in ipairs(win) do
         local s = scores[t]
@@ -550,10 +565,11 @@ local function write_pending_result(pend, snap)
         local n = _G.user_freq_eff and _G.user_freq_eff(t, pend.code) or 0
         local u1 = _G.user_unigram_term
                 and _G.user_unigram_term(t, pend.code) or 0
-        local delta = pairfix_delta(pftbl, t, pend.code)
+        local delta = ce_bias_delta(cbtbl, t, pend.code)
+        local sd = (pend.share_map and pend.share_map[t]) or 0
         local v
         if is_valid_llm_score(s) then
-            v = s + FREQ_BETA * math.log(1 + n) + u1 + delta
+            v = s + FREQ_BETA * math.log(1 + n) + u1 + delta + sd
         else
             -- 无 CE 分（哨兵/缺失）：层1 分 + 窗内最低 LLM 分（压制窗底，
             -- 与同步版同语义）
@@ -581,7 +597,7 @@ end
 -- 任务槽同构，上文/候选变化自然失效，无需失效链）。命中场景 = 同指纹重复
 -- query（翻页/候选窗重建/收割回填）——同步路径零 LLM。快照结构
 -- {cands, scores, ce3, segs, prep, ctx_used, ev_ms} 与 DLL async_wait/poll
--- 返回一致；融合分（eff/pairfix 叠加）每次命中现算，不缓存融合结果。
+-- 返回一致；融合分（eff/CE 偏置 叠加）每次命中现算，不缓存融合结果。
 -- pending：指纹 → 语料挂账——整句模式异步投递时登记，评分结果收割时补写
 -- W ok/P 行；任务被覆盖/取消则条目随容量清理丢弃（快速连打的中间键不落
 -- 语料 = "只有完成的评分才落 W"的异步语义）。
@@ -847,6 +863,157 @@ local function cand_span(c)
     return s, e
 end
 
+-- ── 音节 → 整读字串（syll_chars.tsv，2026-11-26 用户定案①）──
+-- 表 = `音节<TAB>字字字…`（`eval/tools/gen_syll_chars.py` 按**引擎词库**生成，
+-- 与引擎码空间严格一致）。两件事：
+--   ① **整读判定**（显示序分层）：单字候选 span 那段码命中该音节且含该字 =
+--      **整读**；否则 = 前缀简拼（全拼完成匹配 / 双拼简码 / 纠错）→ 显示序
+--      沉到整读之后。全拼打 `s`/`sh` 这类非音节前缀时表里没有键 → 全部前缀
+--      层 → **不重排**（缩简习惯不受影响）。
+--   ② **双拼「2 码音 + 1~2 码形」偏置键解析**：沿 span 从长到短找「表里确实
+--      含这个字」的前缀，命中即取该前缀（带成员校验；旧实现硬编码 `span
+--      长度 == 3 取前 2`，4 码静默失效，且全拼/双拼不分）。
+-- 表缺失 / `_G.llm_exact_tier == false` / `RIME_LLM_EXACT_TIER=0` → 退回旧
+-- 行为（不分层；偏置按 `span` / 3 码取前 2）。按方案缓存（切方案自动重读）。
+local syll_cache = nil       -- { sid = ..., tbl = { [码] = "字字字" } }
+local function syll_chars_table()
+    if _G.llm_syll_reload then    -- 冒烟/热更新钩子（读一次后自动清）
+        syll_cache = nil
+        _G.llm_syll_reload = nil
+    end
+    if _G.llm_exact_tier == false
+            or os.getenv("RIME_LLM_EXACT_TIER") == "0" then
+        return nil
+    end
+    local sid = _G.llm_schema_id or ""
+    if syll_cache and syll_cache.sid == sid then
+        return syll_cache.tbl
+    end
+    local tbl = nil
+    local dir, root = rerank_dir(), rerank_root()
+    local paths = {}
+    if dir then paths[#paths + 1] = dir .. "\\syll_chars.tsv" end
+    if root then paths[#paths + 1] = root .. "\\syll_chars.tsv" end
+    for _, p in ipairs(paths) do
+        local f = io.open(p, "r")
+        if f then
+            tbl = {}
+            for line in f:lines() do
+                line = line:gsub("\r$", "")
+                if line ~= "" and line:sub(1, 1) ~= "#" then
+                    local k, v = line:match("^(%a+)\t(.+)$")
+                    if k and v then tbl[k] = v end
+                end
+            end
+            f:close()
+            break
+        end
+    end
+    syll_cache = { sid = sid, tbl = tbl }
+    return tbl
+end
+
+-- 单字整读判定 + 偏置键解析。syl = 音节表（nil = 无表，走旧规则）
+-- 返回：exact（span 本身即整读）、key（偏置键；nil = 前缀简拼，不叠偏置）
+local function syll_judge(syl, t, span)
+    local seg = syl[span]
+    if seg and seg:find(t, 1, true) then return true, span end
+    local n = #span
+    for k = n - 1, 2, -1 do          -- 双拼「音 + 形」：取命中的最长前缀
+        local pre = span:sub(1, k)
+        local s2 = syl[pre]
+        if s2 and s2:find(t, 1, true) then return false, pre end
+    end
+    return false, nil                -- 完成匹配 / 纠错：不叠偏置
+end
+
+-- ── 字-音节 CE 偏置行（T1 = log P(读音|字)，λ=1，2026-11-26 用户定案）──
+-- **与 (词,码) 行写在同一张表**：`llm_rerank/<方案>/ce_bias.tsv`
+-- （见上方 ce_bias_table；两种键按候选文本长度分流，互不干扰）。
+-- 码 = 该字的**读音码**（不是输入片段）：有 syll_chars 表时按上节解析——span
+-- 本身即整读 → 用 span；双拼「音 + 形」→ 取命中的最长前缀（2 码）；前缀简拼
+-- / 纠错（span 只是读音的前缀）→ **不叠**（读音不确定，且整读分层已把它压到
+-- 后面，2026-11-26 用户定案②）。无表 = 旧规则（span；3 码取前 2）。
+-- 只对**单字候选 + 已算 CE** 生效。
+-- **只打折不加分**：取 min(0, log share)——码不带声调时同一 (字,码) 会汇总
+-- 两个音节（如 pdsp `的 da` = de 99% + dí 1% = 1.0），总和 >1 不该变成
+-- 加分；生成器同样下钳，读端再钳一次（表里写了正数也不生效）。
+-- 关：`_G.llm_ce_share = false`（A/B 用）。表按方案缓存（切方案自动重读）。
+local ce_share_cache = nil       -- { sid = ..., tbl = { [字\t码] = delta } }
+local function ce_share_table()
+    if _G.llm_ce_share_reload then   -- 冒烟/热更新钩子（读一次后自动清）
+        ce_share_cache = nil
+        _G.llm_ce_share_reload = nil
+    end
+    local sid = _G.llm_schema_id or ""
+    if ce_share_cache and ce_share_cache.sid == sid then
+        return ce_share_cache.tbl
+    end
+    -- 统一表：与 (词,码) 行同文件（ce_bias.tsv；旧名 llm_pairfix.tsv 兜底）
+    local root = rerank_root()
+    local paths = {}
+    local dir = rerank_dir()
+    if dir then paths[#paths + 1] = dir .. "\\ce_bias.tsv" end
+    if root then paths[#paths + 1] = root .. "\\ce_bias.tsv" end
+    if dir then paths[#paths + 1] = dir .. "\\llm_pairfix.tsv" end
+    if root then paths[#paths + 1] = root .. "\\llm_pairfix.tsv" end
+    local tbl = nil
+    for _, p in ipairs(paths) do
+        local f = io.open(p, "r")
+        if f then
+            tbl = {}
+            for line in f:lines() do
+                line = line:gsub("\r$", "")
+                if line ~= "" and line:sub(1, 1) ~= "#" then
+                    local w, c, sv = line:match("^(.-)\t(.-)\t([%+%-]?[%d%.]+)$")
+                    if w and c and sv then
+                        tbl[w .. "\t" .. c] = tonumber(sv)
+                    end
+                end
+            end
+            f:close()
+            break
+        end
+    end
+    ce_share_cache = { sid = sid, tbl = tbl }
+    return tbl
+end
+
+-- 单字候选的读音先验修正（无表/非单字/简码/未命中 → 0）
+local function ce_share_delta(tbl, c, code, seg_start)
+    if not tbl or _G.llm_ce_share == false then return 0 end
+    local t = c and c.text
+    if not t or (utf8 and utf8.len and utf8.len(t) or #t) ~= 1 then return 0 end
+    local s, e = cand_span(c)
+    if not s or not e or e - s < 1 then return 0 end   -- 空 span 跳过
+    -- （全拼 1 字母音节 a/e/o 是完整读音，表里有键；双拼 1 码简码表里
+    --   没有 1 字母键，查不到 → 天然不生效）
+    -- 候选 span 是整个 input 的绝对偏移；code 是活动段切片 → 先减段起点
+    local s0 = s - (seg_start or 0)
+    local e0 = e - (seg_start or 0)
+    if s0 < 0 or e0 > #code or e0 <= s0 then return 0 end
+    local span = code:sub(s0 + 1, e0)
+    if span == "" then return 0 end
+    local key
+    local syl = syll_chars_table()
+    if syl then
+        -- 读音码解析（2026-11-26 用户定案②）：整读 → span；双拼音+形 → 前缀；
+        -- 前缀简拼/纠错 → nil（不叠偏置）
+        local _, k = syll_judge(syl, t, span)
+        key = k
+    else
+        key = span                                   -- 无表：旧规则
+        if not tbl[t .. "\t" .. key] and #span == 3 then
+            key = span:sub(1, 2)                     -- 双拼 3 码 = 2 码 + 形码
+        end
+    end
+    if not key then return 0 end
+    local d = tbl[t .. "\t" .. key]
+    if not d or d > 0 then return 0 end              -- 只打折不加分（见表头注）
+    return d
+end
+
+
 -- ═══ N-gram 组句候选（2026-11-23 整句模式第②段）═══
 -- 组句器在 rime_llm.dll（万象 LTS `.gram` + 万象词库词级 beam，算法与
 -- 研究库 eval/tools/sentence_gen_gram.py 同构；生产参数 beam=32 /
@@ -915,6 +1082,9 @@ local function ngram_make(env, code, context, prefix_text, seg_start, seg_end)
                 lead = it.lead,
                 lead_end = it.lead_end,
                 score = it.score,
+                -- 组句词路径 {w=词, e=段码内字节偏移 end}（2026-11-26 整句
+                -- 词频归因用：commit 时按段码切片逐词入账）
+                words = it.words,
                 cand = ctor("ngram_group", seg_start, seg_end, text, ""),
             }
         end
@@ -999,14 +1169,34 @@ local function prefix_gate(gen, b1, seg_start, seg_end, p_thr, ce3map,
     local sr = st - nchars(lead)
     if st < 1 or sr < 2 then return nil end
     -- 2026-11-26 用户定案：整句显示序恢复「先长后短」后，结构证据不再要求
-    -- 融合序第 1，改为「lead 的同字数档首选」（1 字档 / 多字档）。融合序
-    -- 本身不变（win.ordered 仍是融合序），树模型照旧吃完整窗口特征。
+    -- 融合序第 1，改为「lead 的**同 span 首选**」（2026-11-26 用户定案③，
+    -- 取代「同字数档首选」）：确认只对 lead 覆盖的那段码负责，所以按
+    -- span == [seg_start, seg_start+le) 取第一个候选。
+    --   ・旧「同字数」会跨切分比较（明朝 0..8 vs 明察 0..7），lead 输给同长
+    --     度不同切分的词就判失败——那是在判「切分谁更好」，不是「lead 是不是
+    --     这一格的首选」；
+    --   ・同 span 上 1 字/多字可以并存（西安 = xi+an vs 县 = xian，都占 0..4）
+    --     → 一并比（切分竞赛），这正是要判的。
+    -- 融合序本身不变（win.ordered 仍是融合序），树模型照旧吃完整窗口特征。
+    -- 2026-11-26 用户定案②：**音节不完整的单字不参与**——打 `shen` 时 `生`
+    -- （sheng 的前缀）即使 CE 更好也不能成为被确认的那一格；整档都不完整 →
+    -- 不确认（win.tier 无表/关 = nil → 行为同旧版）。
+    -- A/B：`_G.llm_gate_span=false` / `RIME_LLM_GATE_SPAN=0` → 回同字数档。
     local pick = b1
     if win and win.ordered then
+        local span_pick = _G.llm_gate_span ~= false
+                and os.getenv("RIME_LLM_GATE_SPAN") ~= "0"
         local lead_single = (nchars(lead) == 1)
         pick = nil
         for _, c in ipairs(win.ordered) do
-            if (nchars(c.text) == 1) == lead_single then
+            local hit
+            if span_pick then
+                local s0, e0 = cand_span(c)
+                hit = (s0 == seg_start and e0 == seg_start + le)
+            else
+                hit = ((nchars(c.text) == 1) == lead_single)
+            end
+            if hit and not (lead_single and win.tier and win.tier[c.text]) then
                 pick = c
                 break
             end
@@ -1517,6 +1707,15 @@ return function(translation, env)
             and #code >= 4 and code:match("^[a-z]+$") then
         gen = ngram_make(env, code, context, prefix_text, seg_start, seg_end)
         if gen then
+            -- [整句词频归因]（2026-11-26）：显示句的组句词路径登记进环形表
+            -- （text+code 双键；words[].e 为该段码内的字节偏移）。processor
+            -- 在 commit 时按「段文本+段码」取回切词。cap 16 FIFO，同窗重复
+            -- 查询会重复登记——消费端从尾向头匹配即得最新。
+            local ring = _G.llm_gen_paths
+            if ring == nil then ring = {}; _G.llm_gen_paths = ring end
+            ring[#ring + 1] = { text = gen[1].text, code = code,
+                                words = gen[1].words }
+            if #ring > 16 then table.remove(ring, 1) end
             -- 只注入/抑制显示的那一条（ngram 序第 1）；其余只供前缀概率。
             -- 2026-11-24 真机报障（象/向/想 等整字从候选里消失）：旧实现把
             -- top-20 全部文本都登记进 genset 参与抑制/去重，而显示端只留 1
@@ -1533,6 +1732,7 @@ return function(translation, env)
     end
     -- 清掉上一轮快照，避免未重排/失败路径的陈旧窗口被 C 误引用。
     _G.llm_last_window = nil
+    _G.llm_tier_map = nil        -- 冒烟/排障钩子：本窗前缀简拼层（见下）
 
     if #all < 2 then
         live("S|" .. os.date("%H:%M:%S") .. "|few_candidates|" ..
@@ -1571,7 +1771,7 @@ return function(translation, env)
     end
 
     -- 无上文（2026-11-24 用户定案）：CE 不可算，但**前缀确认照常**——融合分
-    -- 按剩余项（β·log1p(eff) + log(uni+1) + 词码对修正）计算，组句 lead 与
+    -- 按剩余项（β·log1p(eff) + log(uni+1) + CE 偏置）计算，组句 lead 与
     -- 窗口融合序第 1 比较。只在整句模式 + 前缀确认 + 组句都开且组句有结果时
     -- 走这条（其余保持旧行为：跳过，W 记 ctx_empty）。
     -- 组合区已确认前缀 prefix_text 非空 = 已有临时上文 → 不进 freq_only，
@@ -1617,10 +1817,10 @@ return function(translation, env)
             return a.idx < b.idx   -- 稳定: 同分保引擎序
         end)
     end
-    -- 词码对分数表（2026-11-21 解耦后只含负分扣分修正）：不参与窗口
+    -- CE 偏置表（有符号；2026-11-26 起正负都照加）：不参与窗口
     -- 准入，仅融合时叠加（评分窗内生效）。分数表在窗口准入前读一次，
     -- 本窗融合复用同一份。
-    local pftbl = pairfix_table()
+    local cbtbl = ce_bias_table()
     local cands = {}
     local l1win = {}
     local win_seen = {}
@@ -1697,6 +1897,54 @@ return function(translation, env)
             end
         end
     end
+    -- 字-音节 CE 偏置（T1 = log P(读音|字)）：本窗准入候选一次算好，融合与
+    -- 挂账回填共用（挂账时已丢候选对象，只剩文本 → 必须在此预存）。
+    local share_map = nil
+    do
+        local stbl = ce_share_table()
+        if stbl then
+            for _, e in ipairs(pool) do
+                local d = ce_share_delta(stbl, e.c, code, seg_start)
+                if d ~= 0 then
+                    if not share_map then share_map = {} end
+                    share_map[e.c.text] = d
+                end
+            end
+        end
+    end
+    -- 整读层（2026-11-26 用户定案①）：单字候选 span 不是该字的完整读音
+    -- （全拼完成匹配 / 双拼简码 / 纠错）→ tier 1，显示序沉到整读之后。
+    -- **只影响显示序**：融合分、CE 准入、预算、前缀判定一律不动。
+    -- 只在整句模式建（字词模式没有「先长后短」单字块；pdsp 单字是音+形，
+    -- tier 恒 0，建了也是白算）。无 syll_chars 表 / A/B 关 → nil = 不分层。
+    local tier_map = nil
+    do
+        local syl = sent_on and syll_chars_table() or nil
+        if syl then
+            for _, e in ipairs(pool) do
+                local t = e.c.text
+                if (utf8 and utf8.len and utf8.len(t) or #t) == 1 then
+                    local s, en = cand_span(e.c)
+                    if s and en and en > s then
+                        local s0 = s - (seg_start or 0)
+                        local e0 = en - (seg_start or 0)
+                        if s0 >= 0 and e0 <= #code and e0 > s0 then
+                            -- tier 1 ⟺ 表里查不到键：span 只是某读音的**严格
+                            -- 前缀**（完成匹配）或干脆无读音关系（纠错）——
+                            -- 双拼「音+形」拿到前缀键 = 音完整 = tier 0。
+                            local _, key = syll_judge(syl, t,
+                                                      code:sub(s0 + 1, e0))
+                            if not key then
+                                if not tier_map then tier_map = {} end
+                                tier_map[t] = 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        _G.llm_tier_map = tier_map   -- 冒烟/排障钩子：{ 前缀简拼字 = 1 }
+    end
     local w_written = false
     -- 评分结果缓存已删除（2026-11-11 用户定案）：同 (上文+编码) 的复用在
     -- 生产里命中率极低（每个新词的上文都变），却要维护一整套失效逻辑（编辑键清
@@ -1758,7 +2006,8 @@ return function(translation, env)
                         pending[fp_r] = { wid = wid, code = code,
                                           ctx_src = ctx_src, context = context,
                                           engine_top = engine_top,
-                                          l1win = l1win, tick = tick }
+                                          l1win = l1win, tick = tick,
+                                          share_map = share_map }
                         cache_trim()
                         sent_pending = true
                     end
@@ -1878,16 +2127,16 @@ return function(translation, env)
         --      布尔开关直接实现（2026-11-22 起为 sentence_mode 整句模式——
         --      满覆盖候选在窗口准入时结构性占满评分窗）。
         --   ④ 冷启动 eff≡0 且 uni 无计数时自动退化为 score 序, 成熟期三项叠加。
-        --   ⑤ 词码对分数修正（2026-11-17 有符号表）: 正分 = 固定首选/次选
-        --      （+200/+100，不受 fade）；负分 = pairfix 降噪（原 −λ，保留
-        --      fade）。**只对已算 CE 的候选生效**（2026-11-24 用户定案：
-        --      pairfix 修的是 CE 系统性偏差，无 CE 分支/无上文 freq_only 不叠
-        --      修正）；debug 行尾 修正%+g，C 行尾追加
+        --   ⑤ CE 偏置（有符号表；2026-11-26 起正负都照加、fade 一视同仁）：
+        --      负分 = 降噪（原 pairfix 语义），正分 = 抬分（原固定候选的
+        --      「加正分」能力保留，与 pin_candidates 解耦）。**只对已算 CE 的
+        --      候选生效**（2026-11-24 用户定案：CE 偏置修的是 CE 系统性偏差，
+        --      无 CE 分支/无上文 freq_only 不叠）；debug 行尾 修正%+g，C 行尾追加
         --      sdelta（有符号；旧 pf 字段仍为负分幅度，兼容旧查看器）。
         -- 失败哨兵分 (≤-1e9) 排尾部不参与; 同分稳定保序 (融合序)。
         local fused_scores = nil
         local ce3map = nil
-        -- freq_only（无上文）：scores 为 nil，融合只剩词频/词码对项——
+        -- freq_only（无上文）：scores 为 nil，融合只剩词频项（CE 偏置不叠）——
         -- 下方 else 分支按 s1_of 计算，min_valid 为 nil（加 0）。
         if #ordered > 1 and (scores or freq_only) then
             local freq_eff = _G.user_freq_eff
@@ -1939,17 +2188,20 @@ return function(translation, env)
                     local n = freq_eff and freq_eff(c.text, code) or 0
                     local u1_term = _G.user_unigram_term
                             and _G.user_unigram_term(c.text, code) or 0
-                    local delta = pairfix_delta(pftbl, c.text, code)
+                    local delta = ce_bias_delta(cbtbl, c.text, code)
+                    local sd = (share_map and share_map[c.text]) or 0
                     local t = s + FREQ_BETA * math.log(1 + n) + u1_term
-                            + delta
+                            + delta + sd
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
                         dbg[c.text] = { ce = s, eff = n,
                                         fb = FREQ_BETA * math.log(1 + n),
                                         u1 = u1_term,
-                                        pf = delta < 0 and -delta or nil,
-                                        sdelta = delta ~= 0 and delta or nil,
+                                        pf = (delta + sd) < 0 and -(delta + sd)
+                                             or nil,
+                                        sdelta = (delta + sd) ~= 0
+                                                 and (delta + sd) or nil,
                                         uni = _G.user_uni_count
                                               and _G.user_uni_count(c.text,
                                                                     code) or 0,
@@ -1961,7 +2213,7 @@ return function(translation, env)
                     -- + 窗内最低 LLM 分（压制到窗底, 保留层1 耦合; 见上注）。
                     -- 无上文时 min_valid=nil → 融合 = β·log1p(eff) +
                     -- log(uni+1)（2026-11-24 用户定案）。
-                    -- **不叠词码对修正**：pairfix 修的是 CE 的系统性偏差，
+                    -- **不叠 CE 偏置**：CE 偏置修的是 CE 的系统性偏差，
                     -- 没有 CE 就无从修（2026-11-24 用户定案）。
                     local s1 = s1_of[c.text]
                     local t = (s1 or -math.huge)
@@ -2007,6 +2259,7 @@ return function(translation, env)
                             nchars((context or "") .. (prefix_text or "")),
                             { ordered = ordered, code = input,
                               seg_start = seg_start,
+                              tier = tier_map,
                               gshow = gen[1] and gen[1].text })
             if lead then
                 _G.llm_pending_confirm = {
@@ -2030,12 +2283,20 @@ return function(translation, env)
         if sent_on then
             -- 2026-11-26 用户定案：整句模式恢复「先长后短」显示序（同字数
             -- 保持融合序；融合/准入/前缀判定仍用融合序，不受显示序影响）。
+            -- 2026-11-26 用户定案①：单字块内再按**整读层**分两段——整读在前、
+            -- 前缀简拼/纠错在后（不能统一按融合分排；tier 只是排序键，不进
+            -- 融合分）。tier_map 为 nil（无表/A/B 关）时行为与旧版逐位一致。
             local di = {}
             for i, c in ipairs(ordered) do di[i] = { c = c, i = i } end
             table.sort(di, function(a, b)
                 local la = utf8.len(a.c.text) or #a.c.text
                 local lb = utf8.len(b.c.text) or #b.c.text
                 if la ~= lb then return la > lb end
+                if la == 1 and tier_map then
+                    local ta = tier_map[a.c.text] or 0
+                    local tb = tier_map[b.c.text] or 0
+                    if ta ~= tb then return ta < tb end
+                end
                 return a.i < b.i
             end)
             for _, x in ipairs(di) do out[#out + 1] = x.c end
@@ -2128,7 +2389,7 @@ return function(translation, env)
                     d and live_fmt3(d.u1) or "",   -- 累计得分 log(p1)
                     -- v5: 旧 pf = 负分幅度（仅扣分，0=未命中），保留给旧查看器
                     d and live_fmt3(d.pf or 0) or "0",
-                    -- v6 (2026-11-17): 有符号词码对修正分（+200/+100/−5/0）
+                    -- v6 (2026-11-17): 有符号 CE 偏置（+200/+100/−5/0）
                     d and live_fmt3(d.sdelta or 0) or "0",
                     -- v7 (2026-11-21): token 边界段显（"词"列：单 token 词原样、
                     -- 真实多 token 词段间 '/'；尾窗透传无 d → 空串，查看器显示原词）
