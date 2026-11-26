@@ -46,27 +46,16 @@ local function to_win(c)
   return gen, ordered
 end
 
-local function class_first_text(ord, lead)
-  local single = (utf8.len(lead) == 1)
+-- 2026-11-26 定案③：结构证据 = 同 span（[seg_start, lead_end)）首选；
+-- 本 harness 的窗 seg_start=0。单字 lead 的 tier 跳过由 win.tier 驱动，
+-- 这里用例不带 tier（= 全整读），与 gen_pg_cases 的参考口径一致。
+local function span_first_text(ord, le)
   for _, o in ipairs(ord) do
-    local n = utf8.len(o.text) or #o.text
-    if (n == 1) == single then return o.text end
+    if o.start == 0 and o._end == le then return o.text end
   end
-end
-local function put_class_first(ord, text)
-  local single = (utf8.len(text) == 1)
-  local idx
-  for i, o in ipairs(ord) do
-    local n = utf8.len(o.text) or #o.text
-    if (n == 1) == single then idx = i; break end
-  end
-  if not idx then return end
-  local j
-  for i, o in ipairs(ord) do if o.text == text then j = i; break end end
-  if j and j ~= idx then ord[idx], ord[j] = ord[j], ord[idx] end
 end
 
--- A：逐例与分数对照（2026-11-26 起结构证据 = 同字数档首选）
+-- A：逐例与分数对照（2026-11-26 定案③起结构证据 = 同 span 首选）
 local cases = dofile(CASES)
 local n_a = 0
 for _, c in ipairs(cases) do
@@ -79,7 +68,7 @@ for _, c in ipairs(cases) do
     local b1 = { text = c.lead, start = 0, _end = c.le }
     local got = _G.llm_prefix_gate(gen, b1, 0, #c.code, nil, c.ce3,
                                    c.ctx_chars, win)
-    local want = (sc >= TAU) and (class_first_text(ordered, c.lead) == c.lead)
+    local want = (sc >= TAU) and (span_first_text(ordered, c.le) == c.lead)
     chk("A/" .. c.wid, (got ~= nil) == want,
         string.format("score=%.4f τ=%.4f got=%s", sc, TAU,
                       tostring(got)))
@@ -110,11 +99,11 @@ do
                     sf or -1, ss or -1))
 end
 
--- B：τ 边界（取一个 lead 本身是同档首选的例）
+-- B：τ 边界（取一个 lead 本身是同 span 首选的例）
 local c1
 for _, c in ipairs(cases) do
   local _, ord = to_win(c)
-  if class_first_text(ord, c.lead) == c.lead then c1 = c; break end
+  if span_first_text(ord, c.le) == c.lead then c1 = c; break end
 end
 c1 = c1 or cases[1]
 local gen1, ord1 = to_win(c1)
@@ -137,7 +126,7 @@ end
 for _, o in ipairs(ord2) do
   if o.text == c1.lead then o.text = "他们" end
 end
-put_class_first(ord2, "他们")
+-- 原地改名即保持「同 span 首选」= 他们（无需挪位）
 local ce2 = {}
 for k, v in pairs(c1.ce3) do ce2[k] = v end
 ce2["他们"] = c1.ce3[c1.lead]
