@@ -1059,7 +1059,8 @@ _G.llm_prefix_gate = prefix_gate
 -- A/B：RIME_LLM_PREFIX_MODEL=0（禁用模型→回退 ce1）、
 -- RIME_LLM_PREFIX_TAU（覆盖 τ）、RIME_LLM_PREFIX_TABLOCK=0（关 ta 族黑名单）；
 -- 冒烟钩子 _G.llm_prefix_model / _G.llm_prefix_tau / _G.llm_prefix_tablock。
-local PREFIX_TAU_DEFAULT = 0.971391
+-- 模型文件缺 tau 时的兜底（2026-11-26 重训后 τ；正常情况读 m.tau）
+local PREFIX_TAU_DEFAULT = 0.977630192
 -- ta 族：先验可论证的结构性同音歧义（他/它/她 只能靠语义定）。研究库
 -- 2026-11-25：40 触发 13 错（32.5%），真实用户域 8/10 = 80%；禁用后整体
 -- +0.07~0.08pp、user 域 +0.55pp，与模型叠加仍 +0.02~0.10pp。
