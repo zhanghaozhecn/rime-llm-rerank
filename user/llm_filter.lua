@@ -392,16 +392,19 @@ function _G.llm_corpus_write(line)
     rec_append(path, line)
 end
 
-function _G.llm_debug_write(line, force)
-    if not force and not _G.llm_debug_enabled then return end
-    local path = llm_resolve("rime_llm_debug.txt", true)
+-- 每键批量合并（2026-11-27）：debug_fusion=true 的逐行写（整句 ~41 行 D/键）
+-- 实测 +288ms/键——每行 轮转检查+追加 = 2 次文件开合，被文件系统过滤放大，
+-- 曾伪装成「space 落刷新窗被吞」（源码版 fix-history 2026-11-27 破案）。
+-- 改为事件内缓冲、事件边界一次落盘：flush 点 = write_w / write_c / write_m
+-- / debug_e / debug_refund / async_harvest 尾 + 过滤入口；上限兜底
+-- （缓冲 ≥256KB 或首行 >50ms 旧 → 先落盘再续，事件异常不丢行不无限迟到）。
+function _G.llm_debug_flush()
+    local buf = _G.__llm_dbg_buf
+    if not buf or buf == "" then return end
+    local path = _G.__llm_dbg_path
+    _G.__llm_dbg_buf = nil
+    _G.__llm_dbg_path = nil
     if not path then return end
-    if _G.llm_debug_header_path ~= path then
-        _G.llm_debug_header_path = path
-        _G.llm_debug_ok = rec_header_ok(path, "#RIME_DEBUG|v2|",
-            "#RIME_DEBUG|v2|" .. rec_stamp() .. "|plugin")
-    end
-    if not _G.llm_debug_ok then return end
     local f = io.open(path, "rb")
     if f then
         local sz = f:seek("end")
@@ -411,7 +414,38 @@ function _G.llm_debug_write(line, force)
             os.rename(path, path .. ".old")
         end
     end
-    rec_append(path, line)
+    if _G.llm_debug_header_path ~= path then
+        _G.llm_debug_header_path = path
+        _G.llm_debug_ok = rec_header_ok(path, "#RIME_DEBUG|v2|",
+            "#RIME_DEBUG|v2|" .. rec_stamp() .. "|plugin")
+    end
+    if not _G.llm_debug_ok then return end
+    local fo = io.open(path, "ab")
+    if not fo then return end
+    fo:write(buf)
+    fo:close()
+end
+
+function _G.llm_debug_write(line, force)
+    if not force and not _G.llm_debug_enabled then return end
+    local path = llm_resolve("rime_llm_debug.txt", true)
+    if not path then return end
+    -- 缓冲存在但目标路径变了（切方案）：先把旧缓冲落到旧路径
+    if _G.__llm_dbg_buf and _G.__llm_dbg_path ~= path then
+        _G.llm_debug_flush()
+    end
+    -- 上限兜底：≥256KB 或首行 >50ms 旧 → 先落盘再续
+    local buf = _G.__llm_dbg_buf
+    if buf and (#buf >= 262144 or os.clock() - (_G.__llm_dbg_t0 or 0) > 0.05) then
+        _G.llm_debug_flush()
+    end
+    if not _G.__llm_dbg_buf then
+        _G.__llm_dbg_buf = line .. "\n"
+        _G.__llm_dbg_path = path
+        _G.__llm_dbg_t0 = os.clock()
+        return
+    end
+    _G.__llm_dbg_buf = _G.__llm_dbg_buf .. line .. "\n"
 end
 
 local function rec_rank(v, word)
@@ -435,6 +469,7 @@ function _G.llm_write_w(id, src, code, ctx, engine, window, final, tick,
     _G.llm_last_window = { id = id, code = code, engine = engine or {},
                            window = window or {}, final = final or {},
                            tick = tick or 0 }
+    _G.llm_debug_flush()   -- 事件尾批量落盘（2026-11-27 每键合并）
     return id
 end
 
@@ -466,6 +501,7 @@ function _G.llm_write_c(word, code, tick, cjk, path)
     local line = table.concat(fields, "\t")
     _G.llm_corpus_write(line)
     _G.llm_last_event_id = id
+    _G.llm_debug_flush()   -- 提交事件边界落盘（2026-11-27 每键合并）
     return id
 end
 
@@ -478,6 +514,7 @@ function _G.llm_write_m(kind)
     _G.llm_corpus_write(line)
     _G.llm_debug_write(id .. "|R|gen=" .. tostring(_G.llm_reset_gen or 0),
                        false)
+    _G.llm_debug_flush()   -- reset 事件边界落盘（2026-11-27 每键合并）
     return id
 end
 
@@ -523,6 +560,7 @@ function _G.llm_debug_e(id, before, after, dirty)
     _G.llm_debug_write(string.format(
         "%s|E|eff_before=%.3f|eff_after=%.3f|dirty=%d", id, before or 0,
         after or 0, dirty or 0), false)
+    _G.llm_debug_flush()   -- 提交退款边界落盘（2026-11-27 每键合并）
 end
 
 -- [回撤退款]（2026-11-20）: 退款成功标记行（debug 开启才写）；词/码在
@@ -530,6 +568,7 @@ end
 function _G.llm_debug_refund(cid, tick)
     _G.llm_debug_write(string.format("%s|RF|refund=1|tick=%d", cid,
         tick or 0), false)
+    _G.llm_debug_flush()   -- 回撤事件边界落盘（2026-11-27 每键合并）
 end
 
 local lat_max   = 0
@@ -644,6 +683,7 @@ function _G.llm_async_harvest()
         end
         cache_trim()
     end
+    _G.llm_debug_flush()   -- 挂账回填行落盘（2026-11-27 每键合并）
 end
 
 -- 提交/上下文变化后由 llm_processor 的 commit 通知调用：先收割（上屏时
@@ -1583,6 +1623,7 @@ _G.llm_prefix_model_ready = function() return pg_model() ~= nil end
 
 -- === Filter ===
 return function(translation, env)
+    _G.llm_debug_flush()   -- 上一事件残留缓冲落盘（2026-11-27 每键合并兜底）
     -- 每次调用都从 schema 读取 enabled，确保重新部署后立即生效
     local sc = env.engine.schema.config
     local enabled = sc:get_bool("llm_rerank/enabled") or false
