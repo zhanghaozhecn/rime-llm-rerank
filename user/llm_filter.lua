@@ -1068,6 +1068,16 @@ local NGRAM_FILES = { "zi", "jichu", "duoyin", "diming", "mingren", "yiren" }
 local NGRAM_PARAMS = {
     topk = 20, beam = 32, min_weight = 10, max_edges = 8, ctx_tail = 10,
 }
+-- 输入闸阈值（2026-11-25 设 30；2026-11-27 放宽 128）：增量组句后逐键成本
+-- 不再随码长超线性（31–88 字母实测 1.3–3ms/键），限量收集/CE 预算窗也与
+-- 码长无关；128 = 真机被闸码长 max 54 的 2.4 倍、与组句检查点上限对齐。
+-- 环境变量 RIME_LLM_GATE_LEN 进程内读一次（A/B：=30 回旧行为）；
+-- _G.llm_gate_len 每键可覆盖（测试钩子）。
+local GATE_LEN = 128
+do
+    local v = os.getenv("RIME_LLM_GATE_LEN")
+    if v and v ~= "" then GATE_LEN = tonumber(v) or GATE_LEN end
+end
 local ngram_ready = false
 local ngram_retry_at = 0
 
@@ -1659,12 +1669,13 @@ return function(translation, env)
     local seg_start, seg_end = resolve_segment(env, input)
     local code = input:sub(seg_start + 1, seg_end)
     local all = {}
-    -- 输入闸（2026-11-25，学万象 limit_repeated）：单段码 >30 字母或连续
-    -- 重复 ≥8 一律不重排。长码的逐键开销随码长超线性增长（实测 41 字母
-    -- 整串 80ms，与万象剖析 P99 36ms 同级），而 LLM 收益集中在短码；
-    -- 超限直接按引擎原序透传（不收集到 64、不推理）。
+    -- 输入闸（2026-11-25 学万象 limit_repeated；2026-11-27 放宽 128，见
+    -- GATE_LEN 处注释）：单段码超阈值或连续重复 ≥8 一律不重排，超限直接
+    -- 按引擎原序透传（不收集到 64、不推理）。
+    local gate_len = GATE_LEN
+    if _G.llm_gate_len then gate_len = tonumber(_G.llm_gate_len) or gate_len end
     local gate_skip = nil
-    if #code > 30 then
+    if #code > gate_len then
         gate_skip = "code_too_long"
     else
         local run = 1

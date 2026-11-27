@@ -1082,9 +1082,10 @@ std::string Engine::status() const {
 
 namespace {
 
-// 检查点保留上限：超长码不建检查点（输入闸 30 字母之外的双保险；恢复侧
-// 不受限——旧检查点 ≤48 位仍可续打到更长码）。
-constexpr int kSessionMaxCode = 48;
+// 检查点保留上限（2026-11-27 与输入闸 128 对齐；旧 48）：超长码不建检查
+// 点（增量退化为全量，结果不变）；恢复侧不受限——旧检查点 ≤128 位仍可续
+// 打到更长码。128 位检查点 ≈ 4k 条目 / 1–2MB。
+constexpr int kSessionMaxCode = 128;
 
 bool ParamsEqual(const Params& a, const Params& b) {
   return a.beam == b.beam && a.topk == b.topk && a.ctx_tail == b.ctx_tail &&
