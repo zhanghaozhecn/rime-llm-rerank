@@ -12,6 +12,12 @@
  * ctx prefill (step1) is NOT timed — production does it in prepare() behind
  * the commit, off the per-keystroke path.
  *
+ * 2026-11-28：context 口径随生产切 kv_unified=true + n_ctx=512 /
+ * n_seq_max=20（分裂式会把多 seq 批逐序列拆 ubatch，每行 9.1ms；unified 后
+ * 6.2ms，最优线程数由 5 移到 8）。A/B：RIME_LLM_KV_UNIFIED=0 回分裂式。
+ * 扫描改为两段：4-8 步进 1 + 10 起步进 2 到逻辑核数（2026-11-28 用户定案；
+ * 超物理核照测不推荐，[RESULT] tested= 字段描述实际扫描段）。
+ *
  * Machines with fewer than 5 logical cores are NOT benchmarked at all
  * (2026-10-01 用户定案): the tool immediately recommends the max thread
  * count (=逻辑核数) and never loads the model — so the answer is instant and
@@ -79,9 +85,12 @@ static const int kNCands = 6;       // production max_candidates default
 static const int kMaxCands = 32;    // sanity cap for --cands
 static const int kNTrials = 99;     // CLI default; median + mid-50% reported
 static const int kMinThr = 4;       // scan start (2026-10-01 用户定案)
-static const int kMaxThr = 8;       // scan end   (2026-10-01 用户定案)
+static const int kMaxThr = 8;       // 密扫段终点（步进 1；2026-10-01 定案）
+static const int kP2Start = 10;     // 疏扫段起点（2026-11-28 用户定案）
+static const int kP2Step = 2;       // 疏扫段步进，到逻辑核数为止
 static const int kMinCoresToTest = 5;      // < 5 逻辑核 = 不实测，直接取最大
 static const double kRecThreshold = 1.05;  // rec = 最优 × 1.05 以内的最小线程
+static const int g_n_seq_max_prod = 20;    // 生产 n_seq_max（2026-11-26）
 
 static llama_model *g_model;
 static const llama_vocab *g_vocab;
@@ -370,8 +379,22 @@ int main(int argc, char **argv) {
   }
 
   int last_thr = std::min(cores, kMaxThr);   // cores >= 5 → last >= 5
+  // 扫描列表（2026-11-28 用户定案）：4-8 步进 1 密扫 + 10 起步进 2 到逻辑核
+  // 数疏扫。超物理核数据点照测（SMT 兄弟线程几乎不涨分，推荐逻辑仍封顶
+  // 物理核），数据留给人工判断。
+  std::vector<int> scan;
+  for (int t = kMinThr; t <= last_thr; t++)
+    scan.push_back(t);
+  for (int t = kP2Start; t <= cores; t += kP2Step)
+    scan.push_back(t);
+  char tested_desc[64];
+  if (!scan.empty() && scan.back() > last_thr)
+    snprintf(tested_desc, sizeof(tested_desc), "%d-%d+%d-%d(%d)", kMinThr,
+             last_thr, kP2Start, scan.back(), kP2Step);
+  else
+    snprintf(tested_desc, sizeof(tested_desc), "%d-%d", kMinThr, last_thr);
   out("model: %s\n", model_path);
-  out("scanning %d..%d threads (%d trials each)\n", kMinThr, last_thr, trials);
+  out("scanning %s threads (%d trials each)\n", tested_desc, trials);
 
   llama_backend_init();
   llama_model_params mp = llama_model_default_params();
@@ -418,12 +441,21 @@ int main(int argc, char **argv) {
 
   std::vector<int> row_thr;
   std::vector<double> row_med;
-  for (int thr = kMinThr; thr <= last_thr; thr++) {
+  for (size_t si = 0; si < scan.size(); si++) {
+    int thr = scan[si];
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 128;
+    cp.n_ctx = 512;                            // 生产口径（2026-11-23 合并 ctx512）
     cp.n_threads = thr;
     cp.n_threads_batch = thr;
-    cp.n_seq_max = std::max(12, ncands + 2);   // seq 0 = ctx, 1..k = candidates
+    cp.n_seq_max = g_n_seq_max_prod;           // 生产口径 20
+    // 生产口径 kv_unified=true（2026-11-28）：false 会把多 seq 批逐序列拆
+    // ubatch（每行 9.1ms/行），unified 后 6.2ms/行，最优线程数随之上移
+    // （5→8）。A/B：RIME_LLM_KV_UNIFIED=0 回分裂式口径。
+    {
+      char buf[16] = "";
+      DWORD n = GetEnvironmentVariableA("RIME_LLM_KV_UNIFIED", buf, sizeof(buf));
+      cp.kv_unified = !(n > 0 && buf[0] == '0');
+    }
     llama_context *ctx = llama_init_from_model(g_model, cp);
     if (!ctx) {
       out("  thr=%2d: ctx create FAILED\n", thr);
@@ -520,9 +552,9 @@ int main(int argc, char **argv) {
       rec, rec_ms, best_ms, best_thr, kRecThreshold, phys);
   out("在方案 llm_rerank 里设 cpu_cores: %d（GUI 点『实测线程数』可直接采用），"
       "然后重新部署。\n", rec);
-  out("[RESULT] log_cores=%d phys_cores=%d tested=%d-%d rec=%d rec_ms=%.1f "
+  out("[RESULT] log_cores=%d phys_cores=%d tested=%s rec=%d rec_ms=%.1f "
       "best=%d best_ms=%.1f threshold=%.2f cands=%d reason=ok\n",
-      cores, phys, kMinThr, last_thr, rec, rec_ms, best_thr, best_ms,
+      cores, phys, tested_desc, rec, rec_ms, best_thr, best_ms,
       kRecThreshold, ncands);
 
   llama_model_free(g_model);

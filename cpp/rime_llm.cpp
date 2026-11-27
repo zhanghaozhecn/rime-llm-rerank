@@ -1031,6 +1031,19 @@ static void load_model_async() {
         cparams.n_threads       = n_thr;
         cparams.n_threads_batch = n_thr;
         cparams.n_seq_max       = g_n_seq_max;
+        // KV 统一池（2026-11-28）：llama 默认 kv_unified=false 把多 seq 批
+        // 逐序列拆成独立 ubatch，每行独立付一遍全部权重（实测 marginal
+        // 9.1ms/行）；unified 后 6.2ms/行（5 线程）、4.5ms/行（8 线程），
+        // 且 KV 分配从 n_seq_max×n_ctx（20×512 ≈ 1.14GB）降到 1×n_ctx
+        // （≈58MB）。本机限频下算力受限是根源（gemm 行数效率：1 行
+        // 75 → 6 行 180 → 20 行 333 GFLOPS）。CE 位级一致性已验
+        // （prof_s2 --ce-check：42 候选 × split/unified × 5/8 线程
+        // Δ=0、排序零翻转、prep 重复零漂移）。A/B：RIME_LLM_KV_UNIFIED=0
+        // 回分裂式。
+        {
+            const char *kvu = getenv("RIME_LLM_KV_UNIFIED");
+            cparams.kv_unified = !(kvu && kvu[0] == '0');
+        }
 
         g_ctx = llama_init_from_model(g_model, cparams);
         if (!g_ctx) {
