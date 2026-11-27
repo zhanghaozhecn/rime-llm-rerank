@@ -456,13 +456,16 @@ local function rec_rank(v, word)
 end
 
 function _G.llm_write_w(id, src, code, ctx, engine, window, final, tick,
-                        status, skip, prep, flags)
+                        status, skip, prep, flags, comp)
     local line = table.concat({
         "W", id, rec_stamp(), rec_esc(src), rec_esc(code),
         rec_esc(rec_ctx_tail(ctx, 120)), rec_join(engine, 10),
         rec_join(window, 20), rec_join(final, 20), tostring(tick or 0),
         status or "ok", rec_esc(skip or ""), prep and "1" or "0",
-        rec_esc(flags or "")
+        rec_esc(flags or ""),
+        -- v9（2026-11-27）：联想类标 =「窗内位次;最终序位次」（1 基、≤20、
+        -- 逗号分隔；空 = 无联想候选）。离线统计联想词位置/选重率用。
+        "comp=" .. (comp or "")
     }, "\t")
     _G.llm_corpus_write(line)
     _G.llm_last_event_id = id
@@ -983,6 +986,48 @@ local function syll_judge(syl, t, span)
     return false, nil                -- 完成匹配 / 纠错：不叠偏置
 end
 
+-- ── 联想/补全判定（2026-11-27 用户定案）──
+-- 原生 script_translator 对**词级补全**候选设 `type = "completion"`（词条码比
+-- 已输入长，如 fudandaxue → 复旦大学站）；精确匹配是 "phrase"/"user_phrase"/
+-- "ledger"，组句是 "ngram_group"。librime-lua 暴露 `cand.type`（processor 已
+-- 在用）。`uniquifier` 合并同文本候选项后 type 变 "uniquified"（ShadowCandidate）
+-- → 取 genuines 还原原始 type。
+-- **拿不到 type 时一律视为精确**（宁可漏判不可错判）：同 span 不同切分本来
+-- 就是同级（yue → 月=1 音节 vs 余额=yu+e 两音节，共占 3 字符），用「字数 >
+-- span 音节数」的启发式会把余额误判成联想并压到所有单字之后。
+-- 用途：显示序「同 span 精确在前、联想在后」+ 前缀确认不把联想词当同 span 首选。
+local function cand_is_completion(c)
+    local t = c.type
+    if type(t) ~= "string" then return false end
+    if t == "completion" then return true end
+    if t ~= "uniquified" and t ~= "shadow" then return false end
+    local ok, gs = pcall(function() return c:get_genuines() end)
+    if ok and type(gs) == "table" then
+        -- 合并候选里**只要有一条是精确匹配**，这段文本就有精确路径可走
+        -- （同文本可能来自 userdb 精确 + 词库联想）→ 按精确对待。
+        local any, all_comp = false, true
+        for _, g in ipairs(gs) do
+            if type(g.type) == "string" then
+                any = true
+                if g.type ~= "completion" then all_comp = false end
+            end
+        end
+        if any then return all_comp end
+    end
+    return false
+end
+
+-- 联想候选在列表中的 1 基位次（≤20、逗号分隔；W 行 v9 类标用）
+local function comp_positions(list, cmap)
+    if not cmap then return "" end
+    local idx = {}
+    for i, t in ipairs(list) do
+        if i > 20 then break end
+        if cmap[t] then idx[#idx + 1] = i end
+    end
+    return table.concat(idx, ",")
+end
+
 -- ── 字-音节 CE 偏置行（T1 = log P(读音|字)，λ=1，2026-11-26 用户定案）──
 -- **与 (词,码) 行写在同一张表**：`llm_rerank/<方案>/ce_bias.tsv`
 -- （见上方 ce_bias_table；两种键按候选文本长度分流，互不干扰）。
@@ -1267,7 +1312,8 @@ local function prefix_gate(gen, b1, seg_start, seg_end, p_thr, ce3map,
             else
                 hit = ((nchars(c.text) == 1) == lead_single)
             end
-            if hit and not (lead_single and win.tier and win.tier[c.text]) then
+            if hit and not (lead_single and win.tier and win.tier[c.text])
+                    and not cand_is_completion(c) then
                 pick = c
                 break
             end
@@ -1872,6 +1918,7 @@ return function(translation, env)
     -- 实测见研究库 §三十三·附 6）。
     local layer1 = {}
     local s1_of = {}
+    local comp_of = {}   -- [text] = true 联想候选（W 行 v9 类标，2026-11-27）
     do
         -- 词码对记账（2026-11-13 用户定案）: eff/uni 查询键 = (候选, 当前
         -- 窗码)——多音词属不同词条, 每个码对只看自己的历史（wiki 59,681
@@ -1888,6 +1935,7 @@ return function(translation, env)
             if bt then s = s + bt(c.text, qcode) end
             layer1[i] = { c = c, s = s, idx = i }
             s1_of[c.text] = s
+            if cand_is_completion(c) then comp_of[c.text] = true end
         end
         table.sort(layer1, function(a, b)
             if a.s ~= b.s then return a.s > b.s end
@@ -2362,33 +2410,49 @@ return function(translation, env)
         local best_gen = (gen and #gen > 0) and gen[1] or nil
         local out = {}
         if best_gen then out[#out + 1] = best_gen.cand end
+        -- 显示序（2026-11-27 用户定案）：按**原生类型优先级**分层——
+        --   ① span（候选覆盖到的输入字符数 = cand._end - seg_start）降序 = 前长后短；
+        --   ② 同 span 内**精确在前、联想/补全在后**（原生 userdb predictive
+        --      rotate 同款语义：长词联想之前须先出严格匹配）；
+        --   ③ 同层内保持既有次序：窗内 = 融合序、窗外 = 层1 序；1 字再分整读层。
+        -- 旧版用「字数」代理 span：联想词字数 = 覆盖音节数 + 1 → 被字数序顶到
+        -- 窗口首位（fudandaxue 出「复旦大学站」压「复旦大学」，语料 27.5% vs
+        -- 原生引擎 4.5%）；尾块原为纯层1 序（无长度序，51% 的联想词掉到 #3 后）。
+        -- 现在窗口与尾块用同一个键排序（窗内在前 = 同层内 CE 优先），尾块也有
+        -- 先长后短。字词模式（非整句）不走此块，行为不变。
         if sent_on then
-            -- 2026-11-26 用户定案：整句模式恢复「先长后短」显示序（同字数
-            -- 保持融合序；融合/准入/前缀判定仍用融合序，不受显示序影响）。
-            -- 2026-11-26 用户定案①：单字块内再按**整读层**分两段——整读在前、
-            -- 前缀简拼/纠错在后（不能统一按融合分排；tier 只是排序键，不进
-            -- 融合分）。tier_map 为 nil（无表/A/B 关）时行为与旧版逐位一致。
-            local di = {}
-            for i, c in ipairs(ordered) do di[i] = { c = c, i = i } end
-            table.sort(di, function(a, b)
-                local la = utf8.len(a.c.text) or #a.c.text
-                local lb = utf8.len(b.c.text) or #b.c.text
-                if la ~= lb then return la > lb end
-                if la == 1 and tier_map then
-                    local ta = tier_map[a.c.text] or 0
-                    local tb = tier_map[b.c.text] or 0
-                    if ta ~= tb then return ta < tb end
+            local seq = {}
+            for i, c in ipairs(ordered) do
+                seq[#seq + 1] = { c = c, i = i }
+            end
+            for _, e in ipairs(layer1) do
+                if not seen[e.c.text] and not (genset and genset[e.c.text]) then
+                    seq[#seq + 1] = { c = e.c, i = #seq + 1 }
+                end
+            end
+            for _, x in ipairs(seq) do
+                local s, e2 = cand_span(x.c)
+                x.span = (s and e2 and e2 > s) and (e2 - seg_start)
+                          or (utf8.len(x.c.text) or #x.c.text)
+                x.comp = cand_is_completion(x.c) and 1 or 0
+                x.one = (utf8.len(x.c.text) or #x.c.text) == 1
+                x.tier = (x.one and tier_map and tier_map[x.c.text]) and 1 or 0
+            end
+            table.sort(seq, function(a, b)
+                if a.span ~= b.span then return a.span > b.span end
+                if a.comp ~= b.comp then return a.comp < b.comp end
+                if a.one and b.one and a.tier ~= b.tier then
+                    return a.tier < b.tier
                 end
                 return a.i < b.i
             end)
-            for _, x in ipairs(di) do out[#out + 1] = x.c end
+            for _, x in ipairs(seq) do out[#out + 1] = x.c end
         else
             for _, c in ipairs(ordered) do out[#out + 1] = c end
-        end
-        for _, e in ipairs(layer1) do
-            if not seen[e.c.text]
-               and not (genset and genset[e.c.text]) then
-                out[#out + 1] = e.c
+            for _, e in ipairs(layer1) do
+                if not seen[e.c.text] and not (genset and genset[e.c.text]) then
+                    out[#out + 1] = e.c
+                end
             end
         end
         -- 组句首选可能与窗口候选同文本（注入时组句版已替换引擎版）——按
@@ -2497,7 +2561,9 @@ return function(translation, env)
         if wid and not w_written then
             _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
                            texts_of(out, 20), tick, "ok", "",
-                           prep_flag == "1", freq_only and "nofreq" or "")
+                           prep_flag == "1", freq_only and "nofreq" or "",
+                           comp_positions(l1win, comp_of) .. ";" ..
+                           comp_positions(texts_of(out, 20), comp_of))
             w_written = true
         end
         -- 来源徽章已删（2026-11-10 用户定案：实时调试窗口上线——上文来源/

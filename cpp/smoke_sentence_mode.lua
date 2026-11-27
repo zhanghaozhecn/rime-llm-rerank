@@ -38,7 +38,7 @@ end
 print(string.format("[smoke] model ready %.0fs", os.clock() - t0))
 
 -- mock env：sentence_mode 开关 + code_pattern + composition 活动段
-local function mkenv(sent, input, seg, pfx)
+local function mkenv(sent, input, seg, pfx, budget)
   return {
     engine = {
       schema = { config = {
@@ -49,7 +49,10 @@ local function mkenv(sent, input, seg, pfx)
           return nil
         end,
         get_int = function(_, k)
-          if k == "llm_rerank/max_candidates" then return 5 end
+          if k == "llm_rerank/ce_budget" and budget then return budget end
+          if k == "llm_rerank/max_candidates" and not budget then
+            return 5
+          end
           return nil
         end,
         get_string = function(_, k)
@@ -76,8 +79,8 @@ local function mkenv(sent, input, seg, pfx)
     },
   }
 end
-local function mkc(t, s, e)
-  local c = { text = t, comment = "", type = "table" }
+local function mkc(t, s, e, typ)
+  local c = { text = t, comment = "", type = typ or "table" }
   if s then c.start = s; c._end = e end
   return c
 end
@@ -93,6 +96,10 @@ end
 local filter = dofile("../user/llm_filter.lua")
 assert(type(filter) == "function", "filter not loaded")
 
+-- 语料写入打桩（W 行断言用；同 smoke_async）
+local CORPUS = {}
+_G.llm_corpus_write = function(line) CORPUS[#CORPUS + 1] = line end
+
 -- 异步基建（2026-11-22）适配：整句模式 2026-11-23 起改为同步短预算
 -- （150ms）——首轮即融合序；helper 仍跑二次同输入（命中缓存、0 LLM），
 -- 断言落在稳定的融合路径上。
@@ -100,12 +107,12 @@ local function msleep(ms)
   local t = os.clock()
   while (os.clock() - t) * 1000 < ms do end
 end
-local function sent_run(cands, input, seg, wait_ms, pfx)
+local function sent_run(cands, input, seg, wait_ms, pfx, budget)
   OUT = {}; LIVE = {}
-  filter(mktrans(cands), mkenv(true, input, seg, pfx))
+  filter(mktrans(cands), mkenv(true, input, seg, pfx, budget))
   msleep(wait_ms or 250)
   OUT = {}; LIVE = {}
-  filter(mktrans(cands), mkenv(true, input, seg, pfx))
+  filter(mktrans(cands), mkenv(true, input, seg, pfx, budget))
 end
 
 local function lrows()
@@ -342,5 +349,46 @@ sent_run({
 _G.user_freq_eff = old_eff2
 assert(_G.llm_pending_confirm == nil, "H: 关闭后不应挂起")
 print("[smoke] H 前缀软确认（单一路线：无组句不确认）OK")
+
+-- ═══ 场景 I：显示序按原生类型优先级（span → 精确/联想 → 融合序）═══
+-- 2026-11-27 用户定案：联想/补全候选（原生 type="completion"，词条码比输入长）
+-- 必须排在同 span 的精确词之后，但仍排在更短覆盖的候选之前；窗口与尾块用
+-- 同一键（旧版尾块是纯层1 序，无长度序；旧版显示序用「字数」代理 span，
+-- 联想词字数 = 音节+1 被顶到首位）。
+-- ce_budget=2：过站(层1 首位，eff=100，2 token→花 1) + 过去(2 token→花 1)
+-- 进窗；两个 span5 联想候选(3 token→各花 2) 预算不足 → 进尾块。
+local old_eff3 = _G.user_freq_eff
+_G.user_freq_eff = function(t) return (t == "过站") and 100 or 0 end
+sent_run({
+    mkc("过去站", 0, 5, "completion"),
+    mkc("过去时", 0, 5, "completion"),
+    mkc("过去", 0, 5, "phrase"),
+    mkc("过站", 0, 4, "phrase"),
+    mkc("过", 0, 2, "phrase"),
+  }, "guoqu", { start = 0, _end = 5 }, nil, nil, 2)
+_G.user_freq_eff = old_eff3
+local iseq = {}
+for _, c in ipairs(OUT) do iseq[#iseq + 1] = c.text end
+local igot = table.concat(iseq, "/")
+assert(#OUT == 5, "I: yield count=" .. #OUT .. " got=" .. igot)
+assert(OUT[1].text == "过去",
+       "I1 同 span 精确词应在联想之前: " .. igot)
+assert((OUT[2].text == "过去站" and OUT[3].text == "过去时")
+       or (OUT[2].text == "过去时" and OUT[3].text == "过去站"),
+       "I2 span5 联想候选紧随其后（尾块也得有长度序）: " .. igot)
+assert(OUT[4].text == "过站",
+       "I3 span4 虽层1 首位，仍排在 span5 之后: " .. igot)
+assert(OUT[5].text == "过", "I4 最短覆盖在末尾: " .. igot)
+-- v9 联想类标（W 行尾 comp=窗内位次;最终序位次）：最终序第 2/3 位是联想
+-- （窗内位次取决于 CE 预算实际花在哪几个——只断最终序部分）
+local wline = nil
+for i = #CORPUS, 1, -1 do
+  if CORPUS[i]:sub(1, 2) == "W\t" then wline = CORPUS[i]; break end
+end
+assert(wline, "I5 未写出 W 行")
+local comp = wline:match("\tcomp=([^\t]*)$")
+assert(comp and comp:match(";2,3$"),
+       "I5 v9 comp 类标最终序应为 '2,3'，实得 " .. tostring(comp))
+print("[smoke] I span→精确/联想→融合序 显示序（窗+尾块同键）OK")
 
 print("[smoke] SMOKE-SENTENCE-MODE OK")
