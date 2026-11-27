@@ -1105,13 +1105,18 @@ local function ngram_ensure(env)
 end
 
 -- 生成并把候选构造好（text/lead/lead_end 供前缀判定）；ctx = 上文 + 已确认前缀
+-- 默认走增量入口 ngram_sentences_cached（跨键复用逐码位 beam，结果与全量
+-- 逐位一致；有效性不满足自动回落全量）。A/B：`_G.llm_ngram_incr = false`
+-- 或环境变量 RIME_LLM_NGRAM_INCR=0 回旧全量入口；旧 dll 无缓存入口时也回落。
 local function ngram_make(env, code, context, prefix_text, seg_start, seg_end)
     if not ngram_ensure(env) then return nil end
     local ctor = _G.Candidate
     if not ctor then return nil end
     local ctx = context or ""
     if prefix_text and prefix_text ~= "" then ctx = ctx .. prefix_text end
-    local ok, items = pcall(llm.ngram_sentences, code, ctx, NGRAM_PARAMS)
+    local entry = llm.ngram_sentences_cached
+    if _G.llm_ngram_incr == false or not entry then entry = llm.ngram_sentences end
+    local ok, items = pcall(entry, code, ctx, NGRAM_PARAMS)
     if not ok or type(items) ~= "table" then return nil end
     local out = {}
     for _, it in ipairs(items) do

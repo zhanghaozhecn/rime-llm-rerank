@@ -2707,35 +2707,32 @@ int lua_ngram_status(lua_State *L) {
   return 1;
 }
 
-int lua_ngram_sentences(lua_State *L) {
-  const char *code = luaL_checkstring(L, 1);
-  const char *ctx = luaL_optstring(L, 2, "");
+// ngram_sentences[_cached] 共用：参数表解析 + 结果压栈。
+rime_llm::ngram::Params ngram_parse_params(lua_State *L, int idx) {
   rime_llm::ngram::Params p;
-  if (lua_istable(L, 3)) {
-    p.topk = (int)ngram_opt_num(L, 3, "topk", p.topk);
-    p.beam = (int)ngram_opt_num(L, 3, "beam", p.beam);
-    p.ctx_tail = (int)ngram_opt_num(L, 3, "ctx_tail", p.ctx_tail);
-    p.max_len = (int)ngram_opt_num(L, 3, "max_len", p.max_len);
-    p.min_len = (int)ngram_opt_num(L, 3, "min_len", p.min_len);
+  if (lua_istable(L, idx)) {
+    p.topk = (int)ngram_opt_num(L, idx, "topk", p.topk);
+    p.beam = (int)ngram_opt_num(L, idx, "beam", p.beam);
+    p.ctx_tail = (int)ngram_opt_num(L, idx, "ctx_tail", p.ctx_tail);
+    p.max_len = (int)ngram_opt_num(L, idx, "max_len", p.max_len);
+    p.min_len = (int)ngram_opt_num(L, idx, "min_len", p.min_len);
     p.collocation_penalty =
-        ngram_opt_num(L, 3, "collocation_penalty", p.collocation_penalty);
-    p.non_collocation_penalty = ngram_opt_num(
-        L, 3, "non_collocation_penalty", p.non_collocation_penalty);
-    p.weak_collocation_penalty = ngram_opt_num(
-        L, 3, "weak_collocation_penalty", p.weak_collocation_penalty);
-    p.rear_penalty = ngram_opt_num(L, 3, "rear_penalty", p.rear_penalty);
-    p.min_weight = ngram_opt_num(L, 3, "min_weight", p.min_weight);
-    p.max_edges = (int)ngram_opt_num(L, 3, "max_edges", p.max_edges);
+        ngram_opt_num(L, idx, "collocation_penalty", p.collocation_penalty);
+    p.non_collocation_penalty =
+        ngram_opt_num(L, idx, "non_collocation_penalty",
+                      p.non_collocation_penalty);
+    p.weak_collocation_penalty =
+        ngram_opt_num(L, idx, "weak_collocation_penalty",
+                      p.weak_collocation_penalty);
+    p.rear_penalty = ngram_opt_num(L, idx, "rear_penalty", p.rear_penalty);
+    p.min_weight = ngram_opt_num(L, idx, "min_weight", p.min_weight);
+    p.max_edges = (int)ngram_opt_num(L, idx, "max_edges", p.max_edges);
   }
-  std::vector<rime_llm::ngram::Sentence> out;
-  {
-    std::lock_guard<std::mutex> lk(g_ngram_mu);
-    if (!g_ngram) {
-      lua_pushnil(L);
-      return 1;
-    }
-    out = g_ngram->Generate(code, ctx, p);
-  }
+  return p;
+}
+
+int ngram_push_sentences(lua_State *L,
+                         const std::vector<rime_llm::ngram::Sentence> &out) {
   lua_newtable(L);
   int n = 0;
   for (size_t i = 0; i < out.size(); ++i) {
@@ -2764,6 +2761,40 @@ int lua_ngram_sentences(lua_State *L) {
     lua_seti(L, -2, (lua_Integer)(++n));
   }
   return 1;
+}
+
+int lua_ngram_sentences(lua_State *L) {
+  const char *code = luaL_checkstring(L, 1);
+  const char *ctx = luaL_optstring(L, 2, "");
+  const rime_llm::ngram::Params p = ngram_parse_params(L, 3);
+  std::vector<rime_llm::ngram::Sentence> out;
+  {
+    std::lock_guard<std::mutex> lk(g_ngram_mu);
+    if (!g_ngram) {
+      lua_pushnil(L);
+      return 1;
+    }
+    out = g_ngram->Generate(code, ctx, p);
+  }
+  return ngram_push_sentences(L, out);
+}
+
+// 增量组句：跨键复用逐码位剪枝 beam，结果与 Generate 逐位一致（见
+// ngram.cpp 的 GenerateCached 注释）。有效性不满足自动回落全量。
+int lua_ngram_sentences_cached(lua_State *L) {
+  const char *code = luaL_checkstring(L, 1);
+  const char *ctx = luaL_optstring(L, 2, "");
+  const rime_llm::ngram::Params p = ngram_parse_params(L, 3);
+  std::vector<rime_llm::ngram::Sentence> out;
+  {
+    std::lock_guard<std::mutex> lk(g_ngram_mu);
+    if (!g_ngram) {
+      lua_pushnil(L);
+      return 1;
+    }
+    out = g_ngram->GenerateCached(code, ctx, p);
+  }
+  return ngram_push_sentences(L, out);
 }
 }  // namespace
 
@@ -2827,6 +2858,8 @@ extern "C" __declspec(dllexport) int luaopen_rime_llm(lua_State * L) {
     lua_setfield(L, -2, "ngram_load");
     lua_pushcfunction(L, lua_ngram_sentences);
     lua_setfield(L, -2, "ngram_sentences");
+    lua_pushcfunction(L, lua_ngram_sentences_cached);
+    lua_setfield(L, -2, "ngram_sentences_cached");
     lua_pushcfunction(L, lua_ngram_status);
     lua_setfield(L, -2, "ngram_status");
 

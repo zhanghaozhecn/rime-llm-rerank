@@ -418,6 +418,17 @@ LTS `.gram`（Rime octagram 格式，44B 头 + Darts 双数组）+ 万象词库
   只是输出截断不同）。与 `eval/tools/sentence_gen_gram.py` 留档
   **100/100 逐句一致**（文本+分数，误差 <1e-6）。对拍工具：
   `cpp/ngram_parity.lua` + 研究库 `eval/tools/ngram_parity_check.py`。
+- **增量组句（2026-11-27）**：逐键续打跨键**复用逐码位剪枝 beam**——位置 i
+  的剪枝结果只依赖码前缀 + 上文尾 + 参数（纯函数），恢复时只补旧位尾部边
+  （旧句尾边带 is_rear 分不可复用）、再从旧码长续跑原循环。结果与全量
+  **逐位一致**（200 句 × 6,741 前缀步 + 200 次 memo 对拍 fail=0，对拍脚本
+  `NGRAM_MODE=incr` 自带逐键模拟）。逐键开销 4–15ms → **~1.2–2ms 且不随
+  码长超线性涨**（30 码 5.7×、48 码 8.5×）；同输入重复调用（filter 重绘）
+  走 memo 零成本。有效性 = 纯前缀延伸 + 同上文尾 + 同参数，不满足自动回落
+  全量；检查点 ≤48 位（超长不建）。A/B：环境变量 `RIME_LLM_NGRAM_INCR=0`
+  或 `_G.llm_ngram_incr=false`；`llm.ngram_status()` 带 fresh/resume/memo
+  计数与最近耗时。冷路径另获 −23%（限边索引每码位只建一次，原每状态重复
+  构建排序 32 次）。
 - 词表索引：首次解析万象 dicts → 二进制 mmap 缓存（约 86MB/方案），
   二次加载近 0 秒；缓存路径 `llm_rerank\ngram_lex\<方案>.bin`。
 - **插件版边界**：官方 rime.dll / TSF 没有推送通道、异步指纹随输入变化，

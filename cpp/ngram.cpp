@@ -17,6 +17,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -596,6 +597,39 @@ struct RawEntry {
   double weight = 1.0;
 };
 
+// ── 增量组句会话（跨键 beam 复用）──────────────────────────────────────
+// 逐键续打时上一键的逐码位剪枝 beam 完全可复用：位置 i 的剪枝结果只依赖
+// code[0..i)、上文尾部 prev_tail 与参数（beam 主循环内无任何后文依赖）。
+// 恢复 = 复用旧位 0..m-1 的剪枝 beam、只重算它们的尾部边（j ≥ m——旧句尾
+// 边带 is_rear 分不可复用），再从 m 起跑原循环；按 i 升序展开使逐 j 插入
+// 序与全量重搜完全一致 → 去重/稳定排序结果逐位一致。parent 恒指向剪枝条
+// 目或根（展开只遍历剪枝后列表），故检查点 = 各位剪枝 beam 的并集，无孤儿。
+struct SessionCNode {
+  double score = 0.0;
+  int parent = -1;             // arena 全局下标；-1 = 根
+  std::string text;
+  std::string word;
+  int code_j = 0;
+  std::string ctx_key;         // gram 查询键上文段（已派生，恢复直用）
+  std::vector<uint8_t> ctx_enc;
+  size_t ctx_len = 0;
+};
+
+struct Session {
+  bool valid = false;          // 检查点可用（有效性指纹见 GenerateCached）
+  std::string prev_code;       // 上次 code（新码须为其纯前缀延伸）
+  std::string prev_tail;       // 上次 context 尾（ctx_tail 字）
+  Params params{};             // 上次参数（须逐字段一致）
+  std::vector<SessionCNode> nodes;  // arena：nodes[0] = 根，其后按码位分段
+  std::vector<int> pos_begin;  // 位 i beam = nodes[pos_begin[i] .. +pos_count[i])
+  std::vector<int> pos_count;  // （已按分降序 = 剪枝后顺序）
+  std::vector<Sentence> last_out;   // 同输入 memo（filter 重绘零成本）
+  std::string last_code;
+  std::string last_tail;
+  Params last_params{};
+  bool have_last = false;
+};
+
 }  // namespace
 
 std::string NormalizeReading(const std::string& code) {
@@ -679,11 +713,27 @@ struct Engine::Impl {
   const char* cache_code_pool_ = nullptr;
   const char* cache_word_pool_ = nullptr;
 
+  // 增量组句（GenerateCached 专用；Generate 冷路径不碰）。
+  Session session;
+  // 诊断计数：全量/恢复/memo 次数 + 最近一次耗时与码长/复用位数
+  // （reuse=-2 表示 memo 命中）。
+  unsigned long long incr_fresh = 0;
+  unsigned long long incr_resume = 0;
+  unsigned long long incr_memo = 0;
+  double incr_ms_last = 0.0;
+  int incr_n_last = 0;
+  int incr_m_last = -1;
+
   bool LoadCache();
   bool BuildFromDicts();
   bool WriteCache() const;
   bool FindCode(const std::string& code, uint32_t* first,
                 uint32_t* count) const;
+  // 组句 beam 核（冷路径与增量恢复共用；见下方定义处注释）
+  std::vector<Sentence> GenerateCore(const std::string& code,
+                                     const std::string& prev_tail,
+                                     const Params& p, Session* sess,
+                                     int* m_used);
 
  private:
   bool ParseDictFile(const std::string& filename,
@@ -1020,26 +1070,55 @@ const std::string& Engine::error() const { return impl_->error; }
 
 std::string Engine::status() const {
   std::lock_guard<std::mutex> lock(impl_->mu);
-  return impl_->status;
+  char buf[224];
+  _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+              "%s; incr: fresh=%llu resume=%llu memo=%llu last=%.2fms "
+              "code=%d reuse=%d",
+              impl_->status.c_str(), impl_->incr_fresh, impl_->incr_resume,
+              impl_->incr_memo, impl_->incr_ms_last, impl_->incr_n_last,
+              impl_->incr_m_last);
+  return buf;
 }
 
-std::vector<Sentence> Engine::Generate(const std::string& code,
-                                       const std::string& context,
-                                       const Params& p) {
-  std::lock_guard<std::mutex> lock(impl_->mu);
+namespace {
+
+// 检查点保留上限：超长码不建检查点（输入闸 30 字母之外的双保险；恢复侧
+// 不受限——旧检查点 ≤48 位仍可续打到更长码）。
+constexpr int kSessionMaxCode = 48;
+
+bool ParamsEqual(const Params& a, const Params& b) {
+  return a.beam == b.beam && a.topk == b.topk && a.ctx_tail == b.ctx_tail &&
+         a.max_len == b.max_len && a.min_len == b.min_len &&
+         a.collocation_penalty == b.collocation_penalty &&
+         a.non_collocation_penalty == b.non_collocation_penalty &&
+         a.weak_collocation_penalty == b.weak_collocation_penalty &&
+         a.rear_penalty == b.rear_penalty && a.min_weight == b.min_weight &&
+         a.max_edges == b.max_edges;
+}
+
+std::string ContextTail(const std::string& context, int ctx_tail) {
+  const std::vector<uint32_t> cps = Utf8ToCodepoints(context);
+  const size_t tail_n = static_cast<size_t>(std::max(0, ctx_tail));
+  const size_t begin = cps.size() > tail_n ? cps.size() - tail_n : 0;
+  return CodepointsToUtf8(cps, begin, cps.size());
+}
+
+}  // namespace
+
+// 组句 beam 核：冷路径与增量恢复共用（sess=null = 纯冷路径，行为与旧
+// Generate 逐位一致）。恢复时复用旧位 0..m-1 剪枝 beam（Phase A 只补尾部
+// 边），再从 m 起跑原循环（Phase B）；*m_used = 复用位数。检查点回写与
+// 同输入 memo 也在本函数收尾。
+std::vector<Sentence> Engine::Impl::GenerateCore(
+    const std::string& code, const std::string& prev_tail, const Params& p,
+    Session* sess, int* m_used) {
   std::vector<Sentence> out;
   const int n = static_cast<int>(code.size());
-  if (n <= 0 || impl_->rec_count() == 0) return out;
+  *m_used = 0;
+  if (n <= 0 || rec_count() == 0) return out;
 
-  const std::vector<uint32_t> ctx_cps = Utf8ToCodepoints(context);
-  const size_t tail_n = static_cast<size_t>(std::max(0, p.ctx_tail));
-  const size_t ctx_begin =
-      ctx_cps.size() > tail_n ? ctx_cps.size() - tail_n : 0;
-  const std::string prev_tail =
-      CodepointsToUtf8(ctx_cps, ctx_begin, ctx_cps.size());
-
-  const LexRec* recs = impl_->recs_data();
-  const char* word_pool = impl_->word_pool_data();
+  const LexRec* recs = recs_data();
+  const char* word_pool = word_pool_data();
 
   struct Node {
     double score = 0.0;
@@ -1049,26 +1128,176 @@ std::vector<Sentence> Engine::Generate(const std::string& code,
     int code_j = 0;
   };
   std::vector<Node> nodes;
-  nodes.reserve(4096);
   std::vector<std::vector<int>> states(static_cast<size_t>(n) + 1);
-  nodes.push_back(Node());
-  states[0].push_back(0);
+
+  // ── 增量恢复：旧位剪枝 beam 原样搬入工作 arena（下标 1:1 对应检查点）──
+  int m = 0;
+  if (sess && sess->valid &&
+      sess->prev_code.size() <= static_cast<size_t>(n) &&
+      sess->prev_code.size() <= static_cast<size_t>(kSessionMaxCode) &&
+      std::memcmp(sess->prev_code.data(), code.data(),
+                  sess->prev_code.size()) == 0 &&
+      sess->prev_tail == prev_tail && ParamsEqual(sess->params, p)) {
+    m = static_cast<int>(sess->prev_code.size());
+    nodes.reserve(sess->nodes.size() + 64);
+    for (const SessionCNode& cn : sess->nodes) {
+      Node nd;
+      nd.score = cn.score;
+      nd.parent = cn.parent;
+      nd.text = cn.text;
+      nd.word = cn.word;
+      nd.code_j = cn.code_j;
+      nodes.push_back(std::move(nd));
+    }
+    for (int i = 0; i < m; ++i) {
+      std::vector<int>& st = states[static_cast<size_t>(i)];
+      st.reserve(static_cast<size_t>(sess->pos_count[static_cast<size_t>(i)]));
+      for (int k = 0; k < sess->pos_count[static_cast<size_t>(i)]; ++k)
+        st.push_back(sess->pos_begin[static_cast<size_t>(i)] + k);
+    }
+    *m_used = m;
+  }
+  if (m == 0) {
+    nodes.reserve(4096);
+    nodes.push_back(Node());
+    states[0].push_back(0);
+  }
 
   std::unordered_map<std::string, double> query_cache;
   std::unordered_map<std::string, std::vector<uint32_t>> word_cps_cache;
   const size_t gram_n =
       static_cast<size_t>(std::max(0, std::min(8, p.max_len - 1)));
+  bool valve = false;
 
-  for (int i = 0; i < n; ++i) {
-    if (states[i].empty()) continue;
+  // 每 (i,j) 的词表定位/限边索引只建一次。原实现每个 (state,j) 重建并重排
+  // 一次（beam=32 时同数据重复 32 遍）；stable_sort 语义不变 → 边迭代序与
+  // 结果完全一致，纯提速。
+  struct EdgeLoc {
+    bool done = false;
+    bool found = false;
+    uint32_t first = 0;
+    uint32_t count = 0;
+    const uint32_t* order = nullptr;  // null = 记录连续 first..first+count
+    uint32_t order_count = 0;
+    std::vector<uint32_t> limited;
+  };
+  std::unordered_map<int, EdgeLoc> edge_loc;
+
+  // 单个已剪枝状态的展开：j ∈ [j_lo, n]。cn 非空 = 恢复路径（ctx 派生量
+  // 取检查点，免重导）；is_rear = (j == n) 计入查询键与 gram 查询。
+  auto expand_state = [&](int i, size_t s, int j_lo, const SessionCNode* cn) {
+    const int cur_idx = states[static_cast<size_t>(i)][s];
+    // 注意：nodes.push_back 会让引用失效——当前节点必须按值取用
+    const double cur_score = nodes[cur_idx].score;
+    const std::string cur_text = nodes[cur_idx].text;
+    std::string ctx_key;
+    std::vector<uint8_t> ctx_enc;
+    size_t ctx_len = 0;
+    if (cn) {
+      ctx_key = cn->ctx_key;
+      ctx_enc = cn->ctx_enc;
+      ctx_len = cn->ctx_len;
+    } else {
+      const std::vector<uint32_t> full_cps =
+          Utf8ToCodepoints(prev_tail + cur_text);
+      const size_t keep =
+          full_cps.size() > gram_n ? full_cps.size() - gram_n : 0;
+      ctx_enc = EncodeCodepoints(full_cps, keep, full_cps.size());
+      ctx_len = full_cps.size() - keep;
+      ctx_key = CodepointsToUtf8(full_cps, keep, full_cps.size());
+    }
+
+    for (int j = j_lo; j <= n; ++j) {
+      EdgeLoc& el = edge_loc[j];
+      if (!el.done) {
+        el.done = true;
+        const std::string sub =
+            code.substr(static_cast<size_t>(i), static_cast<size_t>(j - i));
+        uint32_t first = 0, count = 0;
+        if (FindCode(sub, &first, &count) && count > 0) {
+          el.found = true;
+          el.first = first;
+          el.count = count;
+          if (p.max_edges > 0 && static_cast<int>(count) > p.max_edges) {
+            el.limited.reserve(count);
+            for (uint32_t e = 0; e < count; ++e) el.limited.push_back(first + e);
+            std::stable_sort(el.limited.begin(), el.limited.end(),
+                             [&](uint32_t a, uint32_t b) {
+                               return recs[a].weight > recs[b].weight;
+                             });
+            el.limited.resize(static_cast<size_t>(p.max_edges));
+            el.order = el.limited.data();
+            el.order_count = static_cast<uint32_t>(el.limited.size());
+          } else {
+            el.order = nullptr;
+            el.order_count = count;
+          }
+        }
+      }
+      if (!el.found) continue;
+      for (uint32_t e = 0; e < el.order_count; ++e) {
+        const LexRec& rec = recs[el.order ? el.order[e] : (el.first + e)];
+        const double weight = static_cast<double>(rec.weight);
+        if (weight < p.min_weight) continue;
+        const std::string word(word_pool + rec.word_off, rec.word_len);
+        std::string qkey = ctx_key;
+        qkey.push_back('\x1f');
+        qkey += word;
+        qkey.push_back(j == n ? '1' : '0');
+        double qv = 0.0;
+        auto qit = query_cache.find(qkey);
+        if (qit != query_cache.end()) {
+          qv = qit->second;
+        } else {
+          if (have_gram) {
+            auto wit = word_cps_cache.find(word);
+            if (wit == word_cps_cache.end()) {
+              wit = word_cps_cache.emplace(word, Utf8ToCodepoints(word)).first;
+            }
+            const std::vector<uint32_t>& wcps = wit->second;
+            const size_t wend = std::min(wcps.size(), gram_n);
+            const std::vector<uint8_t> wenc =
+                EncodeCodepoints(wcps, 0, wend);
+            qv = gram.Query(ctx_enc, ctx_len, wenc, wend, j == n, p);
+          }
+          query_cache.emplace(qkey, qv);
+        }
+        Node child;
+        child.score = cur_score + std::log(std::max(weight, 1e-6)) -
+                      kLogScale + qv;
+        child.parent = cur_idx;
+        child.text = cur_text + word;
+        child.word = word;
+        child.code_j = j;
+        nodes.push_back(child);
+        states[static_cast<size_t>(j)].push_back(
+            static_cast<int>(nodes.size() - 1));
+      }
+    }
+  };
+
+  // ── Phase A：旧位 0..m-1 只补尾部边（j ≥ m；j > i 的旧边已在检查点里）──
+  for (int i = 0; i < m && !valve; ++i) {
+    if (states[static_cast<size_t>(i)].empty()) continue;
+    edge_loc.clear();
+    const int j_lo = std::max(m, i + 1);
+    for (size_t s = 0; s < states[static_cast<size_t>(i)].size(); ++s) {
+      expand_state(i, s, j_lo, &sess->nodes[states[static_cast<size_t>(i)][s]]);
+    }
+    if (nodes.size() > 4000000) valve = true;  // 安全阀（异常输入）
+  }
+
+  // ── Phase B：从 m 起跑原循环（冷路径 m=0 = 全量）──
+  for (int i = m; i < n && !valve; ++i) {
+    if (states[static_cast<size_t>(i)].empty()) continue;
     // 位内去重（同文本保最高分）+ 截断 beam（稳定排序，同分保插入序）
     // 插入序与 Python dict 一致：同文本首次出现的位置不变、只更新为更高分项。
     std::unordered_map<std::string, size_t> pos;
     std::vector<int> kept;
-    pos.reserve(states[i].size() * 2);
-    kept.reserve(states[i].size());
-    for (size_t k = 0; k < states[i].size(); ++k) {
-      const int idx = states[i][k];
+    pos.reserve(states[static_cast<size_t>(i)].size() * 2);
+    kept.reserve(states[static_cast<size_t>(i)].size());
+    for (size_t k = 0; k < states[static_cast<size_t>(i)].size(); ++k) {
+      const int idx = states[static_cast<size_t>(i)][k];
       auto it = pos.find(nodes[idx].text);
       if (it == pos.end()) {
         pos.emplace(nodes[idx].text, kept.size());
@@ -1081,119 +1310,171 @@ std::vector<Sentence> Engine::Generate(const std::string& code,
       return nodes[a].score > nodes[b].score;
     });
     if (static_cast<int>(kept.size()) > p.beam) kept.resize(p.beam);
-    states[i].swap(kept);
+    states[static_cast<size_t>(i)].swap(kept);
 
-    for (size_t s = 0; s < states[i].size(); ++s) {
-      const int cur_idx = states[i][s];
-      // 注意：nodes.push_back 会让引用失效——当前节点必须按值取用
-      const double cur_score = nodes[cur_idx].score;
-      const std::string cur_text = nodes[cur_idx].text;
-      const std::vector<uint32_t> full_cps =
-          Utf8ToCodepoints(prev_tail + cur_text);
-      const size_t keep = full_cps.size() > gram_n ? full_cps.size() - gram_n : 0;
-      const std::vector<uint8_t> ctx_enc =
-          EncodeCodepoints(full_cps, keep, full_cps.size());
-      const size_t ctx_len = full_cps.size() - keep;
-      const std::string ctx_key =
-          CodepointsToUtf8(full_cps, keep, full_cps.size());
-
-      for (int j = i + 1; j <= n; ++j) {
-        const std::string sub =
-            code.substr(static_cast<size_t>(i), static_cast<size_t>(j - i));
-        uint32_t first = 0, count = 0;
-        if (!impl_->FindCode(sub, &first, &count) || count == 0) continue;
-        // order = nullptr 表示记录连续（first..first+count）；限边时才建索引表
-        const uint32_t* order = nullptr;
-        uint32_t order_count = count;
-        std::vector<uint32_t> limited;
-        if (p.max_edges > 0 && static_cast<int>(count) > p.max_edges) {
-          limited.reserve(count);
-          for (uint32_t e = 0; e < count; ++e) limited.push_back(first + e);
-          std::stable_sort(limited.begin(), limited.end(),
-                           [&](uint32_t a, uint32_t b) {
-                             return recs[a].weight > recs[b].weight;
-                           });
-          limited.resize(static_cast<size_t>(p.max_edges));
-          order = limited.data();
-          order_count = static_cast<uint32_t>(limited.size());
-        }
-        for (uint32_t e = 0; e < order_count; ++e) {
-          const LexRec& rec = recs[order ? order[e] : (first + e)];
-          const double weight = static_cast<double>(rec.weight);
-          if (weight < p.min_weight) continue;
-          const std::string word(word_pool + rec.word_off, rec.word_len);
-          std::string qkey = ctx_key;
-          qkey.push_back('\x1f');
-          qkey += word;
-          qkey.push_back(j == n ? '1' : '0');
-          double qv = 0.0;
-          auto qit = query_cache.find(qkey);
-          if (qit != query_cache.end()) {
-            qv = qit->second;
-          } else {
-            if (impl_->have_gram) {
-              auto wit = word_cps_cache.find(word);
-              if (wit == word_cps_cache.end()) {
-                wit = word_cps_cache.emplace(word, Utf8ToCodepoints(word)).first;
-              }
-              const std::vector<uint32_t>& wcps = wit->second;
-              const size_t wend = std::min(wcps.size(), gram_n);
-              const std::vector<uint8_t> wenc =
-                  EncodeCodepoints(wcps, 0, wend);
-              qv = impl_->gram.Query(ctx_enc, ctx_len, wenc, wend, j == n, p);
-            }
-            query_cache.emplace(qkey, qv);
-          }
-          Node child;
-          child.score = cur_score + std::log(std::max(weight, 1e-6)) -
-                        kLogScale + qv;
-          child.parent = cur_idx;
-          child.text = cur_text + word;
-          child.word = word;
-          child.code_j = j;
-          nodes.push_back(child);
-          states[static_cast<size_t>(j)].push_back(
-              static_cast<int>(nodes.size() - 1));
-        }
-      }
+    edge_loc.clear();
+    for (size_t s = 0; s < states[static_cast<size_t>(i)].size(); ++s) {
+      expand_state(i, s, i + 1, nullptr);
     }
-    if (nodes.size() > 4000000) break;  // 安全阀（异常输入）
+    if (nodes.size() > 4000000) valve = true;
   }
 
   std::vector<int>& finals = states[static_cast<size_t>(n)];
-  if (finals.empty()) return out;
-  // 末位去重：同文本保最高分，插入序 = 首次出现在 finals 的顺序（同 Python）
-  std::unordered_map<std::string, size_t> pos;
-  std::vector<int> ranked;
-  pos.reserve(finals.size() * 2);
-  ranked.reserve(finals.size());
-  for (size_t k = 0; k < finals.size(); ++k) {
-    const int idx = finals[k];
-    auto it = pos.find(nodes[idx].text);
-    if (it == pos.end()) {
-      pos.emplace(nodes[idx].text, ranked.size());
-      ranked.push_back(idx);
-    } else if (nodes[idx].score > nodes[ranked[it->second]].score) {
-      ranked[it->second] = idx;
+  if (!finals.empty()) {
+    // 末位去重：同文本保最高分，插入序 = 首次出现在 finals 的顺序（同 Python）
+    std::unordered_map<std::string, size_t> pos;
+    std::vector<int> ranked;
+    pos.reserve(finals.size() * 2);
+    ranked.reserve(finals.size());
+    for (size_t k = 0; k < finals.size(); ++k) {
+      const int idx = finals[k];
+      auto it = pos.find(nodes[idx].text);
+      if (it == pos.end()) {
+        pos.emplace(nodes[idx].text, ranked.size());
+        ranked.push_back(idx);
+      } else if (nodes[idx].score > nodes[ranked[it->second]].score) {
+        ranked[it->second] = idx;
+      }
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
+      return nodes[a].score > nodes[b].score;
+    });
+    if (static_cast<int>(ranked.size()) > p.topk) ranked.resize(p.topk);
+    for (size_t r = 0; r < ranked.size(); ++r) {
+      Sentence s;
+      s.score = nodes[ranked[r]].score;
+      s.text = nodes[ranked[r]].text;
+      for (int idx = ranked[r]; idx > 0; idx = nodes[idx].parent) {
+        Sentence::Word w;
+        w.word = nodes[idx].word;
+        w.code_end = nodes[idx].code_j;
+        s.words.push_back(w);
+      }
+      std::reverse(s.words.begin(), s.words.end());
+      out.push_back(s);
     }
   }
-  std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
-    return nodes[a].score > nodes[b].score;
-  });
-  if (static_cast<int>(ranked.size()) > p.topk) ranked.resize(p.topk);
-  for (size_t r = 0; r < ranked.size(); ++r) {
-    Sentence s;
-    s.score = nodes[ranked[r]].score;
-    s.text = nodes[ranked[r]].text;
-    for (int idx = ranked[r]; idx > 0; idx = nodes[idx].parent) {
-      Sentence::Word w;
-      w.word = nodes[idx].word;
-      w.code_end = nodes[idx].code_j;
-      s.words.push_back(w);
+
+  // ── 检查点回写 + 同输入 memo（阀值触发/超长码不建）──
+  if (sess) {
+    if (!valve && n <= kSessionMaxCode) {
+      std::vector<int> remap(nodes.size(), -1);
+      sess->nodes.clear();
+      sess->pos_begin.clear();
+      sess->pos_count.clear();
+      // 只收各位剪枝 beam（≤ n×beam + 根）；工作 arena 的未存活子节点不收
+      sess->nodes.reserve(1 + static_cast<size_t>(n) *
+                                    static_cast<size_t>(std::max(0, p.beam)));
+      bool cap_ok = true;
+      for (int i = 0; i < n && cap_ok; ++i) {
+        sess->pos_begin.push_back(static_cast<int>(sess->nodes.size()));
+        int cnt = 0;
+        for (size_t k = 0; k < states[static_cast<size_t>(i)].size(); ++k) {
+          const int idx = states[static_cast<size_t>(i)][k];
+          const Node& nd = nodes[idx];
+          SessionCNode cn;
+          cn.score = nd.score;
+          cn.text = nd.text;
+          cn.word = nd.word;
+          cn.code_j = nd.code_j;
+          if (nd.parent >= 0) {
+            cn.parent = remap[static_cast<size_t>(nd.parent)];
+            if (cn.parent < 0) {  // 防御：parent 恒为已存剪枝条目或根
+              cap_ok = false;
+              break;
+            }
+          }
+          const std::vector<uint32_t> full_cps =
+              Utf8ToCodepoints(prev_tail + nd.text);
+          const size_t keep =
+              full_cps.size() > gram_n ? full_cps.size() - gram_n : 0;
+          cn.ctx_enc = EncodeCodepoints(full_cps, keep, full_cps.size());
+          cn.ctx_len = full_cps.size() - keep;
+          cn.ctx_key = CodepointsToUtf8(full_cps, keep, full_cps.size());
+          remap[static_cast<size_t>(idx)] =
+              static_cast<int>(sess->nodes.size());
+          sess->nodes.push_back(std::move(cn));
+          ++cnt;
+        }
+        sess->pos_count.push_back(cnt);
+      }
+      if (cap_ok) {
+        sess->prev_code = code;
+        sess->prev_tail = prev_tail;
+        sess->params = p;
+        sess->valid = true;
+      } else {
+        sess->valid = false;
+      }
+    } else {
+      sess->valid = false;
     }
-    std::reverse(s.words.begin(), s.words.end());
-    out.push_back(s);
+    if (!valve) {
+      sess->last_out = out;
+      sess->last_code = code;
+      sess->last_tail = prev_tail;
+      sess->last_params = p;
+      sess->have_last = true;
+    }
   }
+  return out;
+}
+
+std::vector<Sentence> Engine::Generate(const std::string& code,
+                                       const std::string& context,
+                                       const Params& p) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  const std::string prev_tail = ContextTail(context, p.ctx_tail);
+  int m_used = 0;
+  return impl_->GenerateCore(code, prev_tail, p, nullptr, &m_used);
+}
+
+std::vector<Sentence> Engine::GenerateCached(const std::string& code,
+                                             const std::string& context,
+                                             const Params& params) {
+  // A/B 开关：RIME_LLM_NGRAM_INCR=0 恒走全量（进程内只读一次）。
+  static const bool k_incr_on = [] {
+    char buf[8];
+    size_t needed = 0;
+    if (getenv_s(&needed, buf, sizeof(buf), "RIME_LLM_NGRAM_INCR") == 0 &&
+        needed > 0 && buf[0] == '0')
+      return false;
+    return true;
+  }();
+
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::string prev_tail = ContextTail(context, params.ctx_tail);
+
+  int m_used = 0;
+  std::vector<Sentence> out;
+  if (k_incr_on) {
+    Session& sess = impl_->session;
+    // 同输入 memo：filter 重绘 / 同键多次刷新零成本返回。
+    if (sess.have_last && code == sess.last_code &&
+        prev_tail == sess.last_tail &&
+        ParamsEqual(sess.last_params, params)) {
+      ++impl_->incr_memo;
+      impl_->incr_ms_last = 0.0;
+      impl_->incr_n_last = static_cast<int>(code.size());
+      impl_->incr_m_last = -2;
+      return sess.last_out;
+    }
+    out = impl_->GenerateCore(code, prev_tail, params, &sess, &m_used);
+    if (m_used > 0) {
+      ++impl_->incr_resume;
+    } else {
+      ++impl_->incr_fresh;
+    }
+  } else {
+    out = impl_->GenerateCore(code, prev_tail, params, nullptr, &m_used);
+    ++impl_->incr_fresh;
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  impl_->incr_ms_last =
+      std::chrono::duration<double, std::milli>(t1 - t0).count();
+  impl_->incr_n_last = static_cast<int>(code.size());
+  impl_->incr_m_last = m_used;
   return out;
 }
 

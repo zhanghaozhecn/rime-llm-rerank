@@ -72,6 +72,15 @@ class Engine {
                                  const std::string& context,
                                  const Params& params);
 
+  // 增量组句：跨键复用逐码位剪枝 beam（结果与 Generate 完全一致）。
+  // 会话槽在 Impl 内部（单槽：调用方是引擎线程单流）。有效性 = 新码是上次
+  // 码的纯前缀延伸 + 上文尾部（context 末 ctx_tail 字）一致 + 参数一致；
+  // 不满足即整体回落全量重搜。同 (code, context, params) 重复调用走 memo。
+  // 环境变量 RIME_LLM_NGRAM_INCR=0 时恒走全量（A/B 开关，读一次）。
+  std::vector<Sentence> GenerateCached(const std::string& code,
+                                       const std::string& context,
+                                       const Params& params);
+
  private:
   struct Impl;
   Impl* impl_;
