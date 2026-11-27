@@ -601,9 +601,12 @@ local function write_pending_result(pend, snap)
     local arr = {}
     for i, t in ipairs(win) do
         local s = scores[t]
-        local n = _G.user_freq_eff and _G.user_freq_eff(t, pend.code) or 0
+        -- eff/uni 键 = span 切片查询码（2026-11-27 与同步路径同构；缺 =
+        -- 旧挂账 → 回落整段码，词级聚合回退兜底）
+        local qc = (pend.qcodes and pend.qcodes[t]) or pend.code
+        local n = _G.user_freq_eff and _G.user_freq_eff(t, qc) or 0
         local u1 = _G.user_unigram_term
-                and _G.user_unigram_term(t, pend.code) or 0
+                and _G.user_unigram_term(t, qc) or 0
         local delta = ce_bias_delta(cbtbl, t, pend.code)
         local sd = (pend.share_map and pend.share_map[t]) or 0
         local v
@@ -901,6 +904,19 @@ local function cand_span(c)
     local ok2, e = pcall(function() return c._end end)
     if not ok2 or type(e) ~= "number" then return nil end
     return s, e
+end
+
+-- [span 切片查询码]（2026-11-27）: 词频键从整段码改为**候选自身覆盖段**
+-- ——与账本存储键 (词, 词段码) 同构（commit 归因按词切片入账 :473-481）。
+-- 整句模式整段码查询命中 0.2–1.4%（词级 7–12%）——单词候选切片 == 存储
+-- 键，命中恢复；组句候选 span = 整段（:1143）→ 切片 no-op；span 缺失
+-- （旧 librime-lua）回落整段；字词模式段 = 单词 → no-op。
+local function cand_query_code(c, code, seg_start)
+    local s, e = cand_span(c)
+    if s and e and e > s and s >= seg_start and e <= seg_start + #code then
+        return code:sub(s - seg_start + 1, e - seg_start)
+    end
+    return code
 end
 
 -- ── 音节 → 整读字串（syll_chars.tsv，2026-11-26 用户定案①）──
@@ -1861,11 +1877,15 @@ return function(translation, env)
         -- 窗码)——多音词属不同词条, 每个码对只看自己的历史（wiki 59,681
         -- 窗: 分键全面更优 −0.34~−0.73pp 随龄扩大）。2026-11-22 整句模式:
         -- 窗码 = 活动段切片 code（多段续打正确；单段 == 全串不变）。
+        -- 2026-11-27: 窗码进一步切片到**候选自身覆盖段**（cand_query_code）
+        -- ——与账本存储键 (词, 词段码) 同构，整句模式命中恢复（0.2–1.4%
+        -- → 7–12% 量级）；miss 再走词级聚合回退（llm_processor word_agg）。
         local fe, bt = _G.user_freq_eff, _G.user_unigram_term
         for i, c in ipairs(all) do
-            local n = fe and fe(c.text, code) or 0
+            local qcode = cand_query_code(c, code, seg_start)
+            local n = fe and fe(c.text, qcode) or 0
             local s = FREQ_BETA * math.log(1 + n)
-            if bt then s = s + bt(c.text, code) end
+            if bt then s = s + bt(c.text, qcode) end
             layer1[i] = { c = c, s = s, idx = i }
             s1_of[c.text] = s
         end
@@ -1880,6 +1900,7 @@ return function(translation, env)
     local cbtbl = ce_bias_table()
     local cands = {}
     local l1win = {}
+    local qcodes = {}   -- [text] = span 切片查询码（挂账回填 eff/uni 键，2026-11-27）
     local win_seen = {}
     -- 整句模式准入（2026-11-22 定案取代 two_code_sentence 满长规则）：候选
     -- 覆盖整个活动段（FM）才进窗——"音节数一致"由引擎 lattice 保证；部分
@@ -1950,6 +1971,7 @@ return function(translation, env)
                 win_seen[t] = true
                 cands[#cands + 1] = t
                 l1win[#l1win + 1] = t
+                qcodes[t] = cand_query_code(e.c, code, seg_start)
                 rem = rem - cost
             end
         end
@@ -2064,7 +2086,8 @@ return function(translation, env)
                                           ctx_src = ctx_src, context = context,
                                           engine_top = engine_top,
                                           l1win = l1win, tick = tick,
-                                          share_map = share_map }
+                                          share_map = share_map,
+                                          qcodes = qcodes }
                         cache_trim()
                         sent_pending = true
                     end
@@ -2242,9 +2265,10 @@ return function(translation, env)
             for i, c in ipairs(ordered) do
                 local s = scores and scores[c.text]
                 if is_valid_llm_score(s) then
-                    local n = freq_eff and freq_eff(c.text, code) or 0
+                    local qcode = cand_query_code(c, code, seg_start)
+                    local n = freq_eff and freq_eff(c.text, qcode) or 0
                     local u1_term = _G.user_unigram_term
-                            and _G.user_unigram_term(c.text, code) or 0
+                            and _G.user_unigram_term(c.text, qcode) or 0
                     local delta = ce_bias_delta(cbtbl, c.text, code)
                     local sd = (share_map and share_map[c.text]) or 0
                     local t = s + FREQ_BETA * math.log(1 + n) + u1_term
@@ -2261,7 +2285,7 @@ return function(translation, env)
                                                  and (delta + sd) or nil,
                                         uni = _G.user_uni_count
                                               and _G.user_uni_count(c.text,
-                                                                    code) or 0,
+                                                                    qcode) or 0,
                                         ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = t, cerank = i }
                     end
@@ -2278,15 +2302,16 @@ return function(translation, env)
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
-                        local n = freq_eff and freq_eff(c.text, code) or 0
+                        local qcode = cand_query_code(c, code, seg_start)
+                        local n = freq_eff and freq_eff(c.text, qcode) or 0
                         local u1_term = _G.user_unigram_term
-                                and _G.user_unigram_term(c.text, code) or 0
+                                and _G.user_unigram_term(c.text, qcode) or 0
                         dbg[c.text] = { ce = s, eff = n,
                                         fb = FREQ_BETA * math.log(1 + n),
                                         u1 = u1_term,
                                         uni = _G.user_uni_count
                                               and _G.user_uni_count(c.text,
-                                                                    code) or 0,
+                                                                    qcode) or 0,
                                         ce3 = ce3map and ce3map[c.text] or nil,
                                         fused = t, cerank = i,
                                         invalid = true }

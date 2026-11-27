@@ -119,6 +119,52 @@ local stats_dirty = 0
 local function freq_key(word, code)
     return word .. "\t" .. (code or "")
 end
+-- [词级聚合回退]（2026-11-27）: 层1/融合查询键 = (词, 当前段码)——整句
+-- 模式下当前段码是**整段码**，与账本存储键 (词, 词自己的段码) 不同构
+-- （实测整句 (词,整段码) 命中 0.2–1.4%，词级键 7–12%，40× 缺口）。
+-- 精确键 miss 时回退词级聚合 = Σ各码形条目（eff 按各自 tick 衰减后求和、
+-- cum 求和）——跨码形/跨段长的词频重新生效；字词模式段=单词，精确键本
+-- 就命中，回退不触发（pdsp 14.7%≈词单键 14.8%）。多音词消歧：精确键
+-- 优先，聚合只在 miss 时兜底。
+-- 索引 word_agg: word → { [码] = {d=,t=,c=} }（与 _G.user_stats 同生共
+-- 死，载入重建、bump/refund 增量同步、切方案随 _G.user_stats 一起清）。
+-- A/B：_G.llm_freq_agg == false 或 RIME_LLM_FREQ_AGG=0 → 纯精确键。
+local word_agg = nil
+local function freq_agg_enabled()
+    if _G.llm_freq_agg == false then return false end
+    if os.getenv("RIME_LLM_FREQ_AGG") == "0" then return false end
+    return true
+end
+local function word_agg_rebuild()
+    word_agg = {}
+    if not _G.user_stats then return end
+    for k, e in pairs(_G.user_stats) do
+        local w, c = k:match("^(.-)\t(.*)$")
+        if w then
+            word_agg[w] = word_agg[w] or {}
+            word_agg[w][c] = { d = e.d or 0, t = e.t or 0, c = e.c or 0 }
+        end
+    end
+end
+local function word_agg_sync(word, code, e)
+    if not word_agg then return end
+    word_agg[word] = word_agg[word] or {}
+    word_agg[word][code or ""] =
+        { d = e and e.d or 0, t = e and e.t or 0, c = e and (e.c or 0) or 0 }
+end
+-- 词级聚合查询：返回 (Σeff, Σcum)。now = 全局 tick（与精确键衰减同基准）。
+local function word_agg_query(w, now)
+    local arr = word_agg and word_agg[w]
+    if not arr then return 0, 0 end
+    local sd, sc = 0, 0
+    for _, e in pairs(arr) do
+        if (e.d or 0) > 0 then
+            sd = sd + e.d * math.exp(((e.t or 0) - now) / FREQ_TAU)
+        end
+        sc = sc + (e.c or 0)
+    end
+    return sd, sc
+end
 -- 账本路径（2026-11-22 用户定案：四件全分）：账本按方案分目录
 -- <用户文件夹>\llm_rerank\<方案 ID>\user_ledger.tsv。账本属"有状态资产"：
 -- 该方案首次读写时从旧位置（llm_rerank 根 / 用户文件夹根）**复制**一份
@@ -300,6 +346,7 @@ local function stats_load(sid)
         stats_load_legacy_uni()
     end
     _G.user_freq_tick = tick or _G.user_freq_tick or 0
+    word_agg_rebuild()          -- 词级聚合索引随账本重建（两级回退查询用）
 end
 local function stats_save(sid)
     local f = io.open(ledger_file(sid or stats_schema), "w")
@@ -331,6 +378,7 @@ local function stats_ensure_schema()
     if _G.user_stats and stats_schema == sid then return end
     if _G.user_stats then stats_save(stats_schema) end
     _G.user_stats = nil
+    word_agg = nil              -- 聚合索引随账本清空，载入后重建
     stats_load(sid)
 end
 
@@ -365,6 +413,7 @@ local function stats_bump(word, code, tick)
     e.d = 1 + e.d * math.exp((e.t - tick) / FREQ_TAU)
     e.t = tick
     if has_cjk(word) then e.c = (e.c or 0) + 1 end
+    word_agg_sync(word, code, e)    -- 聚合索引增量同步（两级回退）
     stats_dirty = stats_dirty + 1
     if stats_dirty >= FREQ_FLUSH then
         stats_save()
@@ -384,6 +433,7 @@ _G.stats_refund = function(word, code, tick)
     if not h or h.tick ~= tick then return false end
     table.remove(e.hist)
     e.d, e.t, e.c = h.d, h.t, (h.c or 0)
+    word_agg_sync(word, code, e)    -- 聚合索引随退款还原
     stats_save()
     stats_dirty = 0
     return true
@@ -503,10 +553,15 @@ local function build_attribution(w, strip, live_code)
 end
 
 -- 衰减有效计数 (llm_filter 融合用): rime formula_d 查询式 (词码对)
+-- miss 时词级聚合回退（2026-11-27，见 word_agg 注释；A/B llm_freq_agg）
 _G.user_freq_eff = function(w, code)
     stats_ensure_schema()
     local e = _G.user_stats[freq_key(w, code)]
-    if not e or e.d <= 0 then return 0 end
+    if not e or e.d <= 0 then
+        if not freq_agg_enabled() then return 0 end
+        local sd = word_agg_query(w, (_G.user_freq_tick or 0))
+        return sd
+    end
     return e.d * math.exp((e.t - (_G.user_freq_tick or e.t)) / FREQ_TAU)
 end
 
@@ -519,13 +574,24 @@ end
 _G.user_unigram_term = function(x, code)
     stats_ensure_schema()
     local e = _G.user_stats[freq_key(x, code)]
+    if not e then
+        if not freq_agg_enabled() then return 0 end
+        local _, sc = word_agg_query(x, (_G.user_freq_tick or 0))
+        return math.log(sc + 1)
+    end
     return math.log(((e and e.c or 0) + 1))
 end
 
 -- 累计 unigram 原始计数（llm_filter 调试行"累计频"列 / CE 偏置 fade 门用）
+-- miss 时词级聚合回退（Σ 各码形 cum；fade 门语义 = 跨码形累计）
 _G.user_uni_count = function(x, code)
     stats_ensure_schema()
     local e = _G.user_stats[freq_key(x, code)]
+    if not e then
+        if not freq_agg_enabled() then return 0 end
+        local _, sc = word_agg_query(x, (_G.user_freq_tick or 0))
+        return sc
+    end
     return e and e.c or 0
 end
 

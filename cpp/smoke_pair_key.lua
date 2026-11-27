@@ -35,12 +35,34 @@ local function approx(a, b, tag)
     print("[smoke] " .. tag .. " = " .. string.format("%.6f", a) .. " OK")
 end
 approx(_G.user_unigram_term("键", "jki"), math.log(4), "uni(键,jki)=ln4")
-approx(_G.user_unigram_term("键", "jk"), math.log(1), "uni(键,jk)=ln1 无史")
 approx(_G.user_unigram_term("键", ""), math.log(3), "uni(键,'')=ln3 空码对")
 approx(_G.user_uni_count("键", "jki"), 3, "uni_count(键,jki)=3")
 approx(_G.user_unigram_term("忽略", "x"), math.log(1), "旧行类型忽略")
 approx(_G.user_freq_eff("键", "jki"), 2.0, "eff(键,jki)=2.0 同账本")
-approx(_G.user_freq_eff("键", "jk"), 0, "eff(键,jk) 异码无史")
+-- [词级聚合回退]（2026-11-27）: 精确键 (词,码) miss → Σ各码形
+--   uni(键,jk) = (jki:3)+("":2) = 5 → ln6
+--   eff(键,jk) = 2·e^0 + 1·e^{(9-10)/400}（同账本 tick=10 基准）
+-- 环境变量把门关掉时（RIME_LLM_FREQ_AGG=0）断言反过来验旧行为——冒烟在
+-- A/B 环境下也要能跑（_G.llm_freq_agg 的进程内 A/B 见下方）。
+local agg_env_off = os.getenv("RIME_LLM_FREQ_AGG") == "0"
+if not agg_env_off then
+    approx(_G.user_unigram_term("键", "jk"), math.log(6),
+           "uni(键,jk)=ln6 词级聚合回退")
+    approx(_G.user_freq_eff("键", "jk"), 2.0 + 1.0 * math.exp(-1 / 400),
+           "eff(键,jk)=Σ 各码形衰减")
+    approx(_G.user_uni_count("键", "jk"), 5, "uni_count(键,jk)=Σcum=5")
+else
+    approx(_G.user_unigram_term("键", "jk"), math.log(1),
+           "uni(键,jk)=ln1 env 门关=旧异码无史")
+    approx(_G.user_freq_eff("键", "jk"), 0, "eff(键,jk)=0 env 门关")
+    approx(_G.user_uni_count("键", "jk"), 0, "uni_count(键,jk)=0 env 门关")
+end
+-- A/B 关：RIME_LLM_FREQ_AGG=0 / _G.llm_freq_agg=false → 纯精确键（旧行为）
+_G.llm_freq_agg = false
+approx(_G.user_unigram_term("键", "jk"), math.log(1),
+       "uni(键,jk)=ln1 门关=旧异码无史")
+approx(_G.user_freq_eff("键", "jk"), 0, "eff(键,jk)=0 门关=旧异码无史")
+_G.llm_freq_agg = nil
 
 -- 子目录迁移断言（2026-11-22 四件全分语义修订：有状态资产 = **复制**快照，
 -- 旧文件保留——多个方案各自复制一份，不能 move 走让后来者无源可复制）

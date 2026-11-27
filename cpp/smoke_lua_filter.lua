@@ -122,19 +122,26 @@ end
 assert(n1 >= 2 and n2 >= 2, "quota window mix: 1字=" .. n1 .. " 2+字=" .. n2)
 print(string.format("[smoke] 配额窗 1字=%d 2+字=%d", n1, n2))
 
--- 2026-11-25 输入闸：>30 码 / 连续重复 ≥8 → 不重排（W 行 skip 原因）
+-- 2026-11-25 输入闸（2026-11-27 阈值 30→128）/ 连续重复 ≥8 → 不重排
 CPAT = ".{2,}"
 local WR = {}
 _G.llm_write_w = function(id, src, code, ctx, eng, win, fin, tick, status, skip)
   WR[#WR + 1] = { code = code, status = status, skip = skip }
 end
-env.engine.context.input = string.rep("a", 31)
+env.engine.context.input = string.rep("a", 129)
 myc = { "一次", "一处" }
 OUT = {}
 filter(translation, env)
 assert(WR[#WR] and WR[#WR].skip == "code_too_long", "code_too_long gate")
 assert(#OUT == 2, "gate pass-through")
 print("[smoke] 输入闸 code_too_long OK")
+-- 2026-11-27 放宽后 31 码不再命中闸（正常重排路径）
+env.engine.context.input = string.rep("a", 31)
+OUT = {}
+filter(translation, env)
+assert(not (WR[#WR] and WR[#WR].skip == "code_too_long"),
+       "31 码不应命中闸（阈值 128）")
+print("[smoke] 输入闸 31 码正常放行 OK")
 
 env.engine.context.input = "jjjjjjjjj"
 OUT = {}
