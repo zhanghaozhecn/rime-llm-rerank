@@ -550,13 +550,13 @@ function _G.llm_debug_p(id, total, prep)
 end
 
 function _G.llm_debug_d(id, rank, ce, ce1, ce2, ce3, eff, fb, u1, full,
-                        key, sdelta, cerank, finrank)
+                        key, sdelta, cerank, finrank, q)
     _G.llm_debug_write(string.format(
         "%s|D|%d|ce=%s|ce1=%s|ce2=%s|ce3=%s|eff=%.3f|fb=%.3f|u1=%.3f"
-        .. "|full=%d|key=%s|sdelta=%g|cerank=%d|finrank=%d",
+        .. "|full=%d|key=%s|sdelta=%g|cerank=%d|finrank=%d|q=%.2f",
         id, rank, rec_num(ce), rec_num(ce1), rec_num(ce2), rec_num(ce3),
         eff or 0, fb or 0, u1 or 0, full and 1 or 0, rec_num(key),
-        sdelta or 0, cerank or 0, finrank or 0), false)
+        sdelta or 0, cerank or 0, finrank or 0, q or 0), false)
 end
 
 function _G.llm_debug_e(id, before, after, dirty)
@@ -1026,6 +1026,102 @@ local function comp_positions(list, cmap)
         if cmap[t] then idx[#idx + 1] = i end
     end
     return table.concat(idx, ",")
+end
+
+-- ══ A5 匹配可信度进融合分（2026-11-27，两版同构）═══
+-- 纠错/补全/简拼的 credibility 惩罚（librime calculus.cc kAbbreviationPenalty
+-- /kCorrectionPenalty、syllabifier.cc kCompletionPenalty）只进引擎权重，融合
+-- 不读候选 quality → 多字纠错候选可被 CE/词频顶到首位。这里用
+-- <方案>.reverse.bin（文本→完整码，部署产物在用户目录 build\ 子目录）+
+-- 候选 span 切片码重放引擎的匹配分类，把同类惩罚按 δ 补进融合分。
+--   completion 类型 → −3.00（音节补全）
+--   全部音节 = 整读或首字母简拼 → −0.693 × 简拼音节数（DP 最小代价对齐）
+--   其余（纠错/模糊音/不可达）→ −4.605 × 纠错音节数
+-- **只对多字候选生效**（utf8 长度 ≥2）：单字纠错已由 T1 字-音节偏置打折，
+-- 叠加会双重惩罚。反查表缺失/反查 miss → 0（不猜）。δ 默认 1 = 与引擎同
+-- 强度；A/B：RIME_LLM_CRED_DELTA=0 / _G.llm_cred_delta=false。与「整读分层」
+-- 不重复——分层只做单字块显示档位，不进分。
+local PEN_ABBREV     = -0.6931471805599453   -- log(0.5)  简拼（首字母）
+local PEN_COMPLETION = -2.995732273553991   -- log(0.05) 音节补全
+local PEN_CORRECTION = -4.605170185988091   -- log(0.01) 纠错/模糊音
+local PEN_TYPES = { phrase = true, table = true, user_phrase = true,
+                    ledger = true }
+
+local cred_rev_cache = { sid = nil, db = nil, miss = false }
+
+local function cred_rev_db(sid)
+    if cred_rev_cache.sid ~= sid then
+        cred_rev_cache.sid = sid
+        cred_rev_cache.db = nil
+        cred_rev_cache.miss = false
+        -- lua 绑定按 user_data_dir/file 解析（缺则 shared_data_dir 兜底）；
+        -- 部署产物在 build\ 子目录，根目录一份作布局差异兜底
+        local ok, db = pcall(ReverseDb, "build/" .. sid .. ".reverse.bin")
+        if not ok or not db then
+            ok, db = pcall(ReverseDb, sid .. ".reverse.bin")
+        end
+        if ok and db then
+            cred_rev_cache.db = db
+        else
+            cred_rev_cache.miss = true
+        end
+    end
+    return (not cred_rev_cache.miss) and cred_rev_cache.db or nil
+end
+
+-- span 码 vs 反查码逐音节 DP 对齐：每音节消费 ≥1 码，代价 = 整读 0 /
+-- 首字母简拼 −0.693 / 其余 −4.605，取最小代价对齐；不可达 = 全纠错近似。
+local function cred_align_penalty(span_code, reading)
+    local syls = {}
+    for syl in reading:gmatch("%S+") do syls[#syls + 1] = syl end
+    local n, m = #syls, #span_code
+    if n == 0 or m == 0 then return 0 end
+    local INF = math.huge
+    local dp = {}
+    for k = 0, n do
+        dp[k] = {}
+        for p = 0, m do dp[k][p] = INF end
+    end
+    dp[0][0] = 0
+    for k = 0, n - 1 do
+        local syl = syls[k + 1]
+        for p = 0, m do
+            local cur = dp[k][p]
+            if cur ~= INF then
+                for l = 1, m - p do
+                    local seg = span_code:sub(p + 1, p + l)
+                    local cost
+                    if seg == syl then
+                        cost = 0
+                    elseif l == 1 and syl:sub(1, 1) == seg then
+                        cost = PEN_ABBREV
+                    else
+                        cost = PEN_CORRECTION
+                    end
+                    local nxt = cur + cost
+                    if nxt < dp[k + 1][p + l] then dp[k + 1][p + l] = nxt end
+                end
+            end
+        end
+    end
+    local fin = dp[n][m]
+    if fin == INF then return PEN_CORRECTION * n end
+    return fin
+end
+
+-- 候选匹配可信度惩罚（≤0，δ 由调用方乘）。span_code = 候选 span 切片码。
+local function cred_penalty(c, span_code, sid)
+    if not span_code or span_code == "" then return 0 end
+    if cand_is_completion(c) then return PEN_COMPLETION end
+    local t = c.type
+    if type(t) ~= "string" or not PEN_TYPES[t] then return 0 end
+    local tlen = utf8 and utf8.len and utf8.len(c.text) or #c.text
+    if type(tlen) ~= "number" or tlen < 2 then return 0 end   -- 单字 = T1 管辖
+    local db = cred_rev_db(sid)
+    if not db then return 0 end
+    local ok, reading = pcall(function() return db:lookup(c.text) end)
+    if not ok or type(reading) ~= "string" or reading == "" then return 0 end
+    return cred_align_penalty(span_code, reading)
 end
 
 -- ── 字-音节 CE 偏置行（T1 = log P(读音|字)，λ=1，2026-11-26 用户定案）──
@@ -2310,6 +2406,18 @@ return function(translation, env)
             fused_scores = {}
             -- 本窗已在窗口准入前读过同一份表（正分占位用），这里复用。
             local arr = {}
+            -- A5 δ（2026-11-27）：可信度惩罚强度，false/0 = 关（A/B 钩子）
+            local cred_dlt = 1.0
+            if _G.llm_cred_delta == false then
+                cred_dlt = 0
+            elseif type(_G.llm_cred_delta) == "number" then
+                cred_dlt = _G.llm_cred_delta
+            else
+                local ev = os.getenv("RIME_LLM_CRED_DELTA")
+                if ev then cred_dlt = tonumber(ev) or 1.0 end
+            end
+            local cred_sid = (env.engine.schema and env.engine.schema.schema_id)
+                    or _G.llm_schema_id or ""
             for i, c in ipairs(ordered) do
                 local s = scores and scores[c.text]
                 if is_valid_llm_score(s) then
@@ -2319,8 +2427,13 @@ return function(translation, env)
                             and _G.user_unigram_term(c.text, qcode) or 0
                     local delta = ce_bias_delta(cbtbl, c.text, code)
                     local sd = (share_map and share_map[c.text]) or 0
+                    -- A5 匹配可信度惩罚（≤0，多字、有 CE 时生效；单字 = T1
+                    -- 管辖不双罚，无 CE 分支不叠——与 CE 偏置同门）
+                    local q = cred_dlt ~= 0
+                            and cred_penalty(c, qcode, cred_sid) * cred_dlt
+                            or 0
                     local t = s + FREQ_BETA * math.log(1 + n) + u1_term
-                            + delta + sd
+                            + delta + sd + q
                     fused_scores[c.text] = t
                     arr[i] = { c = c, t = t, idx = i }
                     if dbg then
@@ -2331,6 +2444,7 @@ return function(translation, env)
                                              or nil,
                                         sdelta = (delta + sd) ~= 0
                                                  and (delta + sd) or nil,
+                                        q = q,
                                         uni = _G.user_uni_count
                                               and _G.user_uni_count(c.text,
                                                                     qcode) or 0,
@@ -2552,7 +2666,7 @@ return function(translation, env)
                     local d3 = d.ce3 or {}
                     _G.llm_debug_d(wid, i, d.ce, d3[1], d3[2], d3[3],
                                    d.eff, d.fb, d.u1, d.full, d.fused,
-                                   d.sdelta, d.cerank, i)
+                                   d.sdelta, d.cerank, i, d.q)
                 end
             end
         end
