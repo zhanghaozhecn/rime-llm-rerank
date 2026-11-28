@@ -998,7 +998,6 @@ static bool pick(std::string & text, const char *& src) {
 // ============================================================
 // 异步模型加载
 // ============================================================
-static void ce_pool_init(int helpers);   // CE 行级并行池（定义在 score_batch 前）
 static void load_model_async() {
     if (g_loaded.load() || g_loading.load()) return;
     g_loading.store(true);
@@ -1081,8 +1080,6 @@ static void load_model_async() {
                 llama_decode(g_ctx, batch);
             }
         }
-
-        ce_pool_init(n_thr - 1);   // CE 行级并行池（2026-11-28 P0）
 
         g_loaded.store(true);
         g_loading.store(false);
@@ -1262,66 +1259,8 @@ static std::vector<llama_token> ctx_ids_with_prefix(const char * context,
     return ids;
 }
 
-// ============================================================
-// CE 行级并行（2026-11-28 P0）：step2/step3 的逐行 CE（每行 = 一次
-// logits_normalizer + 行内候选查表，~0.8ms×行）在持久 worker 池上并行。
-// 设计约束：**CE 数值逐位不变**——每行内部扫描保持串行（不改浮点求和
-// 顺序），行间无共享写（每候选恰属一行，ce_sum/ce3_out 按 ci 分派）。
-// 池按 n_threads-1 惰性创建、进程生命周期常驻（与异步评分线程同风格）。
-// ============================================================
-static int g_ce_pool_n = 0;
-static std::vector<std::thread> g_ce_pool;
-static std::mutex g_ce_pool_mu;
-static std::condition_variable g_ce_pool_cv;
-static std::function<void(int)> g_ce_pool_task;
-static std::atomic<int> g_ce_pool_busy{0};
-static long long g_ce_pool_gen = 0;
-
-static void ce_pool_worker(int w) {
-    long long seen = 0;
-    for (;;) {
-        std::unique_lock<std::mutex> lk(g_ce_pool_mu);
-        g_ce_pool_cv.wait(lk, [&] { return g_ce_pool_gen != seen; });
-        seen = g_ce_pool_gen;
-        g_ce_pool_task(w);   // 持锁执行：task 不触池状态，锁只串行化派发
-        lk.unlock();
-        g_ce_pool_busy.fetch_sub(1);
-    }
-}
-
-static void ce_pool_init(int helpers) {
-    if (helpers < 1) helpers = 0;
-    if (helpers > 15) helpers = 15;
-    g_ce_pool_n = helpers;
-    for (int w = 1; w <= helpers; w++)
-        g_ce_pool.emplace_back(ce_pool_worker, w);
-}
-
-// n 个行任务；row_fn(i) 必须只写行 i 自己的槽位。n<2 或池未建 → 串行。
-template <class F>
-static void ce_parallel_rows(int n, F &&row_fn) {
-    if (n < 2 || g_ce_pool_n < 1) {
-        for (int i = 0; i < n; i++)
-            row_fn(i);
-        return;
-    }
-    while (g_ce_pool_busy.load() > 0)   // 上一轮收尾（正常路径已 0；防御）
-        std::this_thread::yield();
-    {
-        std::lock_guard<std::mutex> lk(g_ce_pool_mu);
-        g_ce_pool_task = [&row_fn, n](int w) {
-            for (int r = w; r < n; r += g_ce_pool_n + 1)
-                row_fn(r);
-        };
-        g_ce_pool_gen++;
-        g_ce_pool_busy.store(g_ce_pool_n);   // 与 gen++ 同锁发布，防计数竞态
-    }
-    g_ce_pool_cv.notify_all();
-    for (int r = g_ce_pool_n; r < n; r += g_ce_pool_n + 1)
-        row_fn(r);                            // 调用者 = lane g_ce_pool_n
-    while (g_ce_pool_busy.load() > 0)
-        std::this_thread::yield();
-}
+// （2026-11-28 P0-2 第 2 段注：CE 后处理已改走镜像 ggml CE_LSE op 的图内
+//  标量抽取——llama_get_ce_lse，宿主扫描与并行池双双退役，数值逐位不变。）
 
 // ctx KV 就绪（调用方持 g_mutex）：返回 ctx 末位 logits（指向 g_prep_logits）
 // 与归一化量；失败返回 nullptr。三条路径（2026-11-23）：
@@ -1534,28 +1473,25 @@ static bool score_batch(const std::vector<llama_token> & ctx_ids,
         b2.n_tokens = U;
         step2_ok = llama_decode(g_ctx, b2) == 0;
         if (step2_ok) {
-            // CE 后处理行级并行（2026-11-28 P0）：每行 = normalizer + 查表，
-            // 行间无共享写 → CE 逐位同串行（ce_parallel_rows 设计约束）
-            auto ce_row2 = [&](int u) {
+            // CE 标量抽取（2026-11-28 P0-2 第 2 段）：归一化 (max,lse) 在图内
+            // 算好（ggml CE_LSE op，镜像 patch），宿主只做 O(1) 查表——无扫描
+            // 无并行池。数值逐位同宿主扫描（同循环序 + 同 CRT expf/log）。
+            for (int u = 0; u < U; u++) {
+                const double* cl = llama_get_ce_lse(g_ctx, u);
                 float* l = llama_get_logits_ith(g_ctx, u);
-                if (!l) {
+                if (!cl || !l) {
                     for (int ci : r2_cands[u]) ce_sum[ci] = -1e10;
                     if (ce3_out) for (int ci : r2_cands[u]) (*ce3_out)[ci] = {NAN, NAN, NAN};
-                    return;
+                    continue;
                 }
-                // 2026-11-25：归一化 (max,lse) 每行只算一次，行内候选 O(1) 查表
-                // ——原实现每候选重扫 O(vocab)（~2-10ms/候选），是「候选数一多
-                // 就慢」的真正来源（1-token 候选走 CE1 共享归一化 → 免费）。
-                float rm = 0;
-                double rlse = 0;
-                logits_normalizer(l, vs, rm, rlse);
+                const float rm = (float)cl[0];    // float max 的 double 精确投影，还原 = 原值
+                const double rlse = cl[1];
                 for (int ci : r2_cands[u]) {
                     double c2 = -((double)(l[cands[ci][1]] - rm) - rlse);
                     ce_sum[ci] += kCeW2 * c2;
                     if (ce3_out) (*ce3_out)[ci][1] = c2;
                 }
-            };
-            ce_parallel_rows(U, ce_row2);
+            }
         } else {
             for (int ci : idx2) ce_sum[ci] = -1e10;
             if (ce3_out) for (int ci : idx2) (*ce3_out)[ci] = {NAN, NAN, NAN};
@@ -1609,23 +1545,22 @@ static bool score_batch(const std::vector<llama_token> & ctx_ids,
         }
         b3.n_tokens = V;
         if (llama_decode(g_ctx, b3) == 0) {
-            auto ce_row3 = [&](int v) {
+            for (int v = 0; v < V; v++) {
+                const double* cl = llama_get_ce_lse(g_ctx, v);
                 float* l = llama_get_logits_ith(g_ctx, v);
-                if (!l) {
+                if (!cl || !l) {
                     for (int ci : rows3[v].cands) ce_sum[ci] = -1e10;
                     if (ce3_out) for (int ci : rows3[v].cands) (*ce3_out)[ci] = {NAN, NAN, NAN};
-                    return;
+                    continue;
                 }
-                float rm = 0;
-                double rlse = 0;
-                logits_normalizer(l, vs, rm, rlse);
+                const float rm = (float)cl[0];
+                const double rlse = cl[1];
                 for (int ci : rows3[v].cands) {
                     double c3 = -((double)(l[cands[ci][2]] - rm) - rlse);
                     ce_sum[ci] += kCeW3 * c3;
                     if (ce3_out) (*ce3_out)[ci][2] = c3;
                 }
-            };
-            ce_parallel_rows(V, ce_row3);
+            }
         } else {
             for (auto& r : rows3)
                 for (int ci : r.cands) ce_sum[ci] = -1e10;
