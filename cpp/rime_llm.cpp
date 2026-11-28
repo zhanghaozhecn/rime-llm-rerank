@@ -1187,6 +1187,29 @@ static std::string token_seg_display(const std::vector<llama_token> & ids) {
     return out;
 }
 
+// CE 上文锚（2026-11-28，两版同构）：Qwen3-0.6B 在裸单词（1 token）上文时
+// 预测退化为先验序——wiki 分条首句大样本配对实测（2994 句，0.6B）：bare n=1
+// top1 命中 0.0%、句号锚后 6.71%，ΔCE −6.10 nats（win/lose 2808/186，z=47.9）；
+// 「英雄」后事迹 14.3 败于「世纪」8.4 即此。垫「。」把输入还原成训练分布内
+// 的句中形态（attention sink/文档边界文献支持）。n=2 专项验证（3000 新句配
+// 对）：句号锚 ΔCE −0.0096、z=−0.15 = 零效应（n=2 bare 已健康 top1 12.5%）
+// ——故规则收窄为**仅 n=1 垫锚**。0.5B 同效；0.8B 不需要但无害。A/B：
+// RIME_LLM_CTX_ANCHOR=0。
+static const llama_vocab  * g_anchor_vocab = nullptr;  // 锚 token 随词表代缓存
+static int                  g_anchor_tok  = -1;
+static std::vector<llama_token> ctx_ids_for_ce(std::vector<llama_token> ids) {
+    static const bool kOn = !(getenv("RIME_LLM_CTX_ANCHOR") &&
+                              getenv("RIME_LLM_CTX_ANCHOR")[0] == '0');
+    if (!kOn || ids.size() > 1) return ids;
+    if (g_anchor_vocab != g_vocab) {
+        auto t = tokenize("。");
+        g_anchor_tok = t.empty() ? -1 : (int)t[0];
+        g_anchor_vocab = g_vocab;
+    }
+    if (g_anchor_tok >= 0) ids.insert(ids.begin(), g_anchor_tok);
+    return ids;
+}
+
 // 上文 token 化 + min_tokens/max_ctx 截尾（prepare/score 入口共用）。
 // token 数不足 min_tokens（方案 llm_rerank/min_tokens，lua 传入）→ 返回空
 //（空 ctx 无推理是配置语义, 非 bug）。
@@ -1199,7 +1222,7 @@ static std::vector<llama_token> ctx_token_ids(const char * context) {
     } else {
         g_last_ctx_used = context ? context : "";
     }
-    return ids;
+    return ctx_ids_for_ce(std::move(ids));  // 1 token 裸单词上文垫「。」锚（与源码版同构）
 }
 
 // ============================================================

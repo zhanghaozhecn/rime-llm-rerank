@@ -30,6 +30,9 @@
  * usage: prof_s2.exe [model_path] [flags above] [--trials N] [--out FILE]
  *                    [--whole-only] [--no-wait]
  *   --whole-only : skip ext + U sweep (quick A/B runs)
+ *   --ce-dump F  : single production-shape context, dump per-candidate
+ *                  CE1/2/3 + fused score + token ids per workload to F
+ *                  (cross-model pruning A/B: ranking-preservation compare)
  *   model default: d:/gguf_models/Qwen3-0.6B-Base-Q4_K_M.gguf (bench default)
  * Output: human blocks + one machine-readable [PROF] line per config.
  *
@@ -830,6 +833,8 @@ int main(int argc, char **argv) {
   bool unified = false;
   bool whole_only = false;
   bool ce_check = false;
+  const char *ce_dump_path = nullptr;
+  int fa = -2;            // -2 = 不设（生产默认 AUTO）；-1/0/1 = flash_attn_type
   bool no_wait = false;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--threads") && i + 1 < argc)
@@ -850,6 +855,10 @@ int main(int argc, char **argv) {
       whole_only = true;
     else if (!strcmp(argv[i], "--ce-check"))
       ce_check = true;
+    else if (!strcmp(argv[i], "--ce-dump") && i + 1 < argc)
+      ce_dump_path = argv[++i];
+    else if (!strcmp(argv[i], "--fa") && i + 1 < argc)
+      fa = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--out") && i + 1 < argc)
       out_arg = argv[++i];
     else if (!strcmp(argv[i], "--no-wait"))
@@ -943,9 +952,68 @@ int main(int argc, char **argv) {
       (int)ctx_ids.size(), (int)cands.size(), (int)r2.size());
 
   // ---- CE invariance check: split (production) vs unified, per thread count ----
-  if (ce_check) {
-    out("\n== CE invariance: kv_unified=false (production) vs true ==\n");
+  if (ce_check || ce_dump_path) {
     std::vector<WL> wls = build_workloads();
+
+    // --ce-dump: one production-shape context (thr=14 = production cpu_cores,
+    // unified=true = production default). CE is bitwise thread-independent, so
+    // dumps are comparable across models regardless of thread count.
+    if (ce_dump_path) {
+      FILE *df = _fsopen(ce_dump_path, "w", _SH_DENYNO);
+      if (!df) {
+        fprintf(stderr, "cannot open %s\n", ce_dump_path);
+        return 1;
+      }
+      fprintf(df, "# prof_s2 ce-dump model=%s thr=14 unified=1\n", model_path);
+      llama_context_params cp = llama_context_default_params();
+      cp.n_ctx = 512;
+      cp.n_threads = 14;
+      cp.n_threads_batch = 14;
+      cp.n_seq_max = seqmax;
+      cp.kv_unified = true;
+      cp.no_perf = false;
+      llama_context *c = llama_init_from_model(g_model, cp);
+      if (!c) {
+        fprintf(stderr, "ctx create FAILED\n");
+        fclose(df);
+        return 1;
+      }
+      std::vector<WLResult> res;
+      if (!run_ce_suite(c, wls, res, vs)) {
+        fprintf(stderr, "ce suite FAILED\n");
+        fclose(df);
+        return 1;
+      }
+      llama_free(c);
+      for (const auto &r : res) {
+        fprintf(df, "WL\t%s\n", r.name.c_str());
+        for (size_t i = 0; i < r.cands.size(); i++) {
+          char b1[40], b2[40], b3[40], bs[40], tmp[32];
+          snprintf(b1, sizeof b1, "%.17g", r.a[i].c1);
+          snprintf(b2, sizeof b2, "%.17g", r.a[i].c2);
+          snprintf(b3, sizeof b3, "%.17g", r.a[i].c3);
+          snprintf(bs, sizeof bs, "%.17g", r.a[i].score);
+          std::string ids;
+          for (size_t j = 0; j < r.cands[i].size(); j++) {
+            snprintf(tmp, sizeof tmp, "%s%d", j ? "," : "", r.cands[i][j]);
+            ids += tmp;
+          }
+          fprintf(df, "CAND\t%s\t%zu\t%s\t%s\t%s\t%s\t%zu\t%s\t%s\n",
+                  r.name.c_str(), i, b1, b2, b3, bs, r.cands[i].size(),
+                  ids.c_str(), r.texts[i].c_str());
+        }
+      }
+      fclose(df);
+      out("[CEDUMP] wrote %s workloads=%zu\n", ce_dump_path, res.size());
+      llama_model_free(g_model);
+      llama_backend_free();
+      if (g_out)
+        fclose(g_out);
+      wait_exit(no_wait);
+      return 0;
+    }
+
+    out("\n== CE invariance: kv_unified=false (production) vs true ==\n");
     int cand_total = 0;
     for (auto &w : wls) {
       std::vector<llama_token> tids = w.ids;
@@ -1032,6 +1100,8 @@ int main(int argc, char **argv) {
       cp.n_seq_max = seqmax;
       cp.kv_unified = unified;
       cp.no_perf = false;
+      if (fa >= -1 && fa <= 1)
+        cp.flash_attn_type = (enum llama_flash_attn_type)fa;  // FA A/B（生产=不设=AUTO）
       llama_context *ctx = llama_init_from_model(g_model, cp);
       if (!ctx) {
         out("  context create FAILED\n");
