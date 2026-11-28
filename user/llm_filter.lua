@@ -987,6 +987,103 @@ local function syll_judge(syl, t, span)
     return false, nil                -- 完成匹配 / 纠错：不叠偏置
 end
 
+-- ── 组句候选 preedit（音节分隔，2026-11-28）──
+-- 症状：开 Ngram 时显示首选的组合区没有音节分隔（jintiandetianqi 原样），
+-- 关 Ngram 正常。根因：组句注入用裸 SimpleCandidate → preedit 恒空 →
+-- Composition::GetPreedit 回落成无分隔原码切片。
+-- 修法（插件版 = 只修显示）：优先复用**同 span 引擎候选**的 preedit——它由
+-- ScriptSyllabifier::GetPreeditString 生成（分隔符 + translator/preedit_format
+-- 全已应用），与引擎显示完全一致；没有同 span 候选时自建（仅分隔，不跑
+-- preedit_format，lua 侧无 algebra 引擎）。
+-- **Tab（音节跳）插件版仍不可用**：navigator 只认选中候选 As<Phrase> 的
+-- spans()，lua 侧造不出 Phrase（官方 rime.dll）；源码版已用 Phrase 派生类
+-- 修好（NgramGroupPhrase）。
+-- 词内音节切分：sub = 该词输入片段，syl = 音节表，n = 期望音节数（= 词字数，
+-- 消解 xian / xi+an 这类歧义）。返回各音节字节长度数组；nil = 切不开。
+local function syll_split(sub, syl, n)
+    local m = #sub
+    if m == 0 then return nil end
+    local kmax = (n and n > 0) and n or m
+    -- ok[i][k]：sub 从第 i 字节（1 基）起到末尾可切成 k 个音节
+    local ok = {}
+    for i = 1, m + 1 do ok[i] = {} end
+    ok[m + 1][0] = true
+    for i = m, 1, -1 do
+        for j = i + 1, m + 1 do
+            if syl[sub:sub(i, j - 1)] then
+                for k = 1, kmax do
+                    if ok[j][k - 1] then ok[i][k] = true end
+                end
+            end
+        end
+    end
+    local want = nil
+    if n and n > 0 then
+        if ok[1][n] then want = n end
+    else
+        for k = 1, kmax do
+            if ok[1][k] then want = k; break end
+        end
+    end
+    if not want then return nil end
+    -- 回溯：同一音节数下取最长可行音节（常见读法优先）
+    local lens, i = {}, 1
+    for k = want, 1, -1 do
+        local pick = nil
+        for j = m + 1, i + 1, -1 do
+            if ok[j][k - 1] and syl[sub:sub(i, j - 1)] then
+                pick = j; break
+            end
+        end
+        if not pick then return nil end
+        lens[#lens + 1] = pick - i
+        i = pick
+    end
+    if i ~= m + 1 then return nil end
+    return lens
+end
+
+-- 自建组句 preedit（兜底）：词边界（words[].e，字节偏移）+ 词内音节 DP。
+local function gen_preedit(env, code, words)
+    local syl = syll_chars_table()
+    local verts = { 0 }
+    local prev = 0
+    for _, w in ipairs(words or {}) do
+        local e = tonumber(w.e) or 0
+        if e > prev and e <= #code then
+            if syl then
+                local t = w.w or ""
+                local nch = utf8 and utf8.len(t) or #t
+                local lens = syll_split(code:sub(prev + 1, e), syl, nch)
+                if lens then
+                    local p = prev
+                    for _, l in ipairs(lens) do
+                        p = p + l
+                        if p > prev and p < e then verts[#verts + 1] = p end
+                    end
+                end
+            end
+            verts[#verts + 1] = e
+            prev = e
+        end
+    end
+    if #verts < 2 then return nil end
+    local delim = ""
+    if env and env.engine and env.engine.schema and env.engine.schema.config then
+        local sc = env.engine.schema.config
+        delim = sc:get_string("translator/delimiter")
+                or sc:get_string("speller/delimiter") or ""
+    end
+    local dc = (delim ~= "") and delim:sub(1, 1) or ""
+    local out = {}
+    for i = 1, #verts - 1 do
+        local piece = code:sub(verts[i] + 1, verts[i + 1])
+        if i > 1 and dc ~= "" and out[#out] ~= dc then out[#out + 1] = dc end
+        out[#out + 1] = piece
+    end
+    return table.concat(out)
+end
+
 -- ── 联想/补全判定（2026-11-27 用户定案）──
 -- 原生 script_translator 对**词级补全**候选设 `type = "completion"`（词条码比
 -- 已输入长，如 fudandaxue → 复旦大学站）；精确匹配是 "phrase"/"user_phrase"/
@@ -1940,6 +2037,27 @@ return function(translation, env)
             genset = { [gen[1].text] = true }
             seen_t[gen[1].text] = true
             merged[1] = gen[1].cand
+            -- 组句候选 preedit（2026-11-28，只修显示）：组合区音节分隔。
+            -- 优先复用同 span 引擎候选的 preedit（含 preedit_format，与引擎
+            -- 显示一致）；没有则自建（仅分隔）。A/B 与冒烟钩子：
+            -- _G.llm_gen_preedit = false / RIME_LLM_GEN_PREEDIT=0 关闭。
+            if _G.llm_gen_preedit ~= false
+                    and os.getenv("RIME_LLM_GEN_PREEDIT") ~= "0"
+                    and gen[1].cand then
+                local pre = nil
+                for _, c in ipairs(all) do
+                    if c.start == seg_start and c._end == seg_end then
+                        local p = c.preedit
+                        if type(p) == "string" and p ~= "" then
+                            pre = p; break
+                        end
+                    end
+                end
+                if not pre then pre = gen_preedit(env, code, gen[1].words) end
+                if pre and pre ~= "" then
+                    pcall(function() gen[1].cand.preedit = pre end)
+                end
+            end
             for _, c in ipairs(all) do
                 if not seen_t[c.text] then merged[#merged + 1] = c end
             end

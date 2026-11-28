@@ -86,6 +86,8 @@ local function mkenv(input, seg, opts)
         get_string = function(_, k)
           if k == "llm_rerank/code_pattern" then return ".{2,}" end
           if k == "llm_rerank/model_path" then return MODEL end
+          -- 组句候选 preedit（2026-11-28）：分隔符与引擎同源
+          if k == "speller/delimiter" then return " '" end
           if k == "simplifier/option_name" then
             if opts.simp == false or opts.noopt then return nil end
             return "zh_simp"
@@ -467,6 +469,30 @@ for _, ln in ipairs(LIVE) do
 end
 check("N4 组句关时不走 freq_only",
       _G.llm_pending_confirm == nil and saw_ctx_empty)
+
+-- ── P：组句候选 preedit（音节分隔，2026-11-28）──────────────────────
+-- P1 无同 span 引擎 preedit → 自建（词边界 + 词内 DP；冒烟无 syll 表 →
+--    仅词边界，分隔符取 speller/delimiter 首字符）；
+-- P2 有同 span 引擎候选 preedit → 原样复用（含 preedit_format，与引擎显示
+--    一致）。
+GEN = gen5("的", 2, { "的天气很好", "的天气真热", "的天启", "的天气", "的天气啊" })
+for _, it in ipairs(GEN) do
+  it.words = { { w = "的", e = 2 }, { w = "天气", e = 8 } }
+end
+_G.llm_pending_confirm = nil
+run(engine_cands(), "detianqi", { start = 0, _end = 8 })
+check("P1 组句候选自建 preedit（词边界加分隔）",
+      OUT[1] and OUT[1].preedit == "de tianqi",
+      OUT[1] and tostring(OUT[1].preedit))
+local ec = engine_cands()
+for _, c in ipairs(ec) do
+  if c.start == 0 and c._end == 8 then c.preedit = "de tian qi" end
+end
+run(ec, "detianqi", { start = 0, _end = 8 })
+check("P2 同 span 引擎 preedit 优先复用",
+      OUT[1] and OUT[1].preedit == "de tian qi",
+      OUT[1] and tostring(OUT[1].preedit))
+
 _G.llm_context_get = saved_ctx_get
 
 print(string.format("[smoke] ngram_group: %d pass, %d fail", OK, FAIL))
