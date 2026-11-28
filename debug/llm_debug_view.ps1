@@ -30,8 +30,10 @@
                                                        fin=最终位置 win=1 层2窗内/0 尾窗透传
                                                        ce1/2/3=各分位原始 CE（未乘权重）
                                                        fb=β·log1p(eff) u1=ln(uni+1)
-                                                       修正分无专属列（2026-11-21 v7：命中
-                                                       时折进 CE 格数值 + 公式尾项）
+                                                       CE偏置专属列（2026-11-28：sdelta
+                                                       显示在专属列、CE 格恢复纯 CE；
+                                                       2026-11-21 v7 曾折进 CE 格——
+                                                       T1 字-音节偏置上线后命中不再恒 0）
    S|HH:MM:SS|reason|input|src                        跳过原因：pattern/ctx_empty/
                                                        not_ready/ctx_short/scores_nil/
                                                        score_failed/few_candidates；
@@ -202,22 +204,22 @@ $grid.SelectionMode = 'FullRowSelect'
 $grid.AutoSizeColumnsMode = 'None'
 # 列头禁换行 + 短文案：窄列两行表头会被默认行高裁掉下半行（2026-11-10 实测）
 $grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::False
-# 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：CE / 衰减词频分 /
-# 累计词频 / 总分，格内 = 得分 + '=' + 具体计算（成分统一 1 位小数，
-# 等宽字体逐位对齐），公式不再单独展示；身份列只剩 #/词
+# 分数部分四列（2026-11-11 用户定案"分数=计算过程"）：格内 = 得分 + '=' +
+# 具体计算（成分统一 1 位小数，等宽字体逐位对齐），公式不再单独展示；
+# 身份列只剩 #/词
 # 「窗」「匹配词长」列均已删（2026-11-16 用户定案：窗内/尾窗灰字区分、
 # 满长准入优先下"有无 CE 分"即满长标志——列冗余）；
-# 「修正分」列已删（2026-11-21 用户定案 v7：命中修正折进 CE 格数值 +
-# 公式尾项，见 Get-CeProc——0 不显示，恒 0 的专属列无观察价值）
+# 「CE偏置」列恢复（2026-11-28 用户定案）：T1 字-音节偏置上线后命中不再
+# 恒 0，从 CE 格拆出独立列（2026-11-21 曾删——当时恒 0 无观察价值）；
+# 列序 = 衰减词频分→累计词频分→CE→CE偏置：前两项构成用户词频即层 1，
+# 在 CE 计算前先排序。CE 格恢复纯 CE（不再折修正值、不再追公式尾项）
 # 列宽与源码版 WeaselLLMDebug 同值（GDI 实测取宽 + 对齐补空格的余量；
-# 词 100 = 字符段显带 '/'（4 字词 ≈77px，容 5 字词）；2026-11-21 公式空格
-# （'='、'+' 两边各一空格）列宽重分配（合计 878 < 888 Studio 右列网格宽）：
-# CE 380 = 352 + 空格余量 − 挪给分式列的 12；衰减词频分 168 = 140 + 空格
-# 2 字符（真机实测 "=14·log1p(…)" 被截成 …）；累计词频分 140 = 112 + 容
-# 5 位数累计次数）
+# 词 100 = 字符段显带 '/'（4 字词 ≈77px，容 5 字词）；2026-11-28 拆列
+# 重分配（合计 886 < 888 Studio 右列网格宽）：CE 308 = 原 380 − 修正项
+# 尾巴余量；CE偏置 80 = 值 ≤"-99.9" 5 字符 + 5 字表头；其余列不变
 $cols = @(
-  @('#', 26), @('词', 100), @('总分', 64), @('CE', 380), @('衰减词频分', 168),
-  @('累计词频分', 140))
+  @('#', 26), @('词', 100), @('总分', 64), @('衰减词频分', 168),
+  @('累计词频分', 140), @('CE', 308), @('CE偏置', 80))
 foreach ($c in $cols) {
   $i = $grid.Columns.Add($c[0], $c[0])
   $grid.Columns[$i].Width = $c[1]
@@ -320,11 +322,10 @@ function Update-Current {
   $script:grid.Rows.Clear()
   # 动态对齐（2026-11-11 用户定案）：本次调用内每个数值组向最宽者看齐、
   # 右对齐（补空格）——等宽字体下小数点逐位对齐，整数部分位数不同不再错位
-  $wCeL = 0; $wCeC = 0; $wFbL = 0; $wFbE = 0; $wU1L = 0; $wUni = 0; $wFuL = 0
+  $wCeL = 0; $wCeC = 0; $wFbL = 0; $wFbE = 0; $wU1L = 0; $wUni = 0; $wFuL = 0; $wSdL = 0
   foreach ($r in $inv.rows) {
-    # 词码对修正折叠（2026-11-21 v7）：CE 分数列量的是折叠后的值
-    $sdV = Get-Corr $r
-    $v = Get-Num $r.ce;   if ($null -ne $v) { $wCeL = [Math]::Max($wCeL, (Format-F1 ($v + $sdV)).Length) }
+    # CE 偏置独立列（2026-11-28）：CE 分数列恢复量纯 CE 值
+    $v = Get-Num $r.ce;   if ($null -ne $v) { $wCeL = [Math]::Max($wCeL, (Format-F1 $v).Length) }
     foreach ($raw in @($r.ce1, $r.ce2, $r.ce3)) {
       $v = Get-Num $raw;  if ($null -ne $v) { $wCeC = [Math]::Max($wCeC, (Format-F1 $v).Length) }
     }
@@ -333,12 +334,14 @@ function Update-Current {
     $v = Get-Num $r.u1;   if ($null -ne $v) { $wU1L = [Math]::Max($wU1L, (Format-F1 $v).Length) }
     $v = Get-Num $r.uni;  if ($null -ne $v) { $wUni = [Math]::Max($wUni, ([string][int]$v).Length) }
     $v = Get-Num $r.fused; if ($null -ne $v) { $wFuL = [Math]::Max($wFuL, (Format-F1 $v).Length) }
+    $sdV = Get-Corr $r
+    if ($sdV -ne 0) { $wSdL = [Math]::Max($wSdL, (Format-F1 $sdV).Length) }
   }
   $i = 0
   foreach ($r in $inv.rows) {
     [void]$script:grid.Rows.Add(($i + 1), (Get-WordText $r), (Get-FusedProc $r $wFuL),
-      (Get-CeProc $r $wCeL $wCeC), (Get-FbProc $r $wFbL $wFbE),
-      (Get-U1Proc $r $wU1L $wUni))
+      (Get-FbProc $r $wFbL $wFbE), (Get-U1Proc $r $wU1L $wUni),
+      (Get-CeProc $r $wCeL $wCeC), (Get-BiasProc $r $wSdL))
     if ($r.win -eq '0') {
       $script:grid.Rows[$i].DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gray
     }
@@ -380,19 +383,21 @@ function Get-Corr($r) {
   if ($null -ne $pf -and $pf -gt 0) { return -$pf }
   return 0.0
 }
-# 修正项后缀（公式右侧）：负 -5.0 / 正 +5.0；0 = 不显示
-function Get-CorrSuffix([double]$sd) {
-  if ($sd -eq 0) { return '' }
-  return ($(if ($sd -gt 0) { '+' } else { '-' })) + (Format-F1 ([Math]::Abs($sd)))
+# CE 偏置格（2026-11-28 用户定案：偏置从 CE 格拆出独立列「CE偏置」）：
+# 值 = sdelta 有符号分数（无命中/0 = '—' 不显示——偏置只对已算 CE 的
+# 候选生效；旧发送端无 sdelta 字段时经 Get-Corr 回退 -pf）
+# $wL = 偏置列内最宽值宽
+function Get-BiasProc($r, $wL) {
+  $sd = Get-Corr $r
+  if ($sd -eq 0) { return '—' }
+  return Pad-L (Format-F1 $sd) $wL
 }
 
-# CE 格：加权 CE 与其三分量 + 词码对修正折叠（2026-11-21 用户定案 v7：
-# 修正分专属列删除——对几乎所有候选恒为 0 的独立列无观察价值；命中时
-# 把修正值折进 CE 数值本身并在公式右侧追修正项，如
-#   -34.7 = -(14.0 + 1.1·10.1 + 0.6·7.6) - 5.0
-# 修正为 0 不追加任何显示。无 CE 分（尾窗/无法表示）→ 格保持 '—'
-# （修正项只随融合分隐含）。公式排版（2026-11-21 用户定案）：'=' 与 '+'
-# 两边各留一个空格。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
+# CE 格：加权 CE 与其三分量（2026-11-28 用户定案：偏置拆出独立列
+# 「CE偏置」后，本格恢复纯 CE——不再折修正值、不再追公式尾项）：
+#   -34.7 = -(14.0 + 1.1·10.1 + 0.6·7.6)
+# 无 CE 分（尾窗/无法表示）→ 格保持 '—'。公式排版（2026-11-21 用户定案）：
+# '=' 与 '+' 两边各留一个空格。生产语义 = ce = -(Σ kCeW·分量)（分量是原始
 # 交叉熵、正值；分值取负号进融合），故等号右为带负号的括号和。
 # ce2/ce3 带权重前缀（系数 = 标定内置常数 1.10/0.60，显示 1.1/0.6——
 # 第二位小数不显示，与数据 1 位小数一致；2026-11-14 随默认模型 0.5B
@@ -400,12 +405,8 @@ function Get-CorrSuffix([double]$sd) {
 # 恒 1 → 前缀不显示（2026-11-12 用户定案）；数据浮点统一 1 位小数。
 # $wL = 分数列内最宽值宽，$wC = 三分量列内最宽值宽
 function Get-CeProc($r, $wL, $wC) {
-  $sd = Get-Corr $r
   $ce = Get-Num $r.ce
   if ($null -eq $ce) { return '—' }
-  if ($sd -ne 0) { $ce += $sd }
-  $tail = Get-CorrSuffix $sd
-  if ($tail) { $tail = ' ' + $tail }  # 修正项前空一格
   $lead = Pad-L (Format-F1 $ce) $wL
   $t = $lead + ' = -('
   $any = $false
@@ -417,8 +418,8 @@ function Get-CeProc($r, $wL, $wC) {
     $t += Pad-L (Format-F1 $v) $wC
     $any = $true
   }
-  if (-not $any) { return $lead + $tail }
-  return $t + ')' + $tail
+  if (-not $any) { return $lead }
+  return $t + ')'
 }
 
 # 衰减词频分格：β·log1p(eff)，β=14 内置常数（2026-11-14
@@ -444,8 +445,8 @@ function Get-U1Proc($r, $wL, $wU) {
   return $lead + (' = log1p({0})' -f (Pad-L ([string][int]$uni) $wU))
 }
 
-# 总分格：融合分纯分值（三项过程各在自带格内，词码对修正折进 CE 格见
-# Get-CeProc；$wL=分数宽）
+# 总分格：融合分纯分值（= 词频两项 + CE + CE偏置，各过程在自带格内；
+# $wL=分数宽）
 function Get-FusedProc($r, $wL) {
   $fu = Get-Num $r.fused
   if ($null -eq $fu) { return '—' }

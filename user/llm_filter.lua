@@ -632,7 +632,8 @@ local function write_pending_result(pend, snap)
     if pend.wid then
         _G.llm_write_w(pend.wid, pend.ctx_src, pend.code, pend.context,
                        pend.engine_top, pend.l1win, final, pend.tick,
-                       "ok", "", snap.prep and true or false, "async")
+                       "ok", "", snap.prep and true or false,
+                       snap.anchor and "async,anchor" or "async")
         _G.llm_debug_p(pend.wid, snap.ev_ms or 0, snap.prep and true or false)
     end
 end
@@ -2671,11 +2672,16 @@ return function(translation, env)
             end
         end
         -- 常开语料 W ok（最终序 + 引擎前 10 + 层1 窗）
-        -- flags 追加 nofreq（2026-11-24）：本窗无 CE、融合只含词频剩余项
+        -- flags（2026-11-28 加锚标记）：nofreq（2026-11-24：本窗无 CE、
+        -- 融合只含词频剩余项）/ anchor（本窗 CE 评分上文恰 1 token 被垫
+        -- 「。」锚）；多值逗号分隔（挂账回填路径为 "async,anchor"）——
+        -- 研究侧按 flags 直接判口径，不再靠 ts 分界推断
         if wid and not w_written then
+            local wflags = freq_only and "nofreq"
+                or (snap and snap.anchor and "anchor" or "")
             _G.llm_write_w(wid, ctx_src, code, context, engine_top, l1win,
                            texts_of(out, 20), tick, "ok", "",
-                           prep_flag == "1", freq_only and "nofreq" or "",
+                           prep_flag == "1", wflags,
                            comp_positions(l1win, comp_of) .. ";" ..
                            comp_positions(texts_of(out, 20), comp_of))
             w_written = true

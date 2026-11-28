@@ -1197,25 +1197,38 @@ static std::string token_seg_display(const std::vector<llama_token> & ids) {
 // RIME_LLM_CTX_ANCHOR=0。
 static const llama_vocab  * g_anchor_vocab = nullptr;  // 锚 token 随词表代缓存
 static int                  g_anchor_tok  = -1;
-static std::vector<llama_token> ctx_ids_for_ce(std::vector<llama_token> ids) {
+static std::vector<llama_token> ctx_ids_for_ce(std::vector<llama_token> ids,
+                                               bool *anchored = nullptr) {
     static const bool kOn = !(getenv("RIME_LLM_CTX_ANCHOR") &&
                               getenv("RIME_LLM_CTX_ANCHOR")[0] == '0');
-    if (!kOn || ids.size() > 1) return ids;
+    // 仅恰 1 token（==1）垫锚；空上文（=0）不垫（生产不给空上文算 CE，
+    // 此守卫纯对齐研究侧 sim_rerank 口径）。*anchored = 本窗实际垫锚
+    //（W 行 flags=anchor 语料标记用，2026-11-28）。
+    if (!kOn || ids.size() != 1) {
+        if (anchored) *anchored = false;
+        return ids;
+    }
     if (g_anchor_vocab != g_vocab) {
         auto t = tokenize("。");
         g_anchor_tok = t.empty() ? -1 : (int)t[0];
         g_anchor_vocab = g_vocab;
     }
-    if (g_anchor_tok >= 0) ids.insert(ids.begin(), g_anchor_tok);
+    if (g_anchor_tok >= 0) {
+        ids.insert(ids.begin(), g_anchor_tok);
+        if (anchored) *anchored = true;
+    } else if (anchored) {
+        *anchored = false;
+    }
     return ids;
 }
 
 // 上文 token 化 + min_tokens/max_ctx 截尾（prepare/score 入口共用）。
 // token 数不足 min_tokens（方案 llm_rerank/min_tokens，lua 传入）→ 返回空
 //（空 ctx 无推理是配置语义, 非 bug）。
-static std::vector<llama_token> ctx_token_ids(const char * context) {
+static std::vector<llama_token> ctx_token_ids(const char * context,
+                                              bool *anchored = nullptr) {
     auto ids = tokenize(context);
-    if ((int)ids.size() < g_min_tokens) { g_last_ctx_used.clear(); return {}; }
+    if ((int)ids.size() < g_min_tokens) { g_last_ctx_used.clear(); if (anchored) *anchored = false; return {}; }
     if ((int)ids.size() > g_max_ctx_tokens) {
         ids.erase(ids.begin(), ids.end() - g_max_ctx_tokens);
         g_last_ctx_used = tokens_piece(ids);
@@ -1270,8 +1283,9 @@ static double ce_target(const float * logits, int target_id, float m, double lse
 // 语义 = "当前词的完整上下文"——已确认词是确定 token，不能像旧上文一样被
 // 截断挤掉；g_last_ctx_used 也带上前缀（调试端"推理实际使用"口径）。
 static std::vector<llama_token> ctx_ids_with_prefix(const char * context,
-                                                    const char * prefix) {
-    auto ids = ctx_token_ids(context);
+                                                    const char * prefix,
+                                                    bool *anchored = nullptr) {
+    auto ids = ctx_token_ids(context, anchored);
     if (prefix && *prefix) {
         auto pids = tokenize(prefix);
         if (!pids.empty()) {
@@ -1903,6 +1917,7 @@ struct AsyncRes {
     std::vector<std::string> pm_texts;   // 子词文本（提交序）
     std::vector<double> pm_scores;       // 子词复用分（-1e10 = 无前缀匹配）
     bool prep_hit = false;
+    bool ctx_anchored = false;           // 本窗评分垫了「。」锚（W flags=anchor）
     std::string ctx_used;
     double ev_ms = 0;
 };
@@ -1982,6 +1997,8 @@ static void pack_async_result(lua_State * L, const AsyncRes & r) {
     lua_setfield(L, -2, "pm");
     lua_pushboolean(L, r.prep_hit ? 1 : 0);
     lua_setfield(L, -2, "prep");
+    lua_pushboolean(L, r.ctx_anchored ? 1 : 0);
+    lua_setfield(L, -2, "anchor");
     lua_pushstring(L, r.ctx_used.c_str());
     lua_setfield(L, -2, "ctx_used");
     lua_pushnumber(L, r.ev_ms);
@@ -2075,8 +2092,11 @@ static void async_worker_loop() {
             res.segs.push_back(token_seg_display(ids));
             cand_ids.push_back(std::move(ids));
         }
+        bool ctx_anchored = false;
         std::vector<llama_token> ctx_ids =
-            ctx_ids_with_prefix(task.context.c_str(), task.prefix.c_str());
+            ctx_ids_with_prefix(task.context.c_str(), task.prefix.c_str(),
+                                &ctx_anchored);
+        res.ctx_anchored = ctx_anchored;  // W flags=anchor（语料口径标记）
         if ((int)ctx_ids.size() < g_min_tokens) ctx_ids.clear();
         // g_last_ctx_used 已由 ctx_token_ids 写（调试 getter 兼容；跨线程
         // 写与既有 prepare 线程同风险面，字段仅调试显示用）
