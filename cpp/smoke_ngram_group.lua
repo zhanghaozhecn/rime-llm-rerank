@@ -12,6 +12,8 @@
 --   C  多字前导词「今天」一致 → 挂起 {text="今天"}
 --   D  方案无 simplifier（纯繁体输出）→ 运行期 gate 关闭，不注入
 --   F  组句文本与引擎候选重复 → 输出无重复条目
+--   P  组句候选 preedit（2026-11-28）：P1 自建（词边界加分隔）/ P2 同 span
+--      引擎 preedit 优先复用
 package.cpath = [[build/Release/?.dll]]
 
 local OUT = {}
