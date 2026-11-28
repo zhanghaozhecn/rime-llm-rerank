@@ -255,7 +255,10 @@ do
   filter(tr, ev)
   local found_async_w = false
   for _, line in ipairs(CORPUS) do
-    if line:match("^W\t") and line:find("\tasync$") then
+    -- 2026-11-28 修：W 行 v9 起尾字段 `comp` 在 flags 之后，flags 不再是
+    -- 行尾——按字段形状匹配（\tasync\t 或 \tasync$，两种行形状都覆盖；
+    -- async_pending 不含 \tasync 后随制表符，不会误配）
+    if line:match("^W\t") and (line:find("\tasync\t") or line:find("\tasync$")) then
       found_async_w = true
     end
   end
@@ -285,7 +288,9 @@ do
   _G.llm_async_cancel()             -- commit 通知链路：先收割再取消
   local n_async = 0
   for _, line in ipairs(CORPUS) do
-    if line:match("^W\t") and line:find("\tasync$") then n_async = n_async + 1 end
+    if line:match("^W\t") and (line:find("\tasync\t") or line:find("\tasync$")) then
+      n_async = n_async + 1
+    end
   end
   assert(n_async >= 1, "G: commit 收割未落账（W ok flags=async 缺）")
   assert(llm.async_poll() == nil, "G: 结果槽应已被收割消费")

@@ -16,7 +16,7 @@ llm.live_write = function() end
 _G.llm_context_get = function() return "", "" end
 
 local CASES = os.getenv("PG_CASES")
-        or "../llm-rerank-research/eval/lgb/pg_cases.lua"
+        or "../../llm-rerank-research/eval/lgb/pg_cases.lua"  -- cpp\ 上两级 = 大项目根
 dofile("../user/llm_filter.lua")
 local m = _G.llm_prefix_model_reload and _G.llm_prefix_model_reload()
 if not m then error("模型未加载（RIME_LLM_PREFIX_MODEL_PATH?）") end

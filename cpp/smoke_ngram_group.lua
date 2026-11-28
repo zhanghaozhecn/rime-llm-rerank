@@ -42,6 +42,10 @@ llm.ngram_sentences = function(code, ctx, params)
   assert(params and params.topk == 20, "params.topk")
   return GEN
 end
+-- 2026-11-28 修：增量组句（2026-11-27 落地）后 filter 默认走
+-- ngram_sentences_cached——不补桩时真 C++ 增量入口被调（无资产 → 空），
+-- 注入静默消失（A/N 场景失败的根因）。缓存入口同签名，共用同一桩。
+llm.ngram_sentences_cached = llm.ngram_sentences
 
 -- Candidate 构造（rime-lua 生产环境有全局 Candidate；冒烟桩同签名）
 function Candidate(t, s, e, txt, cm)

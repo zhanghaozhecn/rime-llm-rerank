@@ -13,9 +13,9 @@ llm.live_write = function() end          -- 管道打桩（本冒烟不关心调
 _G.llm_context_get = function() return "", "" end
 
 local CASES = os.getenv("PG_CASES")
-        or "../llm-rerank-research/eval/lgb/pg_cases.lua"
+        or "../../llm-rerank-research/eval/lgb/pg_cases.lua"  -- cpp\ 上两级 = 大项目根
 local OUT = os.getenv("PG_OUT")
-        or "../llm-rerank-research/eval/lgb/pg_lua.tsv"
+        or "../../llm-rerank-research/eval/lgb/pg_lua.tsv"
 
 dofile("../user/llm_filter.lua")          -- 注册 _G.llm_prefix_score 等
 
